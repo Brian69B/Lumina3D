@@ -1,0 +1,6 @@
+{
+  "name": "LuminaStreet 3D",
+  "description": "Interactive 3D photometric street lighting simulator with real-time height, tilt, 0-180 degree beam spread, Kelvin color temperature, inverse-square lux readout, and movable shadow-casting targets.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

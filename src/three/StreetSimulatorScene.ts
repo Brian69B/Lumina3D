@@ -1,0 +1,5086 @@
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+import {
+  BUILDING_DEFAULT_HEIGHTS,
+  BuilderTool,
+  CameraControlMode,
+  CameraPresetId,
+  DEFAULT_INPUT_CONTROLS,
+  FIXTURE_MAX_X,
+  FIXTURE_MAX_Z,
+  InputControlsConfig,
+  isRoadOrPathKind,
+  isVehicleKind,
+  LightFixture,
+  MAP_HALF_X,
+  MAP_HALF_Z,
+  MouseDragButton,
+  PhotometricStats,
+  SelectedSidewalkInfo,
+  StreetRouteId,
+  StreetTarget,
+  TargetKind,
+  ViewportSettings,
+} from '../types/lighting';
+import {
+  clamp,
+  computeAngularFactorFromDeg,
+  computeIlluminanceAtPoint,
+  computePeakCandela,
+  computeScenePhotometrics,
+  degToRad,
+  getAimDirection,
+  getEffectiveAngleAtDeg,
+  getEffectiveHalfAngleRad,
+  getFixtureHex,
+  getMaxEffectiveAngle,
+  getNadirEffectiveAngle,
+  getSectorAnglesSignature,
+  hasCustomSectorAngles,
+} from '../utils/photometrics';
+import {
+  attachLuxOverlayToMaterial,
+  attachLuxOverlayToObject,
+  createLuxOverlayUniformState,
+  disposeLuxOverlayState,
+  LuxOverlayUniformState,
+  updateLuxOverlayUniforms,
+} from './luxHeatmapShader';
+import {
+  createBuilderGhostGroup,
+  createStreetPoleRig,
+  createStreetTargetGroup,
+  disposeObject3DResources,
+  PedestrianRigRefs,
+  PoleVisualRefs,
+  TrafficSignalMaterials,
+  updateStreetPoleRig,
+} from './proceduralModels';
+import {
+  createAsphaltTexture,
+  createContactShadowTexture,
+  createSidewalkTexture,
+  disposeCachedRoadTextures,
+  getTrafficCountdownTexture,
+} from './textures';
+import { getShieldTransmittanceAtDeg } from '../utils/photometrics';
+import { SHIELD_SECTORS } from '../types/lighting';
+
+interface LightRigEntry {
+  spotLight: THREE.SpotLight;
+  spotTarget: THREE.Object3D;
+  pointLight: THREE.PointLight;
+  poleRefs: PoleVisualRefs;
+  goboTex: THREE.DataTexture | null;
+  goboSignature: string;
+}
+
+type SignalAspect = 'green' | 'yellow' | 'red';
+
+interface TrafficController {
+  targetId: string;
+  cx: number;
+  cz: number;
+  axisZX: number;
+  axisZZ: number;
+  axisXX: number;
+  axisXZ: number;
+  stopBarDist: number;
+  cycleOffset: number;
+  lastAspectX?: SignalAspect;
+  lastAspectZ?: SignalAspect;
+  lastCountdownX?: number;
+  lastCountdownZ?: number;
+}
+
+interface AnimatedActorState {
+  motion: 'walk' | 'drive';
+  kind: TargetKind;
+  routeId?: StreetRouteId;
+  x: number;
+  z: number;
+  rotationY: number;
+  phase: number;
+  strideBlend: number;
+  waypointIdx: number;
+  halfLen: number;
+  speed: number;
+  currentSpeed: number;
+  isYielding: boolean;
+  lastPropPos: { x: number; z: number };
+  lastPropRotY: number;
+  graphNodeId?: number;
+  subPath?: Array<{ x: number; z: number }>;
+  subPathIdx?: number;
+  roundaboutSteps?: number;
+  roundaboutTargetSteps?: number;
+  speedDriftTimer?: number;
+  offGraphTurnRate?: number;
+  offGraphTimer?: number;
+  walkCurrNodeId?: number;
+  walkPrevNodeId?: number;
+  walkGoalX?: number;
+  walkGoalZ?: number;
+  walkIsCrosswalk?: boolean;
+  walkPauseTimer?: number;
+}
+
+export interface SceneCallbacks {
+  onStatsUpdate: (stats: PhotometricStats) => void;
+  onSelectFixture: (id: string) => void;
+  onSelectTarget: (id: string | null) => void;
+  onSelectSidewalk?: (info: SelectedSidewalkInfo | null) => void;
+  onMoveTarget: (id: string, pos: { x: number; z: number }) => void;
+  onMoveFixture: (id: string, pos: { x: number; z: number }) => void;
+  onPlaceBuilderItem: (
+    tool: Exclude<BuilderTool, null>,
+    pos: { x: number; z: number },
+    rotationY: number,
+  ) => void;
+  onRotateBuilderTool: () => void;
+  onCancelBuilderTool: () => void;
+  onRotateSelected?: (deltaRad: number) => void;
+  onDeleteSelected?: () => void;
+  onContextLostChange?: (lost: boolean) => void;
+}
+
+// Module-level reusable math helpers (zero GC churn inside render loop)
+const _vec3A = new THREE.Vector3();
+const _vec3B = new THREE.Vector3();
+const _vec3C = new THREE.Vector3();
+const _euler = new THREE.Euler(0, 0, 0, 'YXZ');
+const _mouse = new THREE.Vector2();
+const _groundPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+const _dragHit = new THREE.Vector3();
+
+interface WalkGraphNode {
+  id: number;
+  x: number;
+  z: number;
+  roadId: string;
+  isCorner: boolean;
+}
+
+interface WalkGraphEdge {
+  toNodeId: number;
+  isCrosswalk: boolean;
+}
+
+interface WalkGraph {
+  nodes: WalkGraphNode[];
+  edges: WalkGraphEdge[][];
+}
+
+interface RoadGraphNode {
+  id: number;
+  x: number;
+  z: number;
+  dirX: number;
+  dirZ: number;
+  roadId: string;
+  isPerimeter: boolean;
+}
+
+interface RoadGraphEdge {
+  toNodeId: number;
+  points: Array<{ x: number; z: number }>;
+  isWrap?: boolean;
+  isUTurn?: boolean;
+  isRoundaboutStay?: boolean;
+  isRoundaboutExit?: boolean;
+  weight: number;
+}
+
+interface RoadLaneGraph {
+  nodes: RoadGraphNode[];
+  edges: RoadGraphEdge[][];
+}
+
+const ROAD_LANE_OFFSET = 2.15;
+
+function buildRoadLaneGraph(roadEntries: RoadSpatialEntry[]): RoadLaneGraph {
+  const nodes: RoadGraphNode[] = [];
+  const edges: RoadGraphEdge[][] = [];
+
+  interface PortBinding {
+    roadId: string;
+    inId: number;
+    outId: number;
+    px: number;
+    pz: number;
+    outDirX: number;
+    outDirZ: number;
+    connectedOut: boolean;
+    connectedIn: boolean;
+  }
+
+  const portsList: PortBinding[] = [];
+
+  const createNode = (
+    wx: number,
+    wz: number,
+    wdx: number,
+    wdz: number,
+    roadId: string,
+    isPerimeter = false,
+  ): number => {
+    const id = nodes.length;
+    nodes.push({ id, x: wx, z: wz, dirX: wdx, dirZ: wdz, roadId, isPerimeter });
+    edges.push([]);
+    return id;
+  };
+
+  const pushWorldEdge = (
+    fromId: number,
+    toId: number,
+    points: Array<{ x: number; z: number }>,
+    opts: Partial<Omit<RoadGraphEdge, 'toNodeId' | 'points'>> = {},
+  ) => {
+    edges[fromId].push({
+      toNodeId: toId,
+      points,
+      weight: opts.weight ?? 1.0,
+      isWrap: opts.isWrap,
+      isUTurn: opts.isUTurn,
+      isRoundaboutStay: opts.isRoundaboutStay,
+      isRoundaboutExit: opts.isRoundaboutExit,
+    });
+  };
+
+  for (const entry of roadEntries) {
+    const { target, cos, sin } = entry;
+    const tx = target.position.x;
+    const tz = target.position.z;
+    const kind = target.kind;
+
+    const toW = (lx: number, lz: number) => ({
+      x: tx + lx * cos + lz * sin,
+      z: tz - lx * sin + lz * cos,
+    });
+    const toD = (dx: number, dz: number) => ({
+      x: dx * cos + dz * sin,
+      z: -dx * sin + dz * cos,
+    });
+
+    const addLocalPort = (
+      lx: number,
+      lz: number,
+      nx: number,
+      nz: number,
+    ): PortBinding => {
+      const rx = -nz;
+      const rz = nx;
+      // Right-Hand Traffic: entering (-nx, -nz) uses left of outward normal (-rx, -rz);
+      // exiting (+nx, +nz) uses right of outward normal (+rx, +rz).
+      const wIn = toW(lx - rx * ROAD_LANE_OFFSET, lz - rz * ROAD_LANE_OFFSET);
+      const wInDir = toD(-nx, -nz);
+      const wOut = toW(lx + rx * ROAD_LANE_OFFSET, lz + rz * ROAD_LANE_OFFSET);
+      const wOutDir = toD(nx, nz);
+      const wPort = toW(lx, lz);
+      const isPerim =
+        Math.abs(wPort.x) >= MAP_HALF_X - 2.0 ||
+        Math.abs(wPort.z) >= MAP_HALF_Z - 2.0;
+
+      const inId = createNode(wIn.x, wIn.z, wInDir.x, wInDir.z, target.id, isPerim);
+      const outId = createNode(wOut.x, wOut.z, wOutDir.x, wOutDir.z, target.id, isPerim);
+      const binding: PortBinding = {
+        roadId: target.id,
+        inId,
+        outId,
+        px: wPort.x,
+        pz: wPort.z,
+        outDirX: wOutDir.x,
+        outDirZ: wOutDir.z,
+        connectedOut: false,
+        connectedIn: false,
+      };
+      portsList.push(binding);
+      return binding;
+    };
+
+    if (kind === 'road-2lane' || kind === 'road-crosswalk') {
+      const halfL =
+        kind === 'road-2lane' && target.length && target.length > 0
+          ? target.length * 0.5
+          : kind === 'road-crosswalk'
+            ? 3.0
+            : 4.0;
+      const pE = addLocalPort(halfL, 0, 1, 0);
+      const pW = addLocalPort(-halfL, 0, -1, 0);
+      pushWorldEdge(pW.inId, pE.outId, [{ x: nodes[pE.outId].x, z: nodes[pE.outId].z }]);
+      pushWorldEdge(pE.inId, pW.outId, [{ x: nodes[pW.outId].x, z: nodes[pW.outId].z }]);
+    } else if (kind === 'road-intersection' || kind === 'road-t-junction') {
+      const portSpecs: Array<[number, number, number, number]> =
+        kind === 'road-t-junction'
+          ? [
+              [4.5, 0, 1, 0],
+              [-4.5, 0, -1, 0],
+              [0, 4.5, 0, 1],
+            ]
+          : [
+              [4.5, 0, 1, 0],
+              [0, -4.5, 0, -1],
+              [-4.5, 0, -1, 0],
+              [0, 4.5, 0, 1],
+            ];
+      const localPorts = portSpecs.map(([lx, lz, nx, nz]) => addLocalPort(lx, lz, nx, nz));
+      for (let i = 0; i < localPorts.length; i++) {
+        for (let j = 0; j < localPorts.length; j++) {
+          if (i === j) continue;
+          const inNode = nodes[localPorts[i].inId];
+          const outNode = nodes[localPorts[j].outId];
+          const dot = inNode.dirX * outNode.dirX + inNode.dirZ * outNode.dirZ;
+          if (dot > 0.9) {
+            pushWorldEdge(inNode.id, outNode.id, [{ x: outNode.x, z: outNode.z }]);
+          } else {
+            const tProj =
+              (outNode.x - inNode.x) * inNode.dirX + (outNode.z - inNode.z) * inNode.dirZ;
+            const ctrlX = inNode.x + inNode.dirX * tProj;
+            const ctrlZ = inNode.z + inNode.dirZ * tProj;
+            const pts: Array<{ x: number; z: number }> = [];
+            for (const u of [0.2, 0.4, 0.6, 0.8, 1.0]) {
+              const omt = 1 - u;
+              pts.push({
+                x: omt * omt * inNode.x + 2 * omt * u * ctrlX + u * u * outNode.x,
+                z: omt * omt * inNode.z + 2 * omt * u * ctrlZ + u * u * outNode.z,
+              });
+            }
+            pushWorldEdge(inNode.id, outNode.id, pts);
+          }
+        }
+      }
+    } else if (kind === 'road-turn-90') {
+      const pW = addLocalPort(-6.0, 0, -1, 0);
+      const pS = addLocalPort(0, 6.0, 0, 1);
+
+      const innerPts: Array<{ x: number; z: number }> = [];
+      const rInner = 6.0 - ROAD_LANE_OFFSET;
+      for (const u of [0.25, 0.5, 0.75, 1.0]) {
+        const ang = (1 - u) * (Math.PI / 2);
+        innerPts.push(toW(-6 + rInner * Math.cos(ang), 6 - rInner * Math.sin(ang)));
+      }
+      pushWorldEdge(pW.inId, pS.outId, innerPts);
+
+      const outerPts: Array<{ x: number; z: number }> = [];
+      const rOuter = 6.0 + ROAD_LANE_OFFSET;
+      for (const u of [0.25, 0.5, 0.75, 1.0]) {
+        const ang = u * (Math.PI / 2);
+        outerPts.push(toW(-6 + rOuter * Math.cos(ang), 6 - rOuter * Math.sin(ang)));
+      }
+      pushWorldEdge(pS.inId, pW.outId, outerPts);
+    } else if (kind === 'road-curve-45') {
+      const p0 = addLocalPort(-4.95, -2.05, -1, 0);
+      const p1 = addLocalPort(
+        -4.95 + 14.0 * Math.SQRT1_2,
+        11.95 - 14.0 * Math.SQRT1_2,
+        Math.SQRT1_2,
+        -Math.SQRT1_2,
+      );
+      const rInner = 14.0 - ROAD_LANE_OFFSET;
+      const fwdPts: Array<{ x: number; z: number }> = [];
+      for (const u of [0.25, 0.5, 0.75, 1.0]) {
+        const ang = Math.PI / 2 - u * (Math.PI / 4);
+        fwdPts.push(toW(-4.95 + rInner * Math.cos(ang), 11.95 - rInner * Math.sin(ang)));
+      }
+      pushWorldEdge(p0.inId, p1.outId, fwdPts);
+
+      const rOuter = 14.0 + ROAD_LANE_OFFSET;
+      const revPts: Array<{ x: number; z: number }> = [];
+      for (const u of [0.25, 0.5, 0.75, 1.0]) {
+        const ang = Math.PI / 4 + u * (Math.PI / 4);
+        revPts.push(toW(-4.95 + rOuter * Math.cos(ang), 11.95 - rOuter * Math.sin(ang)));
+      }
+      pushWorldEdge(p1.inId, p0.outId, revPts);
+    } else if (kind === 'road-roundabout') {
+      const armMask = entry.armMask ?? 15;
+      const ringR = 6.75;
+      const ringNodeIds: number[] = [];
+      for (let k = 0; k < 8; k++) {
+        const ang = (k * Math.PI) / 4;
+        const wp = toW(Math.sin(ang) * ringR, Math.cos(ang) * ringR);
+        const wd = toD(Math.cos(ang), -Math.sin(ang));
+        ringNodeIds.push(createNode(wp.x, wp.z, wd.x, wd.z, target.id));
+      }
+      for (let k = 0; k < 8; k++) {
+        const nextK = (k + 1) % 8;
+        const midAng = ((k + 0.5) * Math.PI) / 4;
+        const midW = toW(Math.sin(midAng) * ringR, Math.cos(midAng) * ringR);
+        const nextNode = nodes[ringNodeIds[nextK]];
+        pushWorldEdge(
+          ringNodeIds[k],
+          nextNode.id,
+          [midW, { x: nextNode.x, z: nextNode.z }],
+          { isRoundaboutStay: true, weight: 0.5 },
+        );
+      }
+
+      const armDefs: Array<[number, number]> = [
+        [8, 0], // South
+        [1, 2], // East
+        [2, 4], // North
+        [4, 6], // West
+      ];
+      for (const [bit, armIdx] of armDefs) {
+        if ((armMask & bit) === 0) continue;
+        const ang = (armIdx * Math.PI) / 4;
+        const radX = Math.sin(ang);
+        const radZ = Math.cos(ang);
+        const tanX = Math.cos(ang);
+        const tanZ = -Math.sin(ang);
+        const port = addLocalPort(10.0 * radX, 10.0 * radZ, radX, radZ);
+
+        const nextRing = nodes[ringNodeIds[(armIdx + 1) % 8]];
+        const mergeIn = toW(7.2 * radX + 3.2 * tanX, 7.2 * radZ + 3.2 * tanZ);
+        pushWorldEdge(
+          port.inId,
+          nextRing.id,
+          [mergeIn, { x: nextRing.x, z: nextRing.z }],
+        );
+
+        const prevRingId = ringNodeIds[(armIdx + 7) % 8];
+        const mergeOut = toW(7.2 * radX - 3.2 * tanX, 7.2 * radZ - 3.2 * tanZ);
+        const outNode = nodes[port.outId];
+        pushWorldEdge(
+          prevRingId,
+          outNode.id,
+          [mergeOut, { x: outNode.x, z: outNode.z }],
+          { isRoundaboutExit: true, weight: 0.5 },
+        );
+      }
+    } else if (kind === 'road-culdesac') {
+      const ringR = 3.8;
+      const ringNodeIds: number[] = [];
+      for (let k = 0; k < 4; k++) {
+        const ang = (k * Math.PI) / 2;
+        const wp = toW(Math.sin(ang) * ringR, Math.cos(ang) * ringR);
+        const wd = toD(Math.cos(ang), -Math.sin(ang));
+        ringNodeIds.push(createNode(wp.x, wp.z, wd.x, wd.z, target.id));
+      }
+      for (let k = 0; k < 4; k++) {
+        const nextK = (k + 1) % 4;
+        const midAng = ((k + 0.5) * Math.PI) / 2;
+        const midW = toW(Math.sin(midAng) * ringR, Math.cos(midAng) * ringR);
+        const nextNode = nodes[ringNodeIds[nextK]];
+        pushWorldEdge(
+          ringNodeIds[k],
+          nextNode.id,
+          [midW, { x: nextNode.x, z: nextNode.z }],
+          { isRoundaboutStay: true, weight: 0.55 },
+        );
+      }
+      for (let k = 0; k < 4; k++) {
+        const ang = (k * Math.PI) / 2;
+        const radX = Math.sin(ang);
+        const radZ = Math.cos(ang);
+        const port = addLocalPort(6.0 * radX, 6.0 * radZ, radX, radZ);
+        const nextRing = nodes[ringNodeIds[(k + 1) % 4]];
+        pushWorldEdge(port.inId, nextRing.id, [{ x: nextRing.x, z: nextRing.z }]);
+        const outNode = nodes[port.outId];
+        pushWorldEdge(
+          ringNodeIds[k],
+          outNode.id,
+          [{ x: outNode.x, z: outNode.z }],
+          { isRoundaboutExit: true, weight: 0.45 },
+        );
+      }
+    } else if (kind === 'road-deadend') {
+      const pW = addLocalPort(-6.0, 0, -1, 0);
+      const pts = [
+        toW(-1.5, ROAD_LANE_OFFSET),
+        toW(1.8, 2.8),
+        toW(3.4, 0),
+        toW(1.8, -2.8),
+        toW(-1.5, -ROAD_LANE_OFFSET),
+        { x: nodes[pW.outId].x, z: nodes[pW.outId].z },
+      ];
+      pushWorldEdge(pW.inId, pW.outId, pts);
+    }
+  }
+
+  // Stitch flush-connected ports across distinct road targets
+  for (let i = 0; i < portsList.length; i++) {
+    const pA = portsList[i];
+    for (let j = 0; j < portsList.length; j++) {
+      if (i === j) continue;
+      const pB = portsList[j];
+      if (pA.roadId === pB.roadId) continue;
+      if (Math.hypot(pA.px - pB.px, pA.pz - pB.pz) > 0.85) continue;
+      if (pA.outDirX * pB.outDirX + pA.outDirZ * pB.outDirZ > -0.7) continue;
+
+      const outA = nodes[pA.outId];
+      const inB = nodes[pB.inId];
+      const gap = Math.hypot(outA.x - inB.x, outA.z - inB.z);
+      pushWorldEdge(
+        outA.id,
+        inB.id,
+        gap > 0.15 ? [{ x: inB.x, z: inB.z }] : [],
+      );
+      pA.connectedOut = true;
+      pB.connectedIn = true;
+    }
+  }
+
+  // Handle open perimeter ends (wrap across corridor if clear) & internal unconnected ends (safe U-turn)
+  for (const pA of portsList) {
+    if (pA.connectedOut) continue;
+    const outNode = nodes[pA.outId];
+    const inNode = nodes[pA.inId];
+
+    if (outNode.isPerimeter) {
+      let bestWrap: PortBinding | null = null;
+      let bestAxisDist = Infinity;
+      for (const pB of portsList) {
+        if (pB === pA || pB.connectedIn || !nodes[pB.inId].isPerimeter) continue;
+        // Same travel direction (pB outward points opposite to pA outward)
+        if (pA.outDirX * -pB.outDirX + pA.outDirZ * -pB.outDirZ < 0.85) continue;
+        const dx = pB.px - pA.px;
+        const dz = pB.pz - pA.pz;
+        const fwd = dx * pA.outDirX + dz * pA.outDirZ;
+        if (fwd > -20) continue;
+        const perp = Math.abs(dx * -pA.outDirZ + dz * pA.outDirX);
+        if (perp <= 3.5 && perp < bestAxisDist) {
+          bestAxisDist = perp;
+          bestWrap = pB;
+        }
+      }
+      if (bestWrap) {
+        const dest = nodes[bestWrap.inId];
+        pushWorldEdge(outNode.id, dest.id, [{ x: dest.x, z: dest.z }], {
+          isWrap: true,
+          weight: 1.0,
+        });
+      }
+    }
+
+    // Smooth in-road turnaround so cars never drive onto grass when a road ends mid-block
+    const rightVecX = -pA.outDirZ;
+    const rightVecZ = pA.outDirX;
+    const outMid = {
+      x: pA.px - pA.outDirX * 0.25 + rightVecX * (ROAD_LANE_OFFSET * 0.48),
+      z: pA.pz - pA.outDirZ * 0.25 + rightVecZ * (ROAD_LANE_OFFSET * 0.48),
+    };
+    const apex = {
+      x: pA.px - pA.outDirX * 0.55,
+      z: pA.pz - pA.outDirZ * 0.55,
+    };
+    const inMid = {
+      x: pA.px - pA.outDirX * 0.85 - rightVecX * (ROAD_LANE_OFFSET * 0.55),
+      z: pA.pz - pA.outDirZ * 0.85 - rightVecZ * (ROAD_LANE_OFFSET * 0.55),
+    };
+    const inLaneTarget = {
+      x: inNode.x + inNode.dirX * 1.25,
+      z: inNode.z + inNode.dirZ * 1.25,
+    };
+    const inOutEdges = edges[inNode.id];
+    if (inOutEdges.length > 0) {
+      for (const nextEdge of inOutEdges) {
+        if (nextEdge.isWrap || nextEdge.isUTurn) continue;
+        pushWorldEdge(
+          outNode.id,
+          nextEdge.toNodeId,
+          [outMid, apex, inMid, inLaneTarget, ...nextEdge.points],
+          {
+            isUTurn: true,
+            weight: (outNode.isPerimeter ? 0.34 : 1.0) * nextEdge.weight,
+          },
+        );
+      }
+    } else {
+      pushWorldEdge(outNode.id, inNode.id, [outMid, apex, inMid, inLaneTarget], {
+        isUTurn: true,
+        weight: outNode.isPerimeter ? 0.34 : 1.0,
+      });
+    }
+  }
+
+  return { nodes, edges };
+}
+
+function buildWalkGraph(roadEntries: RoadSpatialEntry[]): WalkGraph {
+  const nodes: WalkGraphNode[] = [];
+  const edges: WalkGraphEdge[][] = [];
+
+  const addNode = (wx: number, wz: number, roadId: string, isCorner = false): number => {
+    const id = nodes.length;
+    nodes.push({ id, x: wx, z: wz, roadId, isCorner });
+    edges.push([]);
+    return id;
+  };
+
+  const addEdge = (a: number, b: number, isCrosswalk = false) => {
+    if (a === b) return;
+    if (!edges[a].some((e) => e.toNodeId === b)) {
+      edges[a].push({ toNodeId: b, isCrosswalk });
+    }
+    if (!edges[b].some((e) => e.toNodeId === a)) {
+      edges[b].push({ toNodeId: a, isCrosswalk });
+    }
+  };
+
+  for (const entry of roadEntries) {
+    const { target, cos, sin, hiddenSet } = entry;
+    const tx = target.position.x;
+    const tz = target.position.z;
+    const kind = target.kind;
+    const toW = (lx: number, lz: number) => ({
+      x: tx + lx * cos + lz * sin,
+      z: tz - lx * sin + lz * cos,
+    });
+    const addLocal = (lx: number, lz: number, isCorner = false): number => {
+      const p = toW(lx, lz);
+      return addNode(p.x, p.z, target.id, isCorner);
+    };
+
+    if (kind === 'road-2lane' || kind === 'road-crosswalk') {
+      const halfL =
+        kind === 'road-2lane' && target.length && target.length > 0
+          ? target.length * 0.5
+          : kind === 'road-crosswalk'
+            ? 3.0
+            : 4.0;
+      const nMid = !hiddenSet.has('north') ? addLocal(0, -5.95) : -1;
+      const sMid = !hiddenSet.has('south') ? addLocal(0, 5.95) : -1;
+      if (nMid >= 0) {
+        const nW = addLocal(-halfL, -5.95);
+        const nE = addLocal(halfL, -5.95);
+        addEdge(nW, nMid, false);
+        addEdge(nMid, nE, false);
+      }
+      if (sMid >= 0) {
+        const sW = addLocal(-halfL, 5.95);
+        const sE = addLocal(halfL, 5.95);
+        addEdge(sW, sMid, false);
+        addEdge(sMid, sE, false);
+      }
+      if (kind === 'road-crosswalk' && nMid >= 0 && sMid >= 0) {
+        addEdge(nMid, sMid, true);
+      }
+    } else if (kind === 'road-intersection') {
+      const corners: Record<'nw' | 'ne' | 'sw' | 'se', number> = {
+        nw: -1,
+        ne: -1,
+        sw: -1,
+        se: -1,
+      };
+      const specs: Array<['nw' | 'ne' | 'sw' | 'se', number, number]> = [
+        ['nw', -5.95, -5.95],
+        ['ne', 5.95, -5.95],
+        ['sw', -5.95, 5.95],
+        ['se', 5.95, 5.95],
+      ];
+      for (const [key, lx, lz] of specs) {
+        if (hiddenSet.has(key)) continue;
+        const cId = addLocal(lx, lz, true);
+        corners[key] = cId;
+        const sx = Math.sign(lx);
+        const sz = Math.sign(lz);
+        addEdge(cId, addLocal(sx * 4.5, lz), false);
+        addEdge(cId, addLocal(lx, sz * 4.5), false);
+      }
+      if (corners.nw >= 0 && corners.ne >= 0) addEdge(corners.nw, corners.ne, true);
+      if (corners.sw >= 0 && corners.se >= 0) addEdge(corners.sw, corners.se, true);
+      if (corners.nw >= 0 && corners.sw >= 0) addEdge(corners.nw, corners.sw, true);
+      if (corners.ne >= 0 && corners.se >= 0) addEdge(corners.ne, corners.se, true);
+    } else if (kind === 'road-t-junction') {
+      // Sidewalks only (no unmarked crosswalks across T-junction legs)
+      if (!hiddenSet.has('back')) {
+        const bW = addLocal(-4.5, -5.95);
+        const bM = addLocal(0, -5.95, true);
+        const bE = addLocal(4.5, -5.95);
+        addEdge(bW, bM, false);
+        addEdge(bM, bE, false);
+      }
+      if (!hiddenSet.has('sw')) {
+        const swC = addLocal(-5.95, 5.95, true);
+        addEdge(swC, addLocal(-4.5, 5.95), false);
+        addEdge(swC, addLocal(-5.95, 4.5), false);
+      }
+      if (!hiddenSet.has('se')) {
+        const seC = addLocal(5.95, 5.95, true);
+        addEdge(seC, addLocal(4.5, 5.95), false);
+        addEdge(seC, addLocal(5.95, 4.5), false);
+      }
+    } else if (kind === 'road-roundabout') {
+      const armMask = entry.armMask ?? 15;
+      const openE = (armMask & 1) !== 0;
+      const openN = (armMask & 2) !== 0;
+      const openW = (armMask & 4) !== 0;
+      const openS = (armMask & 8) !== 0;
+
+      const q: Record<'nw' | 'ne' | 'sw' | 'se', number> = {
+        nw: !hiddenSet.has('nw') ? addLocal(-7.85, -7.85, true) : -1,
+        ne: !hiddenSet.has('ne') ? addLocal(7.85, -7.85, true) : -1,
+        sw: !hiddenSet.has('sw') ? addLocal(-7.85, 7.85, true) : -1,
+        se: !hiddenSet.has('se') ? addLocal(7.85, 7.85, true) : -1,
+      };
+      if (openE) {
+        const neE = q.ne >= 0 ? addLocal(10.0, -5.95) : -1;
+        const seE = q.se >= 0 ? addLocal(10.0, 5.95) : -1;
+        if (neE >= 0) addEdge(q.ne, neE, false);
+        if (seE >= 0) addEdge(q.se, seE, false);
+      } else if (!hiddenSet.has('cap-E') && q.ne >= 0 && q.se >= 0) {
+        const capE = addLocal(11.1, 0, true);
+        addEdge(q.ne, capE, false);
+        addEdge(capE, q.se, false);
+      }
+      if (openW) {
+        const nwW = q.nw >= 0 ? addLocal(-10.0, -5.95) : -1;
+        const swW = q.sw >= 0 ? addLocal(-10.0, 5.95) : -1;
+        if (nwW >= 0) addEdge(q.nw, nwW, false);
+        if (swW >= 0) addEdge(q.sw, swW, false);
+      } else if (!hiddenSet.has('cap-W') && q.nw >= 0 && q.sw >= 0) {
+        const capW = addLocal(-11.1, 0, true);
+        addEdge(q.nw, capW, false);
+        addEdge(capW, q.sw, false);
+      }
+      if (openN) {
+        const nwN = q.nw >= 0 ? addLocal(-5.95, -10.0) : -1;
+        const neN = q.ne >= 0 ? addLocal(5.95, -10.0) : -1;
+        if (nwN >= 0) addEdge(q.nw, nwN, false);
+        if (neN >= 0) addEdge(q.ne, neN, false);
+      } else if (!hiddenSet.has('cap-N') && q.nw >= 0 && q.ne >= 0) {
+        const capN = addLocal(0, -11.1, true);
+        addEdge(q.nw, capN, false);
+        addEdge(capN, q.ne, false);
+      }
+      if (openS) {
+        const swS = q.sw >= 0 ? addLocal(-5.95, 10.0) : -1;
+        const seS = q.se >= 0 ? addLocal(5.95, 10.0) : -1;
+        if (swS >= 0) addEdge(q.sw, swS, false);
+        if (seS >= 0) addEdge(q.se, seS, false);
+      } else if (!hiddenSet.has('cap-S') && q.sw >= 0 && q.se >= 0) {
+        const capS = addLocal(0, 11.1, true);
+        addEdge(q.sw, capS, false);
+        addEdge(capS, q.se, false);
+      }
+    } else if (kind === 'road-turn-90') {
+      if (!hiddenSet.has('outer')) {
+        const r = 12.0;
+        const a = addLocal(-6.0 + r * Math.cos(Math.PI / 2), 6.0 - r * Math.sin(Math.PI / 2));
+        const m = addLocal(-6.0 + r * Math.cos(Math.PI / 4), 6.0 - r * Math.sin(Math.PI / 4), true);
+        const b = addLocal(-6.0 + r * Math.cos(0), 6.0 - r * Math.sin(0));
+        addEdge(a, m, false);
+        addEdge(m, b, false);
+      }
+    } else if (kind === 'road-curve-45') {
+      for (const [key, r] of [
+        ['outer', 20.0],
+        ['inner', 8.0],
+      ] as const) {
+        if (hiddenSet.has(key)) continue;
+        const a = addLocal(-4.95 + r * Math.cos(Math.PI / 2), 11.95 - r * Math.sin(Math.PI / 2));
+        const m = addLocal(
+          -4.95 + r * Math.cos(Math.PI * 0.375),
+          11.95 - r * Math.sin(Math.PI * 0.375),
+          true,
+        );
+        const b = addLocal(-4.95 + r * Math.cos(Math.PI / 4), 11.95 - r * Math.sin(Math.PI / 4));
+        addEdge(a, m, false);
+        addEdge(m, b, false);
+      }
+    } else if (kind === 'road-deadend' && !hiddenSet.has('ring')) {
+      const nW = addLocal(-6.0, -5.95);
+      const sW = addLocal(-6.0, 5.95);
+      const nArc = addLocal(2.0, -7.2);
+      const eArc = addLocal(7.4, 0, true);
+      const sArc = addLocal(2.0, 7.2);
+      addEdge(nW, nArc, false);
+      addEdge(nArc, eArc, false);
+      addEdge(eArc, sArc, false);
+      addEdge(sArc, sW, false);
+    }
+  }
+
+  // Stitch adjacent sidewalk nodes across distinct road pieces (avoiding roadway crossings)
+  for (let i = 0; i < nodes.length; i++) {
+    const a = nodes[i];
+    for (let j = i + 1; j < nodes.length; j++) {
+      const b = nodes[j];
+      if (a.roadId === b.roadId) continue;
+      if (Math.hypot(a.x - b.x, a.z - b.z) > 1.05) continue;
+      const mx = (a.x + b.x) * 0.5;
+      const mz = (a.z + b.z) * 0.5;
+      if (isPointInsideAnyRoadway(mx, mz, roadEntries)) continue;
+      addEdge(a.id, b.id, false);
+    }
+  }
+
+  return { nodes, edges };
+}
+
+function getActorHalfLength(kind: TargetKind): number {
+  switch (kind) {
+    case 'bike':
+      return 0.9;
+    case 'motorcycle':
+      return 1.1;
+    case 'sedan':
+      return 2.25;
+    case 'van':
+      return 2.6;
+    case 'truck':
+      return 3.45;
+    case 'bus':
+      return 4.65;
+    default:
+      return 0.5;
+  }
+}
+
+function getActorHalfWidth(kind: TargetKind): number {
+  switch (kind) {
+    case 'bike':
+      return 0.35;
+    case 'motorcycle':
+      return 0.45;
+    case 'sedan':
+      return 0.95;
+    case 'van':
+      return 1.05;
+    case 'truck':
+      return 1.18;
+    case 'bus':
+      return 1.22;
+    default:
+      return 0.85;
+  }
+}
+
+function getActorBaseSpeed(kind: TargetKind, rotY: number): number {
+  switch (kind) {
+    case 'pedestrian':
+      return 1.55;
+    case 'bike':
+      return 3.9;
+    case 'motorcycle':
+      return 9.1;
+    case 'sedan':
+      return Math.cos(rotY) >= 0 ? 7.4 : 8.6;
+    case 'van':
+      return 6.8;
+    case 'truck':
+      return 5.8;
+    case 'bus':
+      return 5.4;
+    default:
+      return 0;
+  }
+}
+
+const ROAD_PORT_DIMS: Partial<Record<TargetKind, { halfL: number; halfW: number }>> = {
+  'road-2lane': { halfL: 4.0, halfW: 4.5 },
+  'road-intersection': { halfL: 4.5, halfW: 4.5 },
+  'road-t-junction': { halfL: 4.5, halfW: 4.5 },
+  'road-turn-90': { halfL: 6.0, halfW: 6.0 },
+  'road-curve-45': { halfL: 7.5, halfW: 5.5 },
+  'road-crosswalk': { halfL: 3.0, halfW: 4.5 },
+  'road-roundabout': { halfL: 10.0, halfW: 10.0 },
+  'road-culdesac': { halfL: 6.0, halfW: 6.0 },
+  'road-deadend': { halfL: 6.0, halfW: 6.0 },
+  'path-sidewalk': { halfL: 4.0, halfW: 1.5 },
+  'path-bike': { halfL: 4.0, halfW: 1.2 },
+  'path-cobble': { halfL: 3.0, halfW: 3.0 },
+  'path-gravel': { halfL: 4.0, halfW: 1.1 },
+};
+
+interface SegmentPort {
+  ox: number;
+  oz: number;
+  nx: number;
+  nz: number;
+}
+
+function getSegmentLocalPorts(
+  kind: TargetKind,
+  rotY: number,
+  length?: number,
+): SegmentPort[] {
+  const dims = ROAD_PORT_DIMS[kind];
+  if (!dims) return [];
+  const cos = Math.cos(rotY);
+  const sin = Math.sin(rotY);
+  const halfL = kind === 'road-2lane' && length && length > 0 ? length * 0.5 : dims.halfL;
+
+  let raw: Array<[number, number, number, number]>;
+  if (kind === 'road-t-junction') {
+    raw = [
+      [4.5, 0, 1, 0],
+      [-4.5, 0, -1, 0],
+      [0, 4.5, 0, 1],
+    ];
+  } else if (kind === 'road-turn-90') {
+    raw = [
+      [-6.0, 0, -1, 0],
+      [0, 6.0, 0, 1],
+    ];
+  } else if (kind === 'road-curve-45') {
+    raw = [
+      [-4.95, -2.05, -1, 0],
+      [4.95, 2.05, Math.SQRT1_2, Math.SQRT1_2],
+    ];
+  } else if (kind === 'road-deadend') {
+    raw = [[-6.0, 0, -1, 0]];
+  } else {
+    raw = [
+      [halfL, 0, 1, 0],
+      [-halfL, 0, -1, 0],
+      [0, dims.halfW, 0, 1],
+      [0, -dims.halfW, 0, -1],
+    ];
+  }
+
+  return raw.map(([lx, lz, lnx, lnz]) => ({
+    ox: lx * cos + lz * sin,
+    oz: -lx * sin + lz * cos,
+    nx: lnx * cos + lnz * sin,
+    nz: -lnx * sin + lnz * cos,
+  }));
+}
+
+interface RoadSpatialEntry {
+  target: StreetTarget;
+  cos: number;
+  sin: number;
+  maxRadiusSq: number;
+  armMask?: number;
+  hiddenSet: Set<string>;
+}
+
+function getRoundaboutArmMask(rbTarget: StreetTarget, allTargets: StreetTarget[]): number {
+  const cos = Math.cos(rbTarget.rotationY);
+  const sin = Math.sin(rbTarget.rotationY);
+  const armSpecs: Array<[number, number, number, number, number]> = [
+    [1, 10, 0, 1, 0],
+    [2, 0, -10, 0, -1],
+    [4, -10, 0, -1, 0],
+    [8, 0, 10, 0, 1],
+  ];
+
+  let mask = 0;
+  let connectedCount = 0;
+
+  for (const [bit, lx, lz, lnx, lnz] of armSpecs) {
+    const px = rbTarget.position.x + lx * cos + lz * sin;
+    const pz = rbTarget.position.z - lx * sin + lz * cos;
+    const nx = lnx * cos + lnz * sin;
+    const nz = -lnx * sin + lnz * cos;
+
+    let connected = false;
+    for (const other of allTargets) {
+      if (other.id === rbTarget.id || !ROAD_PORT_DIMS[other.kind]) continue;
+      const otherPorts = getSegmentLocalPorts(other.kind, other.rotationY, other.length);
+      for (const tp of otherPorts) {
+        if (tp.nx * nx + tp.nz * nz > -0.7) continue;
+        const ox = other.position.x + tp.ox;
+        const oz = other.position.z + tp.oz;
+        if (Math.hypot(ox - px, oz - pz) <= 0.65) {
+          connected = true;
+          break;
+        }
+      }
+      if (connected) break;
+    }
+
+    if (connected) {
+      mask |= bit;
+      connectedCount++;
+    }
+  }
+
+  return connectedCount >= 2 ? mask : 15;
+}
+
+function getRoadSpatialRadius(kind: TargetKind, length?: number): number {
+  switch (kind) {
+    case 'road-2lane':
+      return Math.hypot((length && length > 0 ? length * 0.5 : 4.0) + 1.0, 7.5) + 1.5;
+    case 'road-roundabout':
+      return 15.0;
+    case 'road-curve-45':
+      return 18.0;
+    case 'road-turn-90':
+      return 15.0;
+    case 'road-deadend':
+    case 'road-culdesac':
+      return 11.5;
+    default:
+      return 10.5;
+  }
+}
+
+function toRoadLocal(
+  wx: number,
+  wz: number,
+  entry: RoadSpatialEntry,
+): { lx: number; lz: number } {
+  const dx = wx - entry.target.position.x;
+  const dz = wz - entry.target.position.z;
+  return {
+    lx: dx * entry.cos - dz * entry.sin,
+    lz: dx * entry.sin + dz * entry.cos,
+  };
+}
+
+function isPointInsideRoadTargetLocal(
+  kind: TargetKind,
+  lx: number,
+  lz: number,
+  armMask = 15,
+  length?: number,
+): boolean {
+  switch (kind) {
+    case 'road-2lane': {
+      const halfL = length && length > 0 ? length * 0.5 : 4.0;
+      return Math.abs(lx) <= halfL + 0.04 && Math.abs(lz) <= 4.54;
+    }
+    case 'road-intersection':
+    case 'road-t-junction':
+      return Math.abs(lx) <= 4.54 && Math.abs(lz) <= 4.54;
+    case 'road-crosswalk':
+      return Math.abs(lx) <= 3.04 && Math.abs(lz) <= 4.54;
+    case 'road-turn-90': {
+      if (lx < -6.04 || lz > 6.04) return false;
+      const r = Math.hypot(lx + 6, lz - 6);
+      return r >= 1.46 && r <= 10.54;
+    }
+    case 'road-curve-45': {
+      const dx = lx + 4.95;
+      const dz = -(lz - 11.95);
+      const r = Math.hypot(dx, dz);
+      if (r < 9.46 || r > 18.54) return false;
+      const ang = Math.atan2(dz, dx);
+      return ang >= Math.PI / 4 - 0.02 && ang <= Math.PI / 2 + 0.02;
+    }
+    case 'road-roundabout':
+      if (Math.hypot(lx, lz) <= 9.68) return true;
+      if ((armMask & 1) !== 0 && lx >= 0 && lx <= 10.04 && Math.abs(lz) <= 4.54) return true;
+      if ((armMask & 2) !== 0 && lz <= 0 && lz >= -10.04 && Math.abs(lx) <= 4.54) return true;
+      if ((armMask & 4) !== 0 && lx <= 0 && lx >= -10.04 && Math.abs(lz) <= 4.54) return true;
+      if ((armMask & 8) !== 0 && lz >= 0 && lz <= 10.04 && Math.abs(lx) <= 4.54) return true;
+      return false;
+    case 'road-culdesac':
+      return Math.hypot(lx, lz) <= 6.06;
+    case 'road-deadend':
+      return (
+        Math.hypot(lx, lz) <= 6.06 ||
+        (lx >= -6.04 && lx <= 0 && Math.abs(lz) <= 4.54)
+      );
+    default:
+      return false;
+  }
+}
+
+function getSidewalkPartKeyLocal(
+  kind: TargetKind,
+  lx: number,
+  lz: number,
+  armMask = 15,
+  length?: number,
+): string | null {
+  const ax = Math.abs(lx);
+  const az = Math.abs(lz);
+  switch (kind) {
+    case 'road-2lane': {
+      const halfL = length && length > 0 ? length * 0.5 : 4.0;
+      if (ax > halfL || az < 4.74 || az > 7.24) return null;
+      return lz < 0 ? 'north' : 'south';
+    }
+    case 'road-crosswalk':
+      if (ax > 3.0 || az < 4.74 || az > 7.24) return null;
+      return lz < 0 ? 'north' : 'south';
+    case 'road-intersection':
+      if (ax >= 4.5 && ax <= 7.24 && az >= 4.5 && az <= 7.24 && !(ax < 4.74 && az < 4.74)) {
+        return `${lz < 0 ? 'n' : 's'}${lx < 0 ? 'w' : 'e'}`;
+      }
+      return null;
+    case 'road-t-junction':
+      if (ax <= 4.5 && lz >= -7.24 && lz <= -4.74) return 'back';
+      if (ax >= 4.5 && ax <= 7.24 && lz >= 4.5 && lz <= 7.24 && !(ax < 4.74 && lz < 4.74)) {
+        return lx < 0 ? 'sw' : 'se';
+      }
+      return null;
+    case 'road-turn-90': {
+      if (lx < -6.0 || lz > 6.0) return null;
+      const r = Math.hypot(lx + 6, lz - 6);
+      if (r >= 10.74 && r <= 13.24) return 'outer';
+      if (r <= 1.26) return 'inner';
+      return null;
+    }
+    case 'road-curve-45': {
+      const dx = lx + 4.95;
+      const dz = -(lz - 11.95);
+      const r = Math.hypot(dx, dz);
+      const ang = Math.atan2(dz, dx);
+      if (ang < Math.PI / 4 || ang > Math.PI / 2) return null;
+      if (r >= 6.76 && r <= 9.26) return 'inner';
+      if (r >= 18.74 && r <= 21.24) return 'outer';
+      return null;
+    }
+    case 'road-roundabout': {
+      const r = Math.hypot(lx, lz);
+      if (r < 9.85 || r > 12.35) return null;
+      const openE = (armMask & 1) !== 0;
+      const openN = (armMask & 2) !== 0;
+      const openW = (armMask & 4) !== 0;
+      const openS = (armMask & 8) !== 0;
+      if (az < 4.74) {
+        if (lx > 0) return openE ? null : 'cap-E';
+        if (lx < 0) return openW ? null : 'cap-W';
+        return null;
+      }
+      if (ax < 4.74) {
+        if (lz < 0) return openN ? null : 'cap-N';
+        if (lz > 0) return openS ? null : 'cap-S';
+        return null;
+      }
+      if ((lx > 10.0 && openE) || (lx < -10.0 && openW)) return null;
+      if ((lz < -10.0 && openN) || (lz > 10.0 && openS)) return null;
+      return `${lz < 0 ? 'n' : 's'}${lx < 0 ? 'w' : 'e'}`;
+    }
+    case 'road-culdesac': {
+      const r = Math.hypot(lx, lz);
+      return r >= 6.19 && r <= 8.69 ? 'ring' : null;
+    }
+    case 'road-deadend': {
+      if (lx >= -6.0 && lx <= -3.96 && az >= 4.74 && az <= 7.24) return 'ring';
+      if (lx < -3.96) return null;
+      const r = Math.hypot(lx, lz);
+      if (r < 6.18 || r > 8.68) return null;
+      const thetaNeck = Math.asin(4.74 / 6.18);
+      return Math.abs(Math.atan2(lz, lx)) <= Math.PI - thetaNeck + 0.01 ? 'ring' : null;
+    }
+    default:
+      return null;
+  }
+}
+
+function isPointInsideTargetSidewalkLocal(
+  kind: TargetKind,
+  lx: number,
+  lz: number,
+  armMask = 15,
+  length?: number,
+  hiddenSet?: Set<string>,
+): boolean {
+  const partKey = getSidewalkPartKeyLocal(kind, lx, lz, armMask, length);
+  if (!partKey) return false;
+  return !hiddenSet || !hiddenSet.has(partKey);
+}
+
+function isPointInsideAnyRoadway(
+  wx: number,
+  wz: number,
+  roadEntries: RoadSpatialEntry[],
+): boolean {
+  for (let i = 0; i < roadEntries.length; i++) {
+    const entry = roadEntries[i];
+    const dx = wx - entry.target.position.x;
+    const dz = wz - entry.target.position.z;
+    if (dx * dx + dz * dz > entry.maxRadiusSq) continue;
+    const { lx, lz } = toRoadLocal(wx, wz, entry);
+    if (
+      isPointInsideRoadTargetLocal(
+        entry.target.kind,
+        lx,
+        lz,
+        entry.armMask,
+        entry.target.length,
+      )
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function formatCompassSideLabel(dx: number, dz: number, roadLabel: string): string {
+  if (Math.hypot(dx, dz) < 0.25) return `Sidewalk · ${roadLabel}`;
+  const angle = Math.atan2(dz, dx); // +X=0 (East), +Z=PI/2 (South), -X=PI (West), -Z=-PI/2 (North)
+  const dirs = ['East', 'SE', 'South', 'SW', 'West', 'NW', 'North', 'NE'];
+  const idx = ((Math.round((angle / (Math.PI * 2)) * 8) % 8) + 8) % 8;
+  return `${dirs[idx]} Sidewalk · ${roadLabel}`;
+}
+
+function detectSoftwareGl(): boolean {
+  try {
+    const probeCanvas = document.createElement('canvas');
+    const gl = probeCanvas.getContext('webgl2');
+    if (!gl) return true;
+    const ext = gl.getExtension('WEBGL_debug_renderer_info');
+    const param = ext ? ext.UNMASKED_RENDERER_WEBGL : gl.RENDERER;
+    const gpu = String(gl.getParameter(param) || '');
+    gl.getExtension('WEBGL_lose_context')?.loseContext();
+    return /SwiftShader|llvmpipe|softpipe|Software|Basic Render/i.test(gpu);
+  } catch {
+    return true;
+  }
+}
+
+export class StreetSimulatorScene {
+  private container: HTMLElement;
+  private callbacks: SceneCallbacks;
+  private isSoftwareGl: boolean;
+  private renderer: THREE.WebGLRenderer;
+  private scene: THREE.Scene;
+  private camera: THREE.PerspectiveCamera;
+  private controls: OrbitControls;
+
+  private hemiLight: THREE.HemisphereLight;
+  private moonLight: THREE.DirectionalLight;
+  private gridHelper: THREE.GridHelper;
+  private luxOverlayState: LuxOverlayUniformState;
+  private cursorProbeMesh: THREE.Mesh;
+
+  private lightEntries = new Map<string, LightRigEntry>();
+  private targetGroups = new Map<string, THREE.Group>();
+  private animatedActors = new Map<string, AnimatedActorState>();
+  private contactShadowTex: THREE.CanvasTexture;
+  private asphaltTex: THREE.CanvasTexture;
+  private sidewalkTex: THREE.CanvasTexture;
+  private curbMat: THREE.MeshStandardMaterial;
+  private sidewalkMat: THREE.MeshStandardMaterial;
+  private selectedSidewalkMat: THREE.MeshStandardMaterial;
+  private sidewalkGroup = new THREE.Group();
+  private sidewalkMeshes: THREE.Mesh[] = [];
+  private baseGroundMeshes: THREE.Object3D[] = [];
+  private modularRoadEntries: RoadSpatialEntry[] = [];
+  private roundaboutEntries: Array<{
+    idx: number;
+    entry: RoadSpatialEntry;
+    isMini: boolean;
+    ringZoneR: number;
+    yieldLineR: number;
+    approachMaxR: number;
+  }> = [];
+  private intersectionEntries: Array<{ x: number; z: number }> = [];
+  private roadGraph: RoadLaneGraph = { nodes: [], edges: [] };
+  private walkGraph: WalkGraph = { nodes: [], edges: [] };
+  private trafficControllers: TrafficController[] = [];
+  private trafficSignalClock = 0;
+  private lastRoadSignature = '__init__';
+
+  private raycaster = new THREE.Raycaster();
+  private pickables: THREE.Object3D[] = [];
+  private groundPickMeshes: THREE.Object3D[] = [];
+  private lastGroundCursorHit: THREE.Vector3 | null = null;
+  private lastCursorProbePoint: { x: number; y: number; z: number } | null = null;
+
+  private currentFixtures: LightFixture[] = [];
+  private currentTargets: StreetTarget[] = [];
+  private vehicleTargets: StreetTarget[] = [];
+  private pedestrianTargets: StreetTarget[] = [];
+  private prevFixturesProp: LightFixture[] | null = null;
+  private prevTargetsProp: StreetTarget[] | null = null;
+  private prevSelectedFixtureId: string | null = null;
+  private prevSelectedTargetId: string | null = null;
+  private prevShowBeamEnvelope: boolean | null = null;
+  private prevAmbientMode: 'night' | 'twilight' | null = null;
+  private prevShowLuxHeatmap: boolean | null = null;
+  private prevLuxThreshold: number | null = null;
+  private currentLuxThreshold = 2.0;
+  private pickablesDirty = true;
+
+  private lastPhotometricsKey = '';
+  private cachedPhotometrics: {
+    peakGroundLux: number;
+    footprintAreaSqM: number;
+    centerThrowDistM: number | null;
+  } = {
+    peakGroundLux: 0,
+    footprintAreaSqM: 0,
+    centerThrowDistM: null,
+  };
+  private lastEmittedStatsKey = '';
+
+  private selectedFixtureId: string | null = null;
+  private selectedTargetId: string | null = null;
+  private selectedSidewalkKey: string | null = null;
+  private pendingSidewalkClick: SelectedSidewalkInfo | null = null;
+  private draggingTargetId: string | null = null;
+  private draggingFixtureId: string | null = null;
+  private pointerDownHitPickable = false;
+  private dragOffset = new THREE.Vector2();
+  private lastHoverProbeTime = 0;
+  private lastPointerClient: { x: number; y: number } | null = null;
+  private builderTool: BuilderTool = null;
+  private builderRotationY = 0;
+  private builderGhostGroup: THREE.Group | null = null;
+  private dragPreviewTool: BuilderTool = null;
+  private dragGhostGroup: THREE.Group | null = null;
+  private pointerDownClient = { x: 0, y: 0, button: -1 };
+  private controlsConfig: InputControlsConfig = {
+    ...DEFAULT_INPUT_CONTROLS,
+    keybinds: { ...DEFAULT_INPUT_CONTROLS.keybinds },
+  };
+
+  // Smooth camera transition state
+  private cameraTransition: {
+    active: boolean;
+    targetPos: THREE.Vector3;
+    targetLookAt: THREE.Vector3;
+  } = {
+    active: false,
+    targetPos: new THREE.Vector3(),
+    targetLookAt: new THREE.Vector3(),
+  };
+
+  // Coalesced on-demand rendering state
+  private frameId = 0;
+  private renderBusy = false;
+  private renderDirty = false;
+  private lastTickTime = performance.now();
+  private disposed = false;
+  private pressedKeys = new Set<string>();
+  private cameraControlMode: CameraControlMode = 'orbit';
+  private isFreeLooking = false;
+  private isFreePanning = false;
+  private lastLookPointer = { x: 0, y: 0 };
+  private freeYaw = 0;
+  private freePitch = 0;
+  private savedOrbitDistance = 18;
+
+  constructor(container: HTMLElement, callbacks: SceneCallbacks) {
+    this.container = container;
+    this.callbacks = callbacks;
+    this.isSoftwareGl = detectSoftwareGl();
+
+    this.renderer = new THREE.WebGLRenderer({
+      antialias: !this.isSoftwareGl,
+      powerPreference: 'high-performance',
+    });
+    this.renderer.outputColorSpace = THREE.SRGBColorSpace;
+    this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    this.renderer.toneMappingExposure = 1.15;
+    this.renderer.setPixelRatio(this.isSoftwareGl ? 1 : Math.min(window.devicePixelRatio, 1.5));
+    this.renderer.shadowMap.enabled = !this.isSoftwareGl;
+    this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+
+    const rect = container.getBoundingClientRect();
+    const width = Math.max(rect.width, 320);
+    const height = Math.max(rect.height, 240);
+    this.renderer.setSize(width, height);
+    this.renderer.domElement.style.display = 'block';
+    this.renderer.domElement.style.width = '100%';
+    this.renderer.domElement.style.height = '100%';
+    container.appendChild(this.renderer.domElement);
+
+    this.scene = new THREE.Scene();
+    this.scene.background = new THREE.Color(0x070a12);
+    this.scene.fog = new THREE.FogExp2(0x070a12, 0.0075);
+
+    // Procedural Studio Environment Map for metallic & clearcoat reflections
+    const pmremGenerator = new THREE.PMREMGenerator(this.renderer);
+    this.scene.environment = pmremGenerator.fromScene(new RoomEnvironment(), 0.04).texture;
+    this.scene.environmentIntensity = 0.25;
+    pmremGenerator.dispose();
+
+    this.camera = new THREE.PerspectiveCamera(46, width / height, 0.1, 320);
+    this.camera.position.set(16.5, 12.5, 21.5);
+    this.camera.layers.mask = (1 << 0) | (1 << 2);
+
+    this.controls = new OrbitControls(this.camera, this.renderer.domElement);
+    this.controls.target.set(0, 1.5, 0);
+    this.controls.enableDamping = !this.isSoftwareGl;
+    this.controls.dampingFactor = 0.07;
+    this.controls.enablePan = true;
+    this.controls.screenSpacePanning = false;
+    this.controls.panSpeed = 1.35;
+    this.controls.maxPolarAngle = Math.PI * 0.495;
+    this.controls.minDistance = 0.6;
+    this.controls.maxDistance = 150.0;
+    this.controls.mouseButtons.LEFT = THREE.MOUSE.PAN;
+    this.controls.mouseButtons.RIGHT = THREE.MOUSE.ROTATE;
+    this.controls.touches.ONE = THREE.TOUCH.ROTATE;
+    this.setCameraControlMode('orbit');
+    this.applyControlsConfig();
+    this.controls.update();
+
+    this.controls.addEventListener('start', () => {
+      // Cancel scripted camera glide immediately on user drag
+      this.cameraTransition.active = false;
+    });
+    this.controls.addEventListener('change', () => {
+      if (this.lastPointerClient) {
+        this.updateCursorProbe(false);
+      }
+      this.requestRender();
+    });
+
+    // Ambient twilight hemisphere + soft moonlight key
+    this.hemiLight = new THREE.HemisphereLight(0x385178, 0x10141c, 0.42);
+    this.scene.add(this.hemiLight);
+
+    this.moonLight = new THREE.DirectionalLight(0x9ab8e8, 0.26);
+    this.moonLight.position.set(-16, 22, 14);
+    this.scene.add(this.moonLight);
+
+    // Procedural textures & shared sidewalk materials
+    const maxAniso = this.renderer.capabilities.getMaxAnisotropy();
+    this.asphaltTex = createAsphaltTexture(maxAniso);
+    this.sidewalkTex = createSidewalkTexture(maxAniso);
+    this.sidewalkTex.repeat.set(1, 1);
+    this.contactShadowTex = createContactShadowTexture();
+
+    this.luxOverlayState = createLuxOverlayUniformState();
+
+    this.curbMat = new THREE.MeshStandardMaterial({
+      color: 0x475569,
+      roughness: 0.78,
+      metalness: 0.04,
+    });
+    this.sidewalkMat = new THREE.MeshStandardMaterial({
+      map: this.sidewalkTex,
+      roughness: 0.88,
+      metalness: 0.02,
+    });
+    this.selectedSidewalkMat = new THREE.MeshStandardMaterial({
+      map: this.sidewalkTex,
+      color: 0x99f6e4,
+      emissive: 0x0891b2,
+      emissiveIntensity: 0.45,
+      roughness: 0.84,
+      metalness: 0.04,
+    });
+    attachLuxOverlayToMaterial(this.curbMat, this.luxOverlayState);
+    attachLuxOverlayToMaterial(this.sidewalkMat, this.luxOverlayState);
+    attachLuxOverlayToMaterial(this.selectedSidewalkMat, this.luxOverlayState);
+
+    this.buildStreetEnvironment();
+
+    // Coordinate reference grid (2m cells across 128m x 128m)
+    this.gridHelper = new THREE.GridHelper(128, 64, 0x334155, 0x1e293b);
+    this.gridHelper.position.y = 0.018;
+    const gridMats = Array.isArray(this.gridHelper.material)
+      ? this.gridHelper.material
+      : [this.gridHelper.material];
+    for (const m of gridMats) {
+      m.transparent = true;
+      m.opacity = 0.4;
+      m.depthWrite = false;
+    }
+    this.scene.add(this.gridHelper);
+
+    // Live cursor lux probe reticle (always rendered visibly on top of all surfaces on Layer 2)
+    this.cursorProbeMesh = new THREE.Mesh(
+      new THREE.RingGeometry(0.17, 0.25, 28),
+      new THREE.MeshBasicMaterial({
+        color: 0x06b6d4,
+        side: THREE.DoubleSide,
+        transparent: true,
+        opacity: 0.92,
+        depthTest: false,
+        depthWrite: false,
+        fog: false,
+      }),
+    );
+    this.cursorProbeMesh.rotation.x = -Math.PI / 2;
+    this.cursorProbeMesh.position.set(0, 0.05, 0);
+    this.cursorProbeMesh.renderOrder = 999;
+    this.cursorProbeMesh.layers.set(2);
+
+    const cursorCenterDot = new THREE.Mesh(
+      new THREE.CircleGeometry(0.095, 24),
+      new THREE.MeshBasicMaterial({
+        color: 0x38bdf8,
+        side: THREE.DoubleSide,
+        transparent: true,
+        opacity: 0.98,
+        depthTest: false,
+        depthWrite: false,
+        fog: false,
+      }),
+    );
+    cursorCenterDot.renderOrder = 1000;
+    cursorCenterDot.layers.set(2);
+    this.cursorProbeMesh.add(cursorCenterDot);
+    this.cursorProbeMesh.visible = false;
+    this.scene.add(this.cursorProbeMesh);
+
+    this.bindEvents();
+
+    if (!this.isSoftwareGl) {
+      this.renderer.compile(this.scene, this.camera);
+    }
+    this.requestRender();
+  }
+
+  private buildStreetEnvironment(): void {
+    // Extended dark earth base beyond corridor
+    const terrainMat = new THREE.MeshStandardMaterial({
+      color: 0x0b0f17,
+      roughness: 0.95,
+      metalness: 0.0,
+    });
+    attachLuxOverlayToMaterial(terrainMat, this.luxOverlayState);
+    const terrain = new THREE.Mesh(new THREE.PlaneGeometry(320, 320), terrainMat);
+    terrain.rotation.x = -Math.PI / 2;
+    terrain.position.y = -0.02;
+    terrain.receiveShadow = true;
+    this.scene.add(terrain);
+    this.baseGroundMeshes.push(terrain);
+
+    this.scene.add(this.sidewalkGroup);
+    this.rebuildSidewalks([]);
+  }
+
+  private buildSidewalkPartGeometry(
+    entry: RoadSpatialEntry,
+    ownerIdx: number,
+    roadEntries: RoadSpatialEntry[],
+    patches: Array<{
+      uVals: number[];
+      vVals: number[];
+      localPoint: (u: number, v: number) => [number, number];
+    }>,
+  ): { geometry: THREE.BufferGeometry; centerX: number; centerZ: number } {
+    const positions: number[] = [];
+    const normals: number[] = [];
+    const uvs: number[] = [];
+    const indices: number[] = [];
+    const uScale = 36 / (MAP_HALF_X * 2);
+    const vScale = 3 / 6.2;
+    const topY = 0.12;
+    let sumX = 0;
+    let sumZ = 0;
+    let activeCount = 0;
+
+    const pushTopQuad = (
+      x0: number,
+      z0: number,
+      x1: number,
+      z1: number,
+      x2: number,
+      z2: number,
+      x3: number,
+      z3: number,
+    ) => {
+      const base = positions.length / 3;
+      const pts: [number, number][] = [
+        [x0, z0],
+        [x1, z1],
+        [x2, z2],
+        [x3, z3],
+      ];
+      for (const [wx, wz] of pts) {
+        positions.push(wx, topY, wz);
+        normals.push(0, 1, 0);
+        uvs.push((wx + MAP_HALF_X) * uScale, (wz - 4.76) * vScale);
+      }
+      const crossY = (z1 - z0) * (x2 - x0) - (x1 - x0) * (z2 - z0);
+      if (crossY >= 0) {
+        indices.push(base, base + 1, base + 2, base, base + 2, base + 3);
+      } else {
+        indices.push(base, base + 2, base + 1, base, base + 3, base + 2);
+      }
+    };
+
+    const pushSkirtQuad = (
+      ax: number,
+      az: number,
+      bx: number,
+      bz: number,
+      insideX: number,
+      insideZ: number,
+    ) => {
+      const len = Math.hypot(bx - ax, bz - az);
+      if (len < 1e-4) return;
+      const mx = (ax + bx) * 0.5;
+      const mz = (az + bz) * 0.5;
+      let p0x = ax;
+      let p0z = az;
+      let p1x = bx;
+      let p1z = bz;
+      const nx = bz - az;
+      const nz = -(bx - ax);
+      if (nx * (insideX - mx) + nz * (insideZ - mz) > 0) {
+        p0x = bx;
+        p0z = bz;
+        p1x = ax;
+        p1z = az;
+      }
+      const unx = (p1z - p0z) / len;
+      const unz = -(p1x - p0x) / len;
+      const base = positions.length / 3;
+      positions.push(
+        p0x, topY, p0z,
+        p1x, topY, p1z,
+        p1x, 0, p1z,
+        p0x, 0, p0z,
+      );
+      for (let k = 0; k < 4; k++) normals.push(unx, 0, unz);
+      uvs.push(0, 0.1, len * uScale, 0.1, len * uScale, 0, 0, 0);
+      indices.push(base, base + 1, base + 2, base, base + 2, base + 3);
+    };
+
+    const isClaimedEarlier = (wx: number, wz: number): boolean => {
+      for (let k = 0; k < ownerIdx; k++) {
+        const prev = roadEntries[k];
+        const dx = wx - prev.target.position.x;
+        const dz = wz - prev.target.position.z;
+        if (dx * dx + dz * dz > prev.maxRadiusSq) continue;
+        const { lx, lz } = toRoadLocal(wx, wz, prev);
+        if (
+          isPointInsideTargetSidewalkLocal(
+            prev.target.kind,
+            lx,
+            lz,
+            prev.armMask,
+            prev.target.length,
+            prev.hiddenSet,
+          )
+        ) {
+          return true;
+        }
+      }
+      return false;
+    };
+
+    const tx = entry.target.position.x;
+    const tz = entry.target.position.z;
+    const cos = entry.cos;
+    const sin = entry.sin;
+
+    for (const { uVals, vVals, localPoint } of patches) {
+      const cols = uVals.length - 1;
+      const rows = vVals.length - 1;
+
+      const gridX = new Float32Array((cols + 1) * (rows + 1));
+      const gridZ = new Float32Array((cols + 1) * (rows + 1));
+      for (let i = 0; i <= cols; i++) {
+        for (let j = 0; j <= rows; j++) {
+          const [lx, lz] = localPoint(uVals[i], vVals[j]);
+          const idx = i * (rows + 1) + j;
+          gridX[idx] = tx + lx * cos + lz * sin;
+          gridZ[idx] = tz - lx * sin + lz * cos;
+        }
+      }
+
+      const active = new Uint8Array(cols * rows);
+      const cellCenterX = new Float32Array(cols * rows);
+      const cellCenterZ = new Float32Array(cols * rows);
+
+      for (let i = 0; i < cols; i++) {
+        for (let j = 0; j < rows; j++) {
+          const uMid = (uVals[i] + uVals[i + 1]) * 0.5;
+          const vMid = (vVals[j] + vVals[j + 1]) * 0.5;
+          const [lx, lz] = localPoint(uMid, vMid);
+          const cx = tx + lx * cos + lz * sin;
+          const cz = tz - lx * sin + lz * cos;
+          const cIdx = i * rows + j;
+          cellCenterX[cIdx] = cx;
+          cellCenterZ[cIdx] = cz;
+
+          if (Math.abs(cx) > MAP_HALF_X + 1.5 || Math.abs(cz) > MAP_HALF_Z + 1.5) continue;
+          if (isPointInsideAnyRoadway(cx, cz, roadEntries)) continue;
+          if (isClaimedEarlier(cx, cz)) continue;
+          active[cIdx] = 1;
+          sumX += cx;
+          sumZ += cz;
+          activeCount++;
+        }
+      }
+
+      for (let i = 0; i < cols; i++) {
+        for (let j = 0; j < rows; j++) {
+          const cIdx = i * rows + j;
+          if (!active[cIdx]) continue;
+          const p00 = i * (rows + 1) + j;
+          const p10 = (i + 1) * (rows + 1) + j;
+          const p11 = (i + 1) * (rows + 1) + (j + 1);
+          const p01 = i * (rows + 1) + (j + 1);
+
+          const x00 = gridX[p00];
+          const z00 = gridZ[p00];
+          const x10 = gridX[p10];
+          const z10 = gridZ[p10];
+          const x11 = gridX[p11];
+          const z11 = gridZ[p11];
+          const x01 = gridX[p01];
+          const z01 = gridZ[p01];
+
+          pushTopQuad(x00, z00, x10, z10, x11, z11, x01, z01);
+
+          const cx = cellCenterX[cIdx];
+          const cz = cellCenterZ[cIdx];
+          if (i === 0 || !active[(i - 1) * rows + j]) pushSkirtQuad(x00, z00, x01, z01, cx, cz);
+          if (i === cols - 1 || !active[(i + 1) * rows + j]) pushSkirtQuad(x10, z10, x11, z11, cx, cz);
+          if (j === 0 || !active[i * rows + (j - 1)]) pushSkirtQuad(x00, z00, x10, z10, cx, cz);
+          if (j === rows - 1 || !active[i * rows + (j + 1)]) pushSkirtQuad(x01, z01, x11, z11, cx, cz);
+        }
+      }
+    }
+
+    const geo = new THREE.BufferGeometry();
+    if (indices.length > 0) {
+      geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+      geo.setAttribute('normal', new THREE.Float32BufferAttribute(normals, 3));
+      geo.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
+      geo.setIndex(indices);
+      geo.computeBoundingSphere();
+    }
+    return {
+      geometry: geo,
+      centerX: activeCount > 0 ? sumX / activeCount : tx,
+      centerZ: activeCount > 0 ? sumZ / activeCount : tz,
+    };
+  }
+
+  private rebuildSidewalks(targets: StreetTarget[]): void {
+    const roadEntries: RoadSpatialEntry[] = [];
+    for (const t of targets) {
+      if (!t.kind.startsWith('road-')) continue;
+      const r = getRoadSpatialRadius(t.kind, t.length);
+      const armMask = t.kind === 'road-roundabout' ? getRoundaboutArmMask(t, targets) : undefined;
+      roadEntries.push({
+        target: t,
+        cos: Math.cos(t.rotationY),
+        sin: Math.sin(t.rotationY),
+        maxRadiusSq: r * r,
+        armMask,
+        hiddenSet: new Set(t.hiddenSidewalks ?? []),
+      });
+    }
+
+    for (const child of [...this.sidewalkGroup.children]) {
+      this.sidewalkGroup.remove(child);
+      const mesh = child as THREE.Mesh;
+      if (mesh.geometry) mesh.geometry.dispose();
+    }
+    this.sidewalkMeshes = [];
+    this.modularRoadEntries = roadEntries;
+    this.roundaboutEntries = [];
+    this.intersectionEntries = [];
+    for (let i = 0; i < roadEntries.length; i++) {
+      const entry = roadEntries[i];
+      if (entry.target.kind === 'road-roundabout' || entry.target.kind === 'road-culdesac') {
+        const isMini = entry.target.kind === 'road-culdesac';
+        this.roundaboutEntries.push({
+          idx: i,
+          entry,
+          isMini,
+          ringZoneR: isMini ? 5.25 : 8.55,
+          yieldLineR: isMini ? 6.25 : 10.1,
+          approachMaxR: isMini ? 16.0 : 23.5,
+        });
+      } else if (
+        entry.target.kind === 'road-intersection' ||
+        entry.target.kind === 'road-t-junction'
+      ) {
+        this.intersectionEntries.push({
+          x: entry.target.position.x,
+          z: entry.target.position.z,
+        });
+      }
+    }
+    this.roadGraph = buildRoadLaneGraph(roadEntries);
+    this.walkGraph = buildWalkGraph(roadEntries);
+    this.pickablesDirty = true;
+    for (const actor of this.animatedActors.values()) {
+      if (actor.motion === 'drive') {
+        actor.graphNodeId = undefined;
+        actor.subPath = undefined;
+        actor.subPathIdx = 0;
+        actor.roundaboutSteps = 0;
+      } else if (actor.motion === 'walk') {
+        this.initPedestrianWalk(actor);
+      }
+    }
+
+    const nextPickMeshes: THREE.Object3D[] = [...this.baseGroundMeshes];
+    if (roadEntries.length === 0) {
+      this.groundPickMeshes = nextPickMeshes;
+      return;
+    }
+
+    const lin = (a: number, b: number, segs: number): number[] => {
+      const arr: number[] = [];
+      for (let i = 0; i <= segs; i++) arr.push(a + ((b - a) * i) / segs);
+      return arr;
+    };
+
+    const mergeSortedAngles = (a: number, b: number, baseSegs: number, critical: number[]): number[] => {
+      const set = new Set<number>(lin(a, b, baseSegs));
+      for (const c of critical) {
+        if (c > a + 1e-4 && c < b - 1e-4) set.add(c);
+      }
+      return Array.from(set).sort((x, y) => x - y);
+    };
+
+    const emitSidewalkPart = (
+      entry: RoadSpatialEntry,
+      ownerIdx: number,
+      partKey: string,
+      patches: Array<{
+        uVals: number[];
+        vVals: number[];
+        localPoint: (u: number, v: number) => [number, number];
+      }>,
+    ) => {
+      if (entry.hiddenSet.has(partKey)) return;
+      const { geometry, centerX, centerZ } = this.buildSidewalkPartGeometry(
+        entry,
+        ownerIdx,
+        roadEntries,
+        patches,
+      );
+      if (!geometry.index || geometry.index.count === 0) {
+        geometry.dispose();
+        return;
+      }
+
+      const key = `${entry.target.id}::${partKey}`;
+      const info: SelectedSidewalkInfo = {
+        key,
+        targetId: entry.target.id,
+        partKey,
+        label: formatCompassSideLabel(
+          centerX - entry.target.position.x,
+          centerZ - entry.target.position.z,
+          entry.target.label,
+        ),
+        position: {
+          x: Math.round(centerX * 10) / 10,
+          z: Math.round(centerZ * 10) / 10,
+        },
+      };
+      const mesh = new THREE.Mesh(
+        geometry,
+        key === this.selectedSidewalkKey ? this.selectedSidewalkMat : this.sidewalkMat,
+      );
+      mesh.receiveShadow = true;
+      mesh.userData.selectSidewalkKey = key;
+      mesh.userData.sidewalkInfo = info;
+      mesh.layers.enable(1);
+
+      this.sidewalkGroup.add(mesh);
+      this.sidewalkMeshes.push(mesh);
+      nextPickMeshes.push(mesh);
+    };
+
+    for (let idx = 0; idx < roadEntries.length; idx++) {
+      const entry = roadEntries[idx];
+      const kind = entry.target.kind;
+
+      if (kind === 'road-2lane') {
+        const halfL =
+          entry.target.length && entry.target.length > 0 ? entry.target.length * 0.5 : 4.0;
+        const uSegs = Math.max(8, Math.round(halfL * 4));
+        emitSidewalkPart(entry, idx, 'north', [
+          { uVals: lin(-halfL, halfL, uSegs), vVals: lin(-7.24, -4.74, 4), localPoint: (lx, lz) => [lx, lz] },
+        ]);
+        emitSidewalkPart(entry, idx, 'south', [
+          { uVals: lin(-halfL, halfL, uSegs), vVals: lin(4.74, 7.24, 4), localPoint: (lx, lz) => [lx, lz] },
+        ]);
+      } else if (kind === 'road-crosswalk') {
+        emitSidewalkPart(entry, idx, 'north', [
+          { uVals: lin(-3, 3, 12), vVals: lin(-7.24, -4.74, 4), localPoint: (lx, lz) => [lx, lz] },
+        ]);
+        emitSidewalkPart(entry, idx, 'south', [
+          { uVals: lin(-3, 3, 12), vVals: lin(4.74, 7.24, 4), localPoint: (lx, lz) => [lx, lz] },
+        ]);
+      } else if (kind === 'road-intersection') {
+        for (const sx of [-1, 1]) {
+          for (const sz of [-1, 1]) {
+            const partKey = `${sz < 0 ? 'n' : 's'}${sx < 0 ? 'w' : 'e'}`;
+            const ax0 = sx < 0 ? sx * 4.74 : sx * 4.5;
+            const ax1 = sx < 0 ? sx * 4.5 : sx * 4.74;
+            const bx0 = sx < 0 ? sx * 7.24 : sx * 4.74;
+            const bx1 = sx < 0 ? sx * 4.74 : sx * 7.24;
+            const az0 = sz < 0 ? sz * 7.24 : sz * 4.74;
+            const az1 = sz < 0 ? sz * 4.74 : sz * 7.24;
+            const bz0 = sz < 0 ? sz * 7.24 : sz * 4.5;
+            const bz1 = sz < 0 ? sz * 4.5 : sz * 7.24;
+            emitSidewalkPart(entry, idx, partKey, [
+              { uVals: [ax0, ax1], vVals: lin(az0, az1, 4), localPoint: (lx, lz) => [lx, lz] },
+              { uVals: lin(bx0, bx1, 5), vVals: lin(bz0, bz1, 5), localPoint: (lx, lz) => [lx, lz] },
+            ]);
+          }
+        }
+      } else if (kind === 'road-t-junction') {
+        emitSidewalkPart(entry, idx, 'back', [
+          { uVals: lin(-4.5, 4.5, 18), vVals: lin(-7.24, -4.74, 4), localPoint: (lx, lz) => [lx, lz] },
+        ]);
+        for (const sx of [-1, 1]) {
+          const partKey = sx < 0 ? 'sw' : 'se';
+          const ax0 = sx < 0 ? sx * 4.74 : sx * 4.5;
+          const ax1 = sx < 0 ? sx * 4.5 : sx * 4.74;
+          const bx0 = sx < 0 ? sx * 7.24 : sx * 4.74;
+          const bx1 = sx < 0 ? sx * 4.74 : sx * 7.24;
+          emitSidewalkPart(entry, idx, partKey, [
+            { uVals: [ax0, ax1], vVals: lin(4.74, 7.24, 4), localPoint: (lx, lz) => [lx, lz] },
+            { uVals: lin(bx0, bx1, 5), vVals: lin(4.5, 7.24, 5), localPoint: (lx, lz) => [lx, lz] },
+          ]);
+        }
+      } else if (kind === 'road-turn-90') {
+        emitSidewalkPart(entry, idx, 'outer', [
+          {
+            uVals: lin(0, Math.PI / 2, 24),
+            vVals: lin(10.74, 13.24, 4),
+            localPoint: (ang, r) => [-6 + r * Math.cos(ang), 6 - r * Math.sin(ang)],
+          },
+        ]);
+        emitSidewalkPart(entry, idx, 'inner', [
+          {
+            uVals: lin(0, Math.PI / 2, 14),
+            vVals: lin(0.02, 1.26, 3),
+            localPoint: (ang, r) => [-6 + r * Math.cos(ang), 6 - r * Math.sin(ang)],
+          },
+        ]);
+      } else if (kind === 'road-curve-45') {
+        emitSidewalkPart(entry, idx, 'inner', [
+          {
+            uVals: lin(Math.PI / 4, Math.PI / 2, 18),
+            vVals: lin(6.76, 9.26, 4),
+            localPoint: (ang, r) => [-4.95 + r * Math.cos(ang), 11.95 - r * Math.sin(ang)],
+          },
+        ]);
+        emitSidewalkPart(entry, idx, 'outer', [
+          {
+            uVals: lin(Math.PI / 4, Math.PI / 2, 24),
+            vVals: lin(18.74, 21.24, 4),
+            localPoint: (ang, r) => [-4.95 + r * Math.cos(ang), 11.95 - r * Math.sin(ang)],
+          },
+        ]);
+      } else if (kind === 'road-roundabout') {
+        const armMask = entry.armMask ?? 15;
+        const openE = (armMask & 1) !== 0;
+        const openN = (armMask & 2) !== 0;
+        const openW = (armMask & 4) !== 0;
+        const openS = (armMask & 8) !== 0;
+
+        const aMin = Math.atan2(4.74, 10.0);
+        const aMax = Math.atan2(10.0, 4.74);
+        const thetas = mergeSortedAngles(aMin, aMax, 14, [
+          Math.atan2(4.74, 9.85),
+          Math.atan2(7.24, 10.0),
+          Math.atan2(10.0, 7.24),
+          Math.atan2(9.85, 4.74),
+        ]);
+        for (const sx of [-1, 1]) {
+          for (const sz of [-1, 1]) {
+            const openX = sx > 0 ? openE : openW;
+            const openZ = sz > 0 ? openS : openN;
+            const partKey = `${sz < 0 ? 'n' : 's'}${sx < 0 ? 'w' : 'e'}`;
+            emitSidewalkPart(entry, idx, partKey, [
+              {
+                uVals: thetas,
+                vVals: lin(0, 1, 4),
+                localPoint: (th, t) => {
+                  const c = Math.cos(th);
+                  const s = Math.sin(th);
+                  const rIn = Math.max(9.85, 4.74 / s, 4.74 / c);
+                  const rOut = Math.min(12.35, openX ? 10.0 / c : 12.35, openZ ? 10.0 / s : 12.35);
+                  const r = rIn + (Math.max(rIn, rOut) - rIn) * t;
+                  return [sx * r * c, sz * r * s];
+                },
+              },
+            ]);
+          }
+        }
+
+        // Continuous curved sidewalk across any sealed roundabout arms
+        for (const [bit, capName, cosD, sinD] of [
+          [1, 'cap-E', 1, 0],
+          [2, 'cap-N', 0, -1],
+          [4, 'cap-W', -1, 0],
+          [8, 'cap-S', 0, 1],
+        ] as const) {
+          if ((armMask & bit) !== 0) continue;
+          emitSidewalkPart(entry, idx, capName, [
+            {
+              uVals: lin(-4.74, 4.74, 14),
+              vVals: lin(0, 1, 4),
+              localPoint: (v, t) => {
+                const uIn = Math.sqrt(9.85 * 9.85 - v * v);
+                const uOut = Math.sqrt(12.35 * 12.35 - v * v);
+                const u = uIn + (uOut - uIn) * t;
+                return [u * cosD - v * sinD, u * sinD + v * cosD];
+              },
+            },
+          ]);
+        }
+      } else if (kind === 'road-culdesac') {
+        emitSidewalkPart(entry, idx, 'ring', [
+          {
+            uVals: lin(0, Math.PI * 2, 36),
+            vVals: lin(6.19, 8.69, 4),
+            localPoint: (ang, r) => [r * Math.cos(ang), r * Math.sin(ang)],
+          },
+        ]);
+      } else if (kind === 'road-deadend') {
+        const thetaNeck = Math.asin(4.74 / 6.18);
+        const aEnd = Math.PI - thetaNeck;
+        const critFlare = Math.acos(-3.96 / 8.68);
+        const thetas = mergeSortedAngles(-aEnd, aEnd, 32, [-critFlare, critFlare]);
+        emitSidewalkPart(entry, idx, 'ring', [
+          { uVals: lin(-6.0, -3.96, 4), vVals: lin(-7.24, -4.74, 4), localPoint: (lx, lz) => [lx, lz] },
+          { uVals: lin(-6.0, -3.96, 4), vVals: lin(4.74, 7.24, 4), localPoint: (lx, lz) => [lx, lz] },
+          {
+            uVals: thetas,
+            vVals: lin(0, 1, 4),
+            localPoint: (ang, t) => {
+              const c = Math.cos(ang);
+              const s = Math.sin(ang);
+              const rIn = 6.18;
+              const rOut = c < -3.96 / 8.68 ? Math.min(8.68, Math.max(rIn, -3.96 / c)) : 8.68;
+              const r = rIn + (rOut - rIn) * t;
+              return [r * c, r * s];
+            },
+          },
+        ]);
+      }
+    }
+
+    this.groundPickMeshes = nextPickMeshes;
+  }
+
+  private bindEvents(): void {
+    const dom = this.renderer.domElement;
+    dom.addEventListener('pointerdown', this.onPointerDown, { capture: true });
+    dom.addEventListener('wheel', this.onCanvasWheel, { passive: false });
+    dom.addEventListener('contextmenu', this.onContextMenu);
+    window.addEventListener('pointermove', this.onPointerMove);
+    window.addEventListener('pointerup', this.onPointerUp);
+    window.addEventListener('keydown', this.onKeyDown);
+    window.addEventListener('keyup', this.onKeyUp);
+    window.addEventListener('blur', this.onWindowBlur);
+    window.addEventListener('resize', this.onResize);
+    dom.addEventListener('webglcontextlost', this.onContextLost);
+    dom.addEventListener('webglcontextrestored', this.onContextRestored);
+  }
+
+  private unbindEvents(): void {
+    const dom = this.renderer.domElement;
+    dom.removeEventListener('pointerdown', this.onPointerDown, { capture: true });
+    dom.removeEventListener('wheel', this.onCanvasWheel);
+    dom.removeEventListener('contextmenu', this.onContextMenu);
+    window.removeEventListener('pointermove', this.onPointerMove);
+    window.removeEventListener('pointerup', this.onPointerUp);
+    window.removeEventListener('keydown', this.onKeyDown);
+    window.removeEventListener('keyup', this.onKeyUp);
+    window.removeEventListener('blur', this.onWindowBlur);
+    window.removeEventListener('resize', this.onResize);
+    dom.removeEventListener('webglcontextlost', this.onContextLost);
+    dom.removeEventListener('webglcontextrestored', this.onContextRestored);
+  }
+
+  private mouseButtonToIndex(btn: MouseDragButton): number {
+    if (btn === 'left') return 0;
+    if (btn === 'middle') return 1;
+    return 2;
+  }
+
+  private isAnyActionBoundTo(code: string): boolean {
+    const kb = this.controlsConfig.keybinds;
+    return (
+      kb.moveForward === code ||
+      kb.moveBackward === code ||
+      kb.moveLeft === code ||
+      kb.moveRight === code ||
+      kb.moveUp === code ||
+      kb.moveDown === code ||
+      kb.rotate === code ||
+      kb.delete === code ||
+      kb.toggleDock === code
+    );
+  }
+
+  private applyControlsConfig(): void {
+    const mapAction = (btn: MouseDragButton): THREE.MOUSE | null => {
+      if (this.controlsConfig.rotateMouseButton === btn) return THREE.MOUSE.ROTATE;
+      if (this.controlsConfig.panMouseButton === btn) return THREE.MOUSE.PAN;
+      return btn === 'middle' ? THREE.MOUSE.DOLLY : null;
+    };
+    this.controls.mouseButtons.LEFT = mapAction('left');
+    this.controls.mouseButtons.MIDDLE = mapAction('middle');
+    this.controls.mouseButtons.RIGHT = mapAction('right');
+    this.controls.rotateSpeed = this.controlsConfig.rotateSensitivity;
+    this.controls.zoomSpeed = this.controlsConfig.zoomSensitivity;
+    this.controls.panSpeed = 1.35 * this.controlsConfig.moveSpeed;
+  }
+
+  public setControlsConfig(config: InputControlsConfig): void {
+    this.controlsConfig = {
+      ...config,
+      keybinds: { ...config.keybinds },
+    };
+    this.applyControlsConfig();
+    this.controls.update();
+    this.requestRender();
+  }
+
+  private isMoveKey(code: string): boolean {
+    const kb = this.controlsConfig.keybinds;
+    if (
+      code === kb.moveForward ||
+      code === kb.moveBackward ||
+      code === kb.moveLeft ||
+      code === kb.moveRight ||
+      code === kb.moveUp ||
+      code === kb.moveDown
+    ) {
+      return true;
+    }
+    // Keep Arrow keys / Q / E as secondary aliases only if not rebound to another action
+    if (!this.isAnyActionBoundTo(code)) {
+      return (
+        code === 'ArrowUp' ||
+        code === 'ArrowDown' ||
+        code === 'ArrowLeft' ||
+        code === 'ArrowRight' ||
+        code === 'KeyE' ||
+        code === 'KeyQ' ||
+        code === 'ShiftRight'
+      );
+    }
+    return false;
+  }
+
+  private onKeyDown = (e: KeyboardEvent) => {
+    if (e.defaultPrevented) return;
+    const tag = (e.target as HTMLElement | null)?.tagName;
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+    if (document.querySelector('[data-keybind-capture="true"]')) return;
+
+    const kb = this.controlsConfig.keybinds;
+
+    if (this.builderTool !== null) {
+      if (e.code === kb.rotate) {
+        e.preventDefault();
+        this.callbacks.onRotateBuilderTool();
+        return;
+      }
+      if (e.code === 'Escape') {
+        e.preventDefault();
+        this.callbacks.onCancelBuilderTool();
+        return;
+      }
+    } else {
+      if (e.code === kb.rotate) {
+        e.preventDefault();
+        this.callbacks.onRotateSelected?.(e.shiftKey ? -Math.PI / 4 : Math.PI / 4);
+        return;
+      }
+      if (
+        e.code === kb.delete ||
+        (kb.delete === 'Delete' && e.code === 'Backspace' && !this.isAnyActionBoundTo('Backspace'))
+      ) {
+        e.preventDefault();
+        this.callbacks.onDeleteSelected?.();
+        return;
+      }
+      if (e.code === 'Escape') {
+        e.preventDefault();
+        this.callbacks.onSelectTarget(null);
+        return;
+      }
+    }
+
+    if (!this.isMoveKey(e.code)) return;
+
+    if (
+      e.code === 'Space' ||
+      e.code === kb.moveUp ||
+      e.code === 'ArrowUp' ||
+      e.code === 'ArrowDown' ||
+      e.code === 'ArrowLeft' ||
+      e.code === 'ArrowRight'
+    ) {
+      e.preventDefault();
+    }
+
+    const hadKey = this.pressedKeys.has(e.code);
+    this.pressedKeys.add(e.code);
+    if (!hadKey) {
+      this.cameraTransition.active = false;
+      this.requestRender();
+    }
+  };
+
+  private onKeyUp = (e: KeyboardEvent) => {
+    this.pressedKeys.delete(e.code);
+  };
+
+  private onWindowBlur = () => {
+    this.pressedKeys.clear();
+    this.isFreeLooking = false;
+    this.isFreePanning = false;
+  };
+
+  private onContextMenu = (e: MouseEvent) => {
+    e.preventDefault();
+  };
+
+  private onCanvasWheel = (e: WheelEvent) => {
+    if (this.cameraControlMode !== 'pan') return;
+    e.preventDefault();
+    this.cameraTransition.active = false;
+    this.camera.getWorldDirection(_vec3A);
+    const step = clamp(-e.deltaY * 0.015 * this.controlsConfig.zoomSensitivity, -6, 6);
+    this.camera.position.addScaledVector(_vec3A, step);
+    this.camera.position.x = clamp(this.camera.position.x, -110, 110);
+    this.camera.position.y = clamp(this.camera.position.y, 0.45, 75);
+    this.camera.position.z = clamp(this.camera.position.z, -110, 110);
+    this.controls.target
+      .copy(this.camera.position)
+      .addScaledVector(_vec3A, this.savedOrbitDistance);
+    this.requestRender();
+  };
+
+  public setCameraControlMode(mode: CameraControlMode): void {
+    if (mode === this.cameraControlMode) return;
+    this.cameraControlMode = mode;
+    this.isFreeLooking = false;
+    this.isFreePanning = false;
+
+    if (mode === 'pan') {
+      // Save current orbit distance and switch to free-look + move mode
+      this.savedOrbitDistance = clamp(
+        this.camera.position.distanceTo(this.controls.target),
+        3,
+        40,
+      );
+      _euler.setFromQuaternion(this.camera.quaternion, 'YXZ');
+      this.freePitch = _euler.x;
+      this.freeYaw = _euler.y;
+      this.controls.enabled = false;
+      this.renderer.domElement.style.cursor = 'grab';
+    } else {
+      // Sync orbit target ahead of camera and restore OrbitControls
+      this.camera.getWorldDirection(_vec3A);
+      this.controls.target
+        .copy(this.camera.position)
+        .addScaledVector(_vec3A, this.savedOrbitDistance);
+      this.controls.target.y = clamp(this.controls.target.y, 0, 25);
+      this.controls.enabled = true;
+      this.applyControlsConfig();
+      this.controls.touches.ONE = THREE.TOUCH.ROTATE;
+      this.controls.update();
+      this.renderer.domElement.style.cursor = 'crosshair';
+    }
+    this.requestRender();
+  }
+
+  public setBuilderState(tool: BuilderTool, rotationY: number): void {
+    const toolChanged = tool !== this.builderTool;
+    this.builderTool = tool;
+    this.builderRotationY = rotationY;
+
+    if (toolChanged) {
+      if (this.builderGhostGroup) {
+        this.scene.remove(this.builderGhostGroup);
+        disposeObject3DResources(this.builderGhostGroup);
+        this.builderGhostGroup = null;
+      }
+
+      if (tool !== null) {
+        this.builderGhostGroup = createBuilderGhostGroup(tool);
+        this.builderGhostGroup.traverse((obj) => obj.layers.set(2));
+        this.builderGhostGroup.visible = false;
+        this.scene.add(this.builderGhostGroup);
+      }
+    }
+
+    if (this.builderGhostGroup) {
+      this.builderGhostGroup.rotation.y = rotationY;
+    }
+
+    this.renderer.domElement.style.cursor =
+      tool !== null
+        ? 'copy'
+        : this.cameraControlMode === 'pan'
+          ? 'grab'
+          : 'crosshair';
+    this.requestRender();
+  }
+
+  private disposeGhostGroup(group: THREE.Group | null): void {
+    if (!group) return;
+    this.scene.remove(group);
+    disposeObject3DResources(group);
+  }
+
+  private snapRoadOrPathPosition(
+    kind: TargetKind,
+    rawX: number,
+    rawZ: number,
+    rotationY: number,
+    excludeTargetId?: string,
+    length?: number,
+  ): { x: number; z: number } {
+    const ports = getSegmentLocalPorts(kind, rotationY, length);
+    if (ports.length === 0) {
+      return {
+        x: clamp(this.snapCoordinate(rawX), -MAP_HALF_X, MAP_HALF_X),
+        z: clamp(this.snapCoordinate(rawZ), -MAP_HALF_Z, MAP_HALF_Z),
+      };
+    }
+
+    const snapThreshold = 3.2;
+    let bestDist = Infinity;
+    let bestX = rawX;
+    let bestZ = rawZ;
+
+    // Snap flush to existing placed roads & paths via opposing outward ports
+    for (const target of this.currentTargets) {
+      if (target.id === excludeTargetId) continue;
+      if (!ROAD_PORT_DIMS[target.kind]) continue;
+      const tPorts = getSegmentLocalPorts(target.kind, target.rotationY, target.length);
+      for (const tp of tPorts) {
+        const px = target.position.x + tp.ox;
+        const pz = target.position.z + tp.oz;
+        for (const mp of ports) {
+          if (tp.nx * mp.nx + tp.nz * mp.nz > -0.7) continue;
+          const cx = px - mp.ox;
+          const cz = pz - mp.oz;
+          const d = Math.hypot(cx - rawX, cz - rawZ);
+          if (d <= snapThreshold && d < bestDist) {
+            bestDist = d;
+            bestX = cx;
+            bestZ = cz;
+          }
+        }
+      }
+    }
+
+    const gridX = this.snapCoordinate(rawX);
+    if (bestDist === Infinity) {
+      return {
+        x: clamp(gridX, -MAP_HALF_X, MAP_HALF_X),
+        z: clamp(this.snapCoordinate(rawZ), -MAP_HALF_Z, MAP_HALF_Z),
+      };
+    }
+
+    return {
+      x: clamp(Math.round(bestX * 100) / 100, -MAP_HALF_X, MAP_HALF_X),
+      z: clamp(Math.round(bestZ * 100) / 100, -MAP_HALF_Z, MAP_HALF_Z),
+    };
+  }
+
+  private resolvePlacementCoords(
+    clientX: number,
+    clientY: number,
+    tool?: Exclude<BuilderTool, null>,
+    rotationY = 0,
+  ): { x: number; y: number; z: number } | null {
+    if (!this.updateNormalizedPointer(clientX, clientY)) return null;
+    this.raycaster.setFromCamera(_mouse, this.camera);
+    const kind = tool && tool !== 'light' ? tool : undefined;
+    const groundHits = this.raycaster.intersectObjects(this.groundPickMeshes, false);
+    const pt =
+      groundHits.length > 0
+        ? groundHits[0].point
+        : this.raycaster.ray.intersectPlane(_groundPlane, _dragHit)
+          ? _dragHit
+          : null;
+    if (!pt) return null;
+
+    if (kind && isRoadOrPathKind(kind)) {
+      const snapped = this.snapRoadOrPathPosition(kind, pt.x, pt.z, rotationY);
+      return {
+        x: snapped.x,
+        y: this.getGroundPlacementHeight(snapped.x, snapped.z, kind),
+        z: snapped.z,
+      };
+    }
+
+    const sx = clamp(this.snapCoordinate(pt.x), -MAP_HALF_X, MAP_HALF_X);
+    const sz = clamp(this.snapCoordinate(pt.z), -MAP_HALF_Z, MAP_HALF_Z);
+    return { x: sx, y: this.getGroundPlacementHeight(sx, sz, kind), z: sz };
+  }
+
+  public previewBuilderDragAt(
+    tool: Exclude<BuilderTool, null>,
+    clientX: number,
+    clientY: number,
+    rotationY: number,
+  ): void {
+    if (this.dragPreviewTool !== tool || !this.dragGhostGroup) {
+      this.disposeGhostGroup(this.dragGhostGroup);
+      this.dragGhostGroup = createBuilderGhostGroup(tool);
+      this.dragGhostGroup.traverse((obj) => obj.layers.set(2));
+      this.dragPreviewTool = tool;
+      this.scene.add(this.dragGhostGroup);
+    }
+
+    const coords = this.resolvePlacementCoords(clientX, clientY, tool, rotationY);
+    if (coords) {
+      this.dragGhostGroup.position.set(coords.x, coords.y, coords.z);
+      this.dragGhostGroup.rotation.y = rotationY;
+      this.dragGhostGroup.visible = true;
+    } else {
+      this.dragGhostGroup.visible = false;
+    }
+    this.requestRender();
+  }
+
+  public clearBuilderDragPreview(): void {
+    if (!this.dragGhostGroup) return;
+    this.disposeGhostGroup(this.dragGhostGroup);
+    this.dragGhostGroup = null;
+    this.dragPreviewTool = null;
+    this.requestRender();
+  }
+
+  public dropBuilderAt(
+    tool: Exclude<BuilderTool, null>,
+    clientX: number,
+    clientY: number,
+    rotationY: number,
+  ): void {
+    const coords = this.resolvePlacementCoords(clientX, clientY, tool, rotationY);
+    this.clearBuilderDragPreview();
+    if (coords) {
+      this.callbacks.onPlaceBuilderItem(tool, { x: coords.x, z: coords.z }, rotationY);
+    }
+  }
+
+  private snapCoordinate(val: number): number {
+    return Math.round(val * 2) / 2;
+  }
+
+  private isPointOnAnySidewalk(x: number, z: number): boolean {
+    if (isPointInsideAnyRoadway(x, z, this.modularRoadEntries)) return false;
+    for (let i = 0; i < this.modularRoadEntries.length; i++) {
+      const entry = this.modularRoadEntries[i];
+      const dx = x - entry.target.position.x;
+      const dz = z - entry.target.position.z;
+      if (dx * dx + dz * dz > entry.maxRadiusSq) continue;
+      const { lx, lz } = toRoadLocal(x, z, entry);
+      if (
+        isPointInsideTargetSidewalkLocal(
+          entry.target.kind,
+          lx,
+          lz,
+          entry.armMask,
+          entry.target.length,
+          entry.hiddenSet,
+        )
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private getGroundPlacementHeight(x: number, z: number, kind?: TargetKind): number {
+    if (kind?.startsWith('road-')) return 0;
+    return this.isPointOnAnySidewalk(x, z) ? 0.12 : 0;
+  }
+
+  private onContextLost = (e: Event) => {
+    e.preventDefault();
+    this.callbacks.onContextLostChange?.(true);
+  };
+
+  private onContextRestored = () => {
+    this.callbacks.onContextLostChange?.(false);
+    this.requestRender();
+  };
+
+  private updateNormalizedPointer(clientX: number, clientY: number): boolean {
+    const rect = this.renderer.domElement.getBoundingClientRect();
+    if (
+      clientX < rect.left ||
+      clientX > rect.right ||
+      clientY < rect.top ||
+      clientY > rect.bottom
+    ) {
+      return false;
+    }
+    _mouse.x = ((clientX - rect.left) / rect.width) * 2 - 1;
+    _mouse.y = -((clientY - rect.top) / rect.height) * 2 + 1;
+    return true;
+  }
+
+  private onPointerDown = (event: PointerEvent) => {
+    this.pointerDownClient = { x: event.clientX, y: event.clientY, button: event.button };
+    this.pointerDownHitPickable = false;
+    this.pendingSidewalkClick = null;
+    if (!this.updateNormalizedPointer(event.clientX, event.clientY)) return;
+
+    if (event.button === 0 && this.builderTool === null) {
+      this.raycaster.layers.set(1);
+      this.raycaster.setFromCamera(_mouse, this.camera);
+      const hits = this.raycaster.intersectObjects(this.pickables, true);
+      this.raycaster.layers.set(0);
+
+      if (hits.length > 0) {
+        const hitObj = hits[0].object;
+        if (hitObj.userData.selectTargetId) {
+          event.stopImmediatePropagation();
+          const targetId = String(hitObj.userData.selectTargetId);
+          this.pointerDownHitPickable = true;
+          this.callbacks.onSelectTarget(targetId);
+          this.draggingTargetId = targetId;
+          this.controls.enabled = false;
+
+          if (this.raycaster.ray.intersectPlane(_groundPlane, _dragHit)) {
+            const group = this.targetGroups.get(targetId);
+            if (group) {
+              this.dragOffset.set(group.position.x - _dragHit.x, group.position.z - _dragHit.z);
+            }
+          }
+          this.renderer.domElement.style.cursor = 'grabbing';
+          return;
+        }
+
+        if (hitObj.userData.selectFixtureId) {
+          event.stopImmediatePropagation();
+          const fixtureId = String(hitObj.userData.selectFixtureId);
+          this.pointerDownHitPickable = true;
+          this.callbacks.onSelectFixture(fixtureId);
+          this.draggingFixtureId = fixtureId;
+          this.controls.enabled = false;
+
+          if (this.raycaster.ray.intersectPlane(_groundPlane, _dragHit)) {
+            const entry = this.lightEntries.get(fixtureId);
+            if (entry) {
+              this.dragOffset.set(
+                entry.poleRefs.root.position.x - _dragHit.x,
+                entry.poleRefs.root.position.z - _dragHit.z,
+              );
+            }
+          }
+          this.renderer.domElement.style.cursor = 'grabbing';
+          return;
+        }
+
+        if (hitObj.userData.selectSidewalkKey && hitObj.userData.sidewalkInfo) {
+          this.pointerDownHitPickable = true;
+          this.pendingSidewalkClick = hitObj.userData.sidewalkInfo as SelectedSidewalkInfo;
+        }
+      }
+    }
+
+    // In Move Camera mode, configured rotate/pan mouse buttons rotate look direction or pan
+    if (this.cameraControlMode === 'pan') {
+      this.cameraTransition.active = false;
+      this.lastLookPointer.x = event.clientX;
+      this.lastLookPointer.y = event.clientY;
+      if (event.button === this.mouseButtonToIndex(this.controlsConfig.rotateMouseButton)) {
+        _euler.setFromQuaternion(this.camera.quaternion, 'YXZ');
+        this.freePitch = _euler.x;
+        this.freeYaw = _euler.y;
+        this.isFreeLooking = true;
+        this.renderer.domElement.style.cursor = 'grabbing';
+      } else if (event.button === this.mouseButtonToIndex(this.controlsConfig.panMouseButton)) {
+        this.isFreePanning = true;
+        this.renderer.domElement.style.cursor = 'move';
+      }
+    }
+  };
+
+  private updateCursorProbe(computeLux: boolean): void {
+    if (!this.lastPointerClient) {
+      this.lastGroundCursorHit = null;
+      return;
+    }
+    const inside = this.updateNormalizedPointer(
+      this.lastPointerClient.x,
+      this.lastPointerClient.y,
+    );
+    if (!inside) {
+      this.lastGroundCursorHit = null;
+      if (this.cursorProbeMesh.visible) {
+        this.cursorProbeMesh.visible = false;
+        this.requestRender();
+      }
+      return;
+    }
+
+    this.raycaster.setFromCamera(_mouse, this.camera);
+    const groundHits = this.raycaster.intersectObjects(this.groundPickMeshes, false);
+
+    if (groundHits.length > 0) {
+      const pt = groundHits[0].point;
+      this.lastGroundCursorHit = pt;
+      const probePt = { x: pt.x, y: Math.max(pt.y, 0), z: pt.z };
+      this.lastCursorProbePoint = probePt;
+      const probeY = Math.max(pt.y, 0.03) + 0.025;
+      this.cursorProbeMesh.position.set(pt.x, probeY, pt.z);
+      if (computeLux) {
+        const lux = computeIlluminanceAtPoint(
+          probePt,
+          { x: 0, y: 1, z: 0 },
+          this.currentFixtures,
+        );
+        this.emitStats(probePt, lux);
+      }
+    } else if (this.raycaster.ray.intersectPlane(_groundPlane, _vec3A)) {
+      this.lastGroundCursorHit = null;
+      const probePt = { x: _vec3A.x, y: 0, z: _vec3A.z };
+      this.lastCursorProbePoint = probePt;
+      this.cursorProbeMesh.position.set(_vec3A.x, 0.055, _vec3A.z);
+      if (computeLux) {
+        const lux = computeIlluminanceAtPoint(
+          probePt,
+          { x: 0, y: 1, z: 0 },
+          this.currentFixtures,
+        );
+        this.emitStats(probePt, lux);
+      }
+    } else {
+      this.lastGroundCursorHit = null;
+      this.lastCursorProbePoint = null;
+      _vec3A
+        .copy(this.raycaster.ray.origin)
+        .addScaledVector(this.raycaster.ray.direction, 40);
+      this.cursorProbeMesh.position.copy(_vec3A);
+      if (computeLux) {
+        this.emitStats(null, null);
+      }
+    }
+
+    const camDist = this.camera.position.distanceTo(this.cursorProbeMesh.position);
+    const probeScale = clamp(camDist / 26, 0.65, 2.2);
+    this.cursorProbeMesh.scale.setScalar(probeScale);
+    this.cursorProbeMesh.visible = true;
+  }
+
+  private onPointerMove = (event: PointerEvent) => {
+    this.lastPointerClient = { x: event.clientX, y: event.clientY };
+    const inside = this.updateNormalizedPointer(event.clientX, event.clientY);
+
+    if (this.draggingTargetId) {
+      this.raycaster.setFromCamera(_mouse, this.camera);
+      if (this.raycaster.ray.intersectPlane(_groundPlane, _dragHit)) {
+        const nx = clamp(_dragHit.x + this.dragOffset.x, -MAP_HALF_X, MAP_HALF_X);
+        const nz = clamp(_dragHit.z + this.dragOffset.y, -MAP_HALF_Z, MAP_HALF_Z);
+        const dragged = this.currentTargets.find((t) => t.id === this.draggingTargetId);
+        if (dragged && isRoadOrPathKind(dragged.kind)) {
+          const snapped = this.snapRoadOrPathPosition(
+            dragged.kind,
+            nx,
+            nz,
+            dragged.rotationY,
+            dragged.id,
+            dragged.length,
+          );
+          this.callbacks.onMoveTarget(this.draggingTargetId, snapped);
+        } else {
+          this.callbacks.onMoveTarget(this.draggingTargetId, {
+            x: Math.round(nx * 20) / 20,
+            z: Math.round(nz * 20) / 20,
+          });
+        }
+      }
+      this.updateCursorProbe(false);
+      this.requestRender();
+      return;
+    }
+
+    if (this.draggingFixtureId) {
+      this.raycaster.setFromCamera(_mouse, this.camera);
+      if (this.raycaster.ray.intersectPlane(_groundPlane, _dragHit)) {
+        const nx = clamp(_dragHit.x + this.dragOffset.x, -FIXTURE_MAX_X, FIXTURE_MAX_X);
+        const nz = clamp(_dragHit.z + this.dragOffset.y, -FIXTURE_MAX_Z, FIXTURE_MAX_Z);
+        this.callbacks.onMoveFixture(this.draggingFixtureId, {
+          x: Math.round(nx * 10) / 10,
+          z: Math.round(nz * 10) / 10,
+        });
+      }
+      this.updateCursorProbe(false);
+      this.requestRender();
+      return;
+    }
+
+    if (this.isFreeLooking) {
+      const dx = event.clientX - this.lastLookPointer.x;
+      const dy = event.clientY - this.lastLookPointer.y;
+      this.lastLookPointer.x = event.clientX;
+      this.lastLookPointer.y = event.clientY;
+
+      this.freeYaw -= dx * 0.0045;
+      this.freePitch = clamp(
+        this.freePitch - dy * 0.0045,
+        -Math.PI * 0.47,
+        Math.PI * 0.47,
+      );
+      _euler.set(this.freePitch, this.freeYaw, 0, 'YXZ');
+      this.camera.quaternion.setFromEuler(_euler);
+
+      this.camera.getWorldDirection(_vec3A);
+      this.controls.target
+        .copy(this.camera.position)
+        .addScaledVector(_vec3A, this.savedOrbitDistance);
+      this.updateCursorProbe(false);
+      this.requestRender();
+      return;
+    }
+
+    if (this.isFreePanning) {
+      const dx = event.clientX - this.lastLookPointer.x;
+      const dy = event.clientY - this.lastLookPointer.y;
+      this.lastLookPointer.x = event.clientX;
+      this.lastLookPointer.y = event.clientY;
+
+      this.camera.getWorldDirection(_vec3A);
+      _vec3A.y = 0;
+      if (_vec3A.lengthSq() < 1e-5) _vec3A.set(0, 0, -1);
+      else _vec3A.normalize();
+      _vec3B.crossVectors(_vec3A, this.camera.up).normalize();
+
+      const panScale = 0.03;
+      this.camera.position.addScaledVector(_vec3B, -dx * panScale);
+      this.camera.position.addScaledVector(_vec3A, dy * panScale);
+      this.camera.position.x = clamp(this.camera.position.x, -110, 110);
+      this.camera.position.z = clamp(this.camera.position.z, -110, 110);
+      this.camera.getWorldDirection(_vec3C);
+      this.controls.target
+        .copy(this.camera.position)
+        .addScaledVector(_vec3C, this.savedOrbitDistance);
+      this.updateCursorProbe(false);
+      this.requestRender();
+      return;
+    }
+
+    if (!inside) {
+      if (this.cursorProbeMesh.visible || (this.builderGhostGroup && this.builderGhostGroup.visible)) {
+        this.cursorProbeMesh.visible = false;
+        if (this.builderGhostGroup) this.builderGhostGroup.visible = false;
+        this.requestRender();
+      }
+      return;
+    }
+
+    const now = performance.now();
+    const shouldComputeLux = now - this.lastHoverProbeTime >= 28;
+    if (shouldComputeLux) {
+      this.lastHoverProbeTime = now;
+    }
+
+    this.updateCursorProbe(shouldComputeLux);
+
+    if (this.builderTool !== null) {
+      this.renderer.domElement.style.cursor = 'copy';
+      if (shouldComputeLux) {
+        const pt = this.lastGroundCursorHit;
+        if (pt && this.builderGhostGroup) {
+          const kind = this.builderTool !== 'light' ? this.builderTool : undefined;
+          let sx = clamp(this.snapCoordinate(pt.x), -MAP_HALF_X, MAP_HALF_X);
+          let sz = clamp(this.snapCoordinate(pt.z), -MAP_HALF_Z, MAP_HALF_Z);
+          if (kind && isRoadOrPathKind(kind)) {
+            const snapped = this.snapRoadOrPathPosition(kind, pt.x, pt.z, this.builderRotationY);
+            sx = snapped.x;
+            sz = snapped.z;
+          }
+          const sy = this.getGroundPlacementHeight(sx, sz, kind);
+          this.builderGhostGroup.position.set(sx, sy, sz);
+          this.builderGhostGroup.rotation.y = this.builderRotationY;
+          this.builderGhostGroup.visible = true;
+        } else if (this.builderGhostGroup) {
+          this.builderGhostGroup.visible = false;
+        }
+      }
+      this.requestRender();
+      return;
+    }
+
+    if (shouldComputeLux) {
+      // Check hover affordance over draggable targets & poles
+      this.raycaster.setFromCamera(_mouse, this.camera);
+      this.raycaster.layers.set(1);
+      const pickHits = this.raycaster.intersectObjects(this.pickables, true);
+      this.raycaster.layers.set(0);
+
+      if (pickHits.length > 0 && (pickHits[0].object.userData.selectTargetId || pickHits[0].object.userData.selectFixtureId)) {
+        this.renderer.domElement.style.cursor = 'grab';
+      } else if (pickHits.length > 0 && pickHits[0].object.userData.selectSidewalkKey) {
+        this.renderer.domElement.style.cursor = 'pointer';
+      } else {
+        this.renderer.domElement.style.cursor =
+          this.cameraControlMode === 'pan' ? 'grab' : 'crosshair';
+      }
+    }
+
+    this.requestRender();
+  };
+
+  private onPointerUp = (event: PointerEvent) => {
+    if (this.draggingTargetId || this.draggingFixtureId) {
+      this.draggingTargetId = null;
+      this.draggingFixtureId = null;
+      this.controls.enabled = this.cameraControlMode === 'orbit';
+      this.renderer.domElement.style.cursor =
+        this.cameraControlMode === 'pan' ? 'grab' : 'crosshair';
+      return;
+    }
+
+    if (this.isFreeLooking || this.isFreePanning) {
+      this.isFreeLooking = false;
+      this.isFreePanning = false;
+      this.renderer.domElement.style.cursor =
+        this.builderTool !== null ? 'copy' : 'grab';
+    }
+
+    // Click-to-place in Builder Mode (distinguishes crisp click < 5px from camera drag)
+    const moveDist = Math.hypot(
+      event.clientX - this.pointerDownClient.x,
+      event.clientY - this.pointerDownClient.y,
+    );
+
+    if (
+      this.builderTool !== null &&
+      event.button === 0 &&
+      this.pointerDownClient.button === 0 &&
+      this.updateNormalizedPointer(event.clientX, event.clientY)
+    ) {
+      if (moveDist < 5) {
+        this.raycaster.setFromCamera(_mouse, this.camera);
+        const groundHits = this.raycaster.intersectObjects(this.groundPickMeshes, false);
+        if (groundHits.length > 0) {
+          const pt = groundHits[0].point;
+          const kind = this.builderTool !== 'light' ? this.builderTool : undefined;
+          let sx = clamp(this.snapCoordinate(pt.x), -MAP_HALF_X, MAP_HALF_X);
+          let sz = clamp(this.snapCoordinate(pt.z), -MAP_HALF_Z, MAP_HALF_Z);
+          if (kind && isRoadOrPathKind(kind)) {
+            const snapped = this.snapRoadOrPathPosition(kind, pt.x, pt.z, this.builderRotationY);
+            sx = snapped.x;
+            sz = snapped.z;
+          }
+          this.callbacks.onPlaceBuilderItem(
+            this.builderTool,
+            { x: sx, z: sz },
+            this.builderRotationY,
+          );
+        }
+      }
+    } else if (this.builderTool !== null && event.button === 2) {
+      if (moveDist < 5) {
+        this.callbacks.onCancelBuilderTool();
+      }
+    } else if (
+      this.builderTool === null &&
+      event.button === 0 &&
+      this.pointerDownClient.button === 0 &&
+      this.pendingSidewalkClick
+    ) {
+      const clickInfo = this.pendingSidewalkClick;
+      this.pendingSidewalkClick = null;
+      if (moveDist < 5) {
+        this.callbacks.onSelectSidewalk?.(clickInfo);
+      }
+    } else if (
+      this.builderTool === null &&
+      event.button === 0 &&
+      this.pointerDownClient.button === 0 &&
+      !this.pointerDownHitPickable &&
+      moveDist < 5
+    ) {
+      // Crisp click on empty street/terrain clears object selection
+      this.callbacks.onSelectTarget(null);
+    }
+    this.pendingSidewalkClick = null;
+  };
+
+  public onResize = () => {
+    if (this.disposed) return;
+    const rect = this.container.getBoundingClientRect();
+    const width = Math.max(rect.width, 320);
+    const height = Math.max(rect.height, 240);
+    this.camera.aspect = width / height;
+    this.camera.updateProjectionMatrix();
+    this.renderer.setSize(width, height);
+    this.requestRender();
+  };
+
+  public setCameraPreset(preset: CameraPresetId): void {
+    const goalPos = this.cameraTransition.targetPos;
+    const goalTarget = this.cameraTransition.targetLookAt;
+
+    switch (preset) {
+      case 'perspective':
+        goalPos.set(16.5, 12.5, 21.5);
+        goalTarget.set(0, 1.5, 0);
+        break;
+      case 'top':
+        goalPos.set(0, 68, 0.01);
+        goalTarget.set(0, 0, 0);
+        break;
+      case 'side':
+        goalPos.set(-18.5, 4.8, 0.2);
+        goalTarget.set(0, 2.2, 0);
+        break;
+      case 'closeup': {
+        const active =
+          this.currentFixtures.find((f) => f.id === this.selectedFixtureId) ??
+          this.currentFixtures[0];
+        const fx = active?.position.x ?? 0;
+        const fz = active?.position.z ?? -3.2;
+        const fh = active?.height ?? 8;
+        goalPos.set(fx + 5.8, Math.max(2.4, fh * 0.85), fz + 6.4);
+        goalTarget.set(fx, fh * 0.6, fz);
+        break;
+      }
+    }
+
+    this.cameraTransition.active = true;
+    this.requestRender();
+  }
+
+  public syncState(
+    fixtures: LightFixture[],
+    targets: StreetTarget[],
+    selectedFixtureId: string,
+    selectedTargetId: string | null,
+    settings: ViewportSettings,
+    selectedSidewalkKey: string | null = null,
+  ): void {
+    this.currentFixtures = fixtures;
+    this.currentTargets = targets;
+    this.selectedFixtureId = selectedFixtureId;
+    this.selectedTargetId = selectedTargetId;
+    this.selectedSidewalkKey = selectedSidewalkKey;
+
+    const fixturesChanged =
+      fixtures !== this.prevFixturesProp ||
+      selectedFixtureId !== this.prevSelectedFixtureId ||
+      settings.showBeamEnvelope !== this.prevShowBeamEnvelope;
+    const targetsChanged = targets !== this.prevTargetsProp;
+
+    // 1. Ambient sky & fog mode (only update when changed)
+    if (this.prevAmbientMode !== settings.ambientMode) {
+      this.prevAmbientMode = settings.ambientMode;
+      if (settings.ambientMode === 'twilight') {
+        (this.scene.background as THREE.Color).setHex(0x11192b);
+        (this.scene.fog as THREE.FogExp2).color.setHex(0x11192b);
+        this.hemiLight.intensity = 0.85;
+        this.moonLight.intensity = 0.55;
+        this.scene.environmentIntensity = 0.48;
+      } else {
+        (this.scene.background as THREE.Color).setHex(0x070a12);
+        (this.scene.fog as THREE.FogExp2).color.setHex(0x070a12);
+        this.hemiLight.intensity = 0.36;
+        this.moonLight.intensity = 0.22;
+        this.scene.environmentIntensity = 0.22;
+      }
+    }
+
+    this.currentLuxThreshold = settings.luxThreshold;
+    const thresholdChanged = settings.luxThreshold !== this.prevLuxThreshold;
+
+    this.gridHelper.visible = settings.showGrid;
+    if (
+      settings.showLuxHeatmap !== this.prevShowLuxHeatmap ||
+      (settings.showLuxHeatmap &&
+        (fixtures !== this.prevFixturesProp || thresholdChanged))
+    ) {
+      updateLuxOverlayUniforms(
+        this.luxOverlayState,
+        fixtures,
+        settings.showLuxHeatmap,
+        settings.luxThreshold,
+      );
+    }
+    this.prevShowLuxHeatmap = settings.showLuxHeatmap;
+    this.prevLuxThreshold = settings.luxThreshold;
+
+    // Rebuild corridor sidewalks when modular road targets or removed sidewalks change
+    if (targetsChanged) {
+      const roadSig = targets
+        .filter((t) => t.kind.startsWith('road-'))
+        .map(
+          (t) =>
+            `${t.id}:${t.kind}:${t.position.x.toFixed(2)},${t.position.z.toFixed(2)},${t.rotationY.toFixed(3)},${t.length ?? 0},${(t.hiddenSidewalks ?? []).join(',')}`,
+        )
+        .join('|');
+      if (roadSig !== this.lastRoadSignature) {
+        this.lastRoadSignature = roadSig;
+        this.rebuildSidewalks(targets);
+      }
+    }
+    for (const mesh of this.sidewalkMeshes) {
+      const wantMat =
+        mesh.userData.selectSidewalkKey === selectedSidewalkKey
+          ? this.selectedSidewalkMat
+          : this.sidewalkMat;
+      if (mesh.material !== wantMat) {
+        mesh.material = wantMat;
+      }
+    }
+
+    // 2. Sync Light Fixtures (only when fixtures, selected fixture, or beam toggle changed)
+    if (fixturesChanged) {
+      const activeIds = new Set(fixtures.map((f) => f.id));
+      for (const [id, entry] of this.lightEntries.entries()) {
+        if (!activeIds.has(id)) {
+          this.scene.remove(entry.spotLight);
+          this.scene.remove(entry.spotTarget);
+          this.scene.remove(entry.pointLight);
+          this.scene.remove(entry.poleRefs.root);
+          entry.spotLight.map = null;
+          entry.goboTex?.dispose();
+          entry.poleRefs.shieldTex.dispose();
+          entry.spotLight.dispose();
+          entry.pointLight.dispose();
+          this.lightEntries.delete(id);
+          this.pickablesDirty = true;
+        }
+      }
+
+      let enabledShadowCount = 0;
+      fixtures.forEach((f) => {
+        let entry = this.lightEntries.get(f.id);
+        if (!entry) {
+          const spotLight = new THREE.SpotLight(0xffffff, 0, 55, Math.PI / 4, 0.32, 2);
+          spotLight.shadow.mapSize.set(1024, 1024);
+          spotLight.shadow.camera.near = 0.35;
+          spotLight.shadow.camera.far = 42;
+          spotLight.shadow.bias = -0.0005;
+          spotLight.shadow.normalBias = 0.02;
+
+          const spotTarget = new THREE.Object3D();
+          spotLight.target = spotTarget;
+
+          const pointLight = new THREE.PointLight(0xffffff, 0, 48, 2);
+          pointLight.shadow.mapSize.set(512, 512);
+          pointLight.shadow.camera.near = 0.08;
+          pointLight.shadow.camera.far = 36;
+          pointLight.shadow.bias = -0.004;
+
+          const poleRefs = createStreetPoleRig(f.id);
+          attachLuxOverlayToObject(poleRefs.root, this.luxOverlayState);
+
+          this.scene.add(spotLight, spotTarget, pointLight, poleRefs.root);
+          entry = {
+            spotLight,
+            spotTarget,
+            pointLight,
+            poleRefs,
+            goboTex: null,
+            goboSignature: '',
+          };
+          this.lightEntries.set(f.id, entry);
+          this.pickablesDirty = true;
+        }
+
+        const colorHex = getFixtureHex(f);
+        const aim = getAimDirection(f.tiltAngle, f.yawAngle);
+        const shieldMask = (f.shieldSectors ?? 0) & ((1 << SHIELD_SECTORS) - 1);
+        const hasCustomAngles = hasCustomSectorAngles(f.sectorAngles);
+        const sectorAnglesSig = hasCustomAngles ? getSectorAnglesSignature(f.sectorAngles) : '';
+        const maxEffectiveAngle = hasCustomAngles ? getMaxEffectiveAngle(f) : f.angleRange;
+
+        entry.poleRefs.root.position.set(f.position.x, 0, f.position.z);
+        updateStreetPoleRig(
+          entry.poleRefs,
+          f.height,
+          f.tiltAngle,
+          f.yawAngle,
+          f.angleRange,
+          f.lumens,
+          colorHex,
+          f.enabled,
+          f.id === selectedFixtureId,
+          settings.showBeamEnvelope,
+          f.position.x,
+          f.position.z,
+          shieldMask,
+          hasCustomAngles ? f.sectorAngles : undefined,
+          sectorAnglesSig,
+          f.poleYawAngle ?? f.yawAngle,
+        );
+
+        // Position real Three.js lights at optical center
+        entry.spotLight.position.set(f.position.x, f.height, f.position.z);
+        entry.spotTarget.position.set(
+          f.position.x + aim.x * 10,
+          f.height + aim.y * 10,
+          f.position.z + aim.z * 10,
+        );
+        entry.spotLight.updateMatrixWorld();
+        entry.spotTarget.updateMatrixWorld();
+        entry.pointLight.position.set(f.position.x, f.height, f.position.z);
+
+        entry.spotLight.color.set(colorHex);
+        entry.pointLight.color.set(colorHex);
+
+        // Physical Three.js intensity scaling calibrated to lumens & beam spread
+        const halfRad = getEffectiveHalfAngleRad(f.angleRange);
+        const maxHalfRad = getEffectiveHalfAngleRad(maxEffectiveAngle);
+        const solidAngle = Math.max(2 * Math.PI * (1 - Math.cos(halfRad)), 0.008);
+        const baseIntensity = f.enabled ? (f.lumens / solidAngle) * 0.042 : 0;
+        const canShadow = !this.isSoftwareGl && f.enabled && enabledShadowCount < 3;
+        if (canShadow) enabledShadowCount++;
+
+        let openSectorCount = 0;
+        let wideExcessSum = 0;
+        for (let s = 0; s < SHIELD_SECTORS; s++) {
+          if (((shieldMask >> s) & 1) !== 0) continue;
+          openSectorCount++;
+          const secAngle = hasCustomAngles
+            ? (f.sectorAngles?.[s] ?? f.angleRange)
+            : f.angleRange;
+          if (secAngle > 76) {
+            wideExcessSum += clamp((secAngle - 76) / 104, 0, 1);
+          }
+        }
+        const openRatio = openSectorCount / SHIELD_SECTORS;
+        const wideOpenRatio = wideExcessSum / SHIELD_SECTORS;
+
+        entry.spotLight.penumbra = hasCustomAngles ? 0.0 : 0.32;
+        const maxSafeSpotRad = degToRad(76);
+        const pointBase = f.enabled ? (f.lumens / (4 * Math.PI)) * 0.065 : 0;
+
+        if (f.angleRange <= 78) {
+          entry.spotLight.angle = Math.min(maxHalfRad, maxSafeSpotRad);
+          entry.spotLight.intensity = baseIntensity;
+          entry.spotLight.castShadow = canShadow;
+          entry.pointLight.intensity = wideOpenRatio > 0.01 ? pointBase * wideOpenRatio * 0.72 : 0;
+          entry.pointLight.castShadow = false;
+        } else {
+          const blend = clamp((f.angleRange - 78) / 102, 0, 1);
+
+          entry.spotLight.angle = maxSafeSpotRad;
+          entry.spotLight.intensity = baseIntensity * (1 - blend);
+          entry.pointLight.intensity = pointBase * openRatio * (0.25 + 0.75 * blend);
+
+          entry.spotLight.castShadow = canShadow && blend < 0.35;
+          entry.pointLight.castShadow = canShadow && blend >= 0.35 && openRatio > 0.05;
+        }
+
+        if ((shieldMask === 0 && !hasCustomAngles) || !f.enabled || entry.spotLight.intensity <= 0.001) {
+          if (entry.spotLight.map !== null) {
+            entry.spotLight.map = null;
+          }
+        } else {
+          const goboSig = `${shieldMask}:${f.angleRange}:${sectorAnglesSig}:${f.tiltAngle}:${f.yawAngle}:${Math.round(entry.spotLight.angle * 1000)}`;
+          if (entry.goboSignature !== goboSig || !entry.goboTex) {
+            entry.goboSignature = goboSig;
+            entry.spotLight.shadow.updateMatrices(entry.spotLight);
+            entry.goboTex = this.buildSpotShieldGoboTexture(
+              entry.goboTex,
+              entry.spotLight.shadow.camera as THREE.PerspectiveCamera,
+              f,
+              shieldMask,
+              hasCustomAngles,
+            );
+          }
+          entry.spotLight.map = entry.goboTex;
+        }
+      });
+
+      this.prevFixturesProp = fixtures;
+      this.prevSelectedFixtureId = selectedFixtureId;
+      this.prevShowBeamEnvelope = settings.showBeamEnvelope;
+    }
+
+    // 3. Sync Movable & Animated Street Targets (only rebuild when targets change)
+    if (targetsChanged) {
+      const targetIds = new Set(targets.map((t) => t.id));
+      for (const [id, group] of this.targetGroups.entries()) {
+        if (!targetIds.has(id)) {
+          this.disposeGhostGroup(group);
+          this.targetGroups.delete(id);
+          this.animatedActors.delete(id);
+          this.pickablesDirty = true;
+        }
+      }
+      for (const id of this.animatedActors.keys()) {
+        if (!targetIds.has(id)) {
+          this.animatedActors.delete(id);
+        }
+      }
+
+      const maxAniso = this.renderer.capabilities.getMaxAnisotropy();
+      const nextVehicles: StreetTarget[] = [];
+      const nextPedestrians: StreetTarget[] = [];
+
+      for (const t of targets) {
+        if (isVehicleKind(t.kind)) nextVehicles.push(t);
+        else if (t.kind === 'pedestrian') nextPedestrians.push(t);
+
+        let group = this.targetGroups.get(t.id);
+        const colorKey = t.color ?? '';
+        const lenKey = t.length ?? 0;
+        if (
+          group &&
+          (group.userData.targetKind !== t.kind ||
+            group.userData.targetColor !== colorKey ||
+            group.userData.targetLength !== lenKey)
+        ) {
+          this.disposeGhostGroup(group);
+          this.targetGroups.delete(t.id);
+          this.animatedActors.delete(t.id);
+          group = undefined;
+          this.pickablesDirty = true;
+        }
+
+        if (!group) {
+          group = createStreetTargetGroup(
+            t.id,
+            t.kind,
+            this.contactShadowTex,
+            maxAniso,
+            t.color,
+            t.length,
+          );
+          group.userData.targetKind = t.kind;
+          group.userData.targetColor = colorKey;
+          group.userData.targetLength = lenKey;
+          attachLuxOverlayToObject(group, this.luxOverlayState);
+          this.scene.add(group);
+          this.targetGroups.set(t.id, group);
+          this.pickablesDirty = true;
+        }
+
+        let liveX = t.position.x;
+        let liveZ = t.position.z;
+        let liveRotY = t.rotationY;
+
+        if (t.motion) {
+          let actor = this.animatedActors.get(t.id);
+          if (
+            !actor ||
+            actor.motion !== t.motion ||
+            actor.kind !== t.kind ||
+            actor.routeId !== t.routeId
+          ) {
+            const baseSpeed =
+              t.motion === 'drive'
+                ? getActorBaseSpeed(t.kind, t.rotationY) * (0.82 + Math.random() * 0.36)
+                : getActorBaseSpeed(t.kind, t.rotationY) * (0.76 + Math.random() * 0.48);
+            actor = {
+              motion: t.motion,
+              kind: t.kind,
+              routeId: t.routeId,
+              x: t.position.x,
+              z: t.position.z,
+              rotationY: t.rotationY,
+              phase: t.motion === 'walk' ? Math.random() * Math.PI * 2 : 0,
+              strideBlend: 1,
+              waypointIdx: 0,
+              halfLen: getActorHalfLength(t.kind),
+              speed: baseSpeed,
+              currentSpeed: baseSpeed,
+              isYielding: false,
+              lastPropPos: { x: t.position.x, z: t.position.z },
+              lastPropRotY: t.rotationY,
+              roundaboutSteps: 0,
+              roundaboutTargetSteps: 1 + Math.floor(Math.random() * 8),
+              speedDriftTimer: 2.5 + Math.random() * 5.0,
+              offGraphTurnRate: (Math.random() - 0.5) * 0.45,
+              offGraphTimer: 1.5 + Math.random() * 3.0,
+              walkPauseTimer: t.motion === 'walk' && Math.random() < 0.25 ? Math.random() * 1.4 : 0,
+            };
+            if (actor.motion === 'drive') {
+              this.assignInitialGraphRoute(actor);
+            } else if (actor.motion === 'walk') {
+              this.initPedestrianWalk(actor);
+            }
+            this.animatedActors.set(t.id, actor);
+          } else {
+            if (
+              Math.abs(t.position.x - actor.lastPropPos.x) > 1e-4 ||
+              Math.abs(t.position.z - actor.lastPropPos.z) > 1e-4
+            ) {
+              actor.x = t.position.x;
+              actor.z = t.position.z;
+              actor.lastPropPos.x = t.position.x;
+              actor.lastPropPos.z = t.position.z;
+              if (actor.motion === 'walk') {
+                this.initPedestrianWalk(actor);
+              } else {
+                actor.roundaboutSteps = 0;
+                actor.roundaboutTargetSteps = 1 + Math.floor(Math.random() * 8);
+                this.assignInitialGraphRoute(actor);
+              }
+            }
+            if (Math.abs(t.rotationY - actor.lastPropRotY) > 1e-4) {
+              actor.rotationY = t.rotationY;
+              actor.lastPropRotY = t.rotationY;
+              if (actor.motion === 'drive') {
+                actor.speed =
+                  getActorBaseSpeed(actor.kind, actor.rotationY) * (0.82 + Math.random() * 0.36);
+                actor.roundaboutSteps = 0;
+                actor.roundaboutTargetSteps = 1 + Math.floor(Math.random() * 8);
+                this.assignInitialGraphRoute(actor);
+              }
+            }
+          }
+          liveX = actor.x;
+          liveZ = actor.z;
+          liveRotY = actor.rotationY;
+        } else {
+          this.animatedActors.delete(t.id);
+        }
+
+        const groundY = this.getGroundPlacementHeight(liveX, liveZ, t.kind);
+        group.position.set(liveX, groundY, liveZ);
+        group.rotation.y = liveRotY;
+
+        const defaultH = BUILDING_DEFAULT_HEIGHTS[t.kind];
+        if (defaultH) {
+          const bodyGroup =
+            (group.userData.buildingBody as THREE.Group | undefined) ??
+            group.getObjectByName('buildingBody');
+          if (bodyGroup) {
+            const targetH = t.height ?? defaultH;
+            bodyGroup.scale.y = clamp(targetH / defaultH, 0.35, 3.0);
+          }
+        }
+
+        const ring =
+          (group.userData.selectionRing as THREE.Mesh | undefined) ??
+          group.getObjectByName('selectionRing');
+        if (ring) ring.visible = t.id === selectedTargetId;
+
+        if (t.kind === 'road-roundabout') {
+          const armMask =
+            this.modularRoadEntries.find((e) => e.target.id === t.id)?.armMask ?? 15;
+          const armGroups = group.userData.roundaboutArmGroups as Record<string, THREE.Group> | undefined;
+          const capCurbs = group.userData.roundaboutCapCurbs as Record<string, THREE.Mesh> | undefined;
+          for (const [bit, dir] of [
+            [1, 'E'],
+            [2, 'N'],
+            [4, 'W'],
+            [8, 'S'],
+          ] as const) {
+            const open = (armMask & bit) !== 0;
+            const armGrp = armGroups ? armGroups[dir] : group.getObjectByName(`armGroup_${dir}`);
+            if (armGrp) armGrp.visible = open;
+            const capMesh = capCurbs ? capCurbs[dir] : group.getObjectByName(`capCurb_${dir}`);
+            if (capMesh) capMesh.visible = !open;
+          }
+        }
+      }
+
+      this.vehicleTargets = nextVehicles;
+      this.pedestrianTargets = nextPedestrians;
+      this.prevTargetsProp = targets;
+      this.prevSelectedTargetId = selectedTargetId;
+
+      this.rebuildTrafficControllers(targets);
+      this.updateTrafficLightVisuals();
+    } else if (selectedTargetId !== this.prevSelectedTargetId) {
+      if (this.prevSelectedTargetId) {
+        const prevGrp = this.targetGroups.get(this.prevSelectedTargetId);
+        const prevRing = prevGrp?.userData.selectionRing as THREE.Mesh | undefined;
+        if (prevRing) prevRing.visible = false;
+      }
+      if (selectedTargetId) {
+        const nextGrp = this.targetGroups.get(selectedTargetId);
+        const nextRing = nextGrp?.userData.selectionRing as THREE.Mesh | undefined;
+        if (nextRing) nextRing.visible = true;
+      }
+      this.prevSelectedTargetId = selectedTargetId;
+    }
+
+    if (this.pickablesDirty) {
+      this.pickables = [];
+      for (const entry of this.lightEntries.values()) {
+        this.pickables.push(
+          entry.poleRefs.mastGroup,
+          entry.poleRefs.armMesh,
+          entry.poleRefs.gimbalGroup,
+          entry.poleRefs.shieldGroup,
+        );
+      }
+      for (const group of this.targetGroups.values()) {
+        this.pickables.push(group);
+      }
+      for (const mesh of this.sidewalkMeshes) {
+        this.pickables.push(mesh);
+      }
+      this.pickablesDirty = false;
+    }
+
+    if (fixturesChanged || thresholdChanged) {
+      const pt = this.lastCursorProbePoint;
+      if (pt) {
+        const lux = computeIlluminanceAtPoint(pt, { x: 0, y: 1, z: 0 }, fixtures);
+        this.emitStats(pt, lux);
+      } else {
+        this.emitStats(null, null);
+      }
+    }
+    this.requestRender();
+  }
+
+  private buildSpotShieldGoboTexture(
+    existing: THREE.DataTexture | null,
+    shadowCam: THREE.PerspectiveCamera,
+    fixture: LightFixture,
+    shieldMask: number,
+    hasCustomAngles: boolean,
+  ): THREE.DataTexture {
+    const size = 256;
+    let tex = existing;
+    if (!tex || tex.image.width !== size) {
+      tex?.dispose();
+      const buf = new Uint8Array(size * size * 4);
+      tex = new THREE.DataTexture(buf, size, size, THREE.RGBAFormat);
+      tex.minFilter = THREE.LinearFilter;
+      tex.magFilter = THREE.LinearFilter;
+      tex.wrapS = THREE.ClampToEdgeWrapping;
+      tex.wrapT = THREE.ClampToEdgeWrapping;
+    }
+    const data = tex.image.data as Uint8Array;
+    const tanHalf = Math.tan(degToRad(clamp(shadowCam.fov * 0.5, 1, 78)));
+    const camQuat = shadowCam.quaternion;
+
+    let openCount = 0;
+    if (shieldMask !== 0) {
+      for (let s = 0; s < SHIELD_SECTORS; s++) {
+        if (((shieldMask >> s) & 1) === 0) openCount++;
+      }
+    }
+    const nadirOpen = shieldMask === 0 ? 1 : openCount / SHIELD_SECTORS;
+    const nadirAngle = hasCustomAngles ? getNadirEffectiveAngle(fixture) : fixture.angleRange;
+    const baseUnitCandela = hasCustomAngles ? computePeakCandela(1, fixture.angleRange) : 1;
+
+    for (let y = 0; y < size; y++) {
+      const ndcY = ((y + 0.5) / size) * 2 - 1;
+      for (let x = 0; x < size; x++) {
+        const ndcX = ((x + 0.5) / size) * 2 - 1;
+        const lx = ndcX * tanHalf;
+        const ly = ndcY * tanHalf;
+        const cosTheta = 1 / Math.sqrt(1 + lx * lx + ly * ly);
+        _vec3A.set(lx, ly, -1).applyQuaternion(camQuat);
+        const horiz = Math.hypot(_vec3A.x, _vec3A.z);
+        const azimDeg =
+          horiz >= 0.015 ? (Math.atan2(_vec3A.x, -_vec3A.z) * 180) / Math.PI : 0;
+
+        const shieldT =
+          shieldMask === 0
+            ? 1
+            : horiz >= 0.015
+              ? getShieldTransmittanceAtDeg(shieldMask, azimDeg)
+              : nadirOpen;
+
+        let t = shieldT;
+        if (hasCustomAngles && t > 0) {
+          const effAngle =
+            horiz >= 0.015
+              ? getEffectiveAngleAtDeg(fixture.angleRange, fixture.sectorAngles, azimDeg)
+              : nadirAngle;
+          const angular = computeAngularFactorFromDeg(cosTheta, effAngle);
+          const candelaRatio =
+            effAngle > fixture.angleRange
+              ? Math.min(1, computePeakCandela(1, effAngle) / baseUnitCandela)
+              : 1;
+          t *= angular * candelaRatio;
+        }
+
+        const byte = Math.round(clamp(t, 0, 1) * 255);
+        const idx = (y * size + x) * 4;
+        data[idx] = byte;
+        data[idx + 1] = byte;
+        data[idx + 2] = byte;
+        data[idx + 3] = 255;
+      }
+    }
+    tex.needsUpdate = true;
+    return tex;
+  }
+
+  private rebuildTrafficControllers(targets: StreetTarget[]): void {
+    const controllers: TrafficController[] = [];
+    const intersections = targets.filter(
+      (t) => t.kind === 'road-intersection' || t.kind === 'road-t-junction',
+    );
+
+    for (const tl of targets) {
+      if (tl.kind !== 'traffic-light') continue;
+      let bestInt: StreetTarget | null = null;
+      let bestDist = 11.5;
+      for (const inter of intersections) {
+        const d = Math.hypot(
+          tl.position.x - inter.position.x,
+          tl.position.z - inter.position.z,
+        );
+        if (d <= bestDist) {
+          bestDist = d;
+          bestInt = inter;
+        }
+      }
+
+      const cx = bestInt ? bestInt.position.x : tl.position.x;
+      const cz = bestInt ? bestInt.position.z : tl.position.z;
+      const cos = Math.cos(tl.rotationY);
+      const sin = Math.sin(tl.rotationY);
+      const offset = ((cx * 0.14 + cz * 0.18) % 24 + 24) % 24;
+
+      controllers.push({
+        targetId: tl.id,
+        cx,
+        cz,
+        axisZX: sin,
+        axisZZ: cos,
+        axisXX: cos,
+        axisXZ: -sin,
+        stopBarDist: bestInt ? 7.8 : 3.2,
+        cycleOffset: offset,
+      });
+    }
+
+    this.trafficControllers = controllers;
+  }
+
+  private getTrafficSignalAspects(ctrl: TrafficController): {
+    axisX: SignalAspect;
+    axisZ: SignalAspect;
+    remX: number;
+    remZ: number;
+  } {
+    const cycle = 24.0;
+    const t = (((this.trafficSignalClock + ctrl.cycleOffset) % cycle) + cycle) % cycle;
+    if (t < 8.0) {
+      return {
+        axisX: 'green',
+        axisZ: 'red',
+        remX: Math.max(1, Math.ceil(8.0 - t)),
+        remZ: Math.max(1, Math.ceil(12.0 - t)),
+      };
+    }
+    if (t < 10.0) {
+      return {
+        axisX: 'yellow',
+        axisZ: 'red',
+        remX: Math.max(1, Math.ceil(10.0 - t)),
+        remZ: Math.max(1, Math.ceil(12.0 - t)),
+      };
+    }
+    if (t < 12.0) {
+      return {
+        axisX: 'red',
+        axisZ: 'red',
+        remX: Math.max(1, Math.ceil(24.0 - t)),
+        remZ: Math.max(1, Math.ceil(12.0 - t)),
+      };
+    }
+    if (t < 20.0) {
+      return {
+        axisX: 'red',
+        axisZ: 'green',
+        remX: Math.max(1, Math.ceil(24.0 - t)),
+        remZ: Math.max(1, Math.ceil(20.0 - t)),
+      };
+    }
+    if (t < 22.0) {
+      return {
+        axisX: 'red',
+        axisZ: 'yellow',
+        remX: Math.max(1, Math.ceil(24.0 - t)),
+        remZ: Math.max(1, Math.ceil(22.0 - t)),
+      };
+    }
+    return {
+      axisX: 'red',
+      axisZ: 'red',
+      remX: Math.max(1, Math.ceil(24.0 - t)),
+      remZ: Math.max(1, Math.ceil(36.0 - t)),
+    };
+  }
+
+  private updateTrafficLightVisuals(): void {
+    for (const ctrl of this.trafficControllers) {
+      const { axisX, axisZ, remX, remZ } = this.getTrafficSignalAspects(ctrl);
+      const changedAspect = ctrl.lastAspectX !== axisX || ctrl.lastAspectZ !== axisZ;
+      const changedCountdownX = ctrl.lastAspectX !== axisX || ctrl.lastCountdownX !== remX;
+      const changedCountdownZ = ctrl.lastAspectZ !== axisZ || ctrl.lastCountdownZ !== remZ;
+
+      if (!changedAspect && !changedCountdownX && !changedCountdownZ) continue;
+
+      const group = this.targetGroups.get(ctrl.targetId);
+      if (!group) continue;
+      const mats = group.userData.trafficSignalMaterials as
+        | TrafficSignalMaterials
+        | undefined;
+      if (!mats) continue;
+
+      if (changedAspect) {
+        ctrl.lastAspectX = axisX;
+        ctrl.lastAspectZ = axisZ;
+
+        for (const m of mats.axisZ.red) m.emissiveIntensity = axisZ === 'red' ? 2.6 : 0.05;
+        for (const m of mats.axisZ.yellow) m.emissiveIntensity = axisZ === 'yellow' ? 2.6 : 0.05;
+        for (const m of mats.axisZ.green) m.emissiveIntensity = axisZ === 'green' ? 2.6 : 0.05;
+
+        for (const m of mats.axisX.red) m.emissiveIntensity = axisX === 'red' ? 2.6 : 0.05;
+        for (const m of mats.axisX.yellow) m.emissiveIntensity = axisX === 'yellow' ? 2.6 : 0.05;
+        for (const m of mats.axisX.green) m.emissiveIntensity = axisX === 'green' ? 2.6 : 0.05;
+      }
+
+      if (changedCountdownX) {
+        ctrl.lastCountdownX = remX;
+        const texX = getTrafficCountdownTexture(axisX, remX);
+        mats.axisX.countdown.map = texX;
+        mats.axisX.countdown.emissiveMap = texX;
+      }
+
+      if (changedCountdownZ) {
+        ctrl.lastCountdownZ = remZ;
+        const texZ = getTrafficCountdownTexture(axisZ, remZ);
+        mats.axisZ.countdown.map = texZ;
+        mats.axisZ.countdown.emissiveMap = texZ;
+      }
+    }
+  }
+
+  private emitStats(
+    cursorWorld: { x: number; y: number; z: number } | null,
+    cursorLux: number | null,
+  ): void {
+    const active =
+      this.currentFixtures.find((f) => f.id === this.selectedFixtureId) ??
+      this.currentFixtures[0];
+
+    const photometricsKey =
+      `${active?.id ?? ''}:${this.currentLuxThreshold.toFixed(1)}:` +
+      this.currentFixtures
+        .map(
+          (f) =>
+            `${f.id},${f.enabled ? 1 : 0},${f.position.x.toFixed(2)},${f.position.z.toFixed(2)},${f.height.toFixed(2)},${f.tiltAngle},${f.yawAngle},${f.angleRange},${f.lumens},${f.shieldSectors ?? 0},${getSectorAnglesSignature(f.sectorAngles)}`,
+        )
+        .join('|');
+
+    if (photometricsKey !== this.lastPhotometricsKey) {
+      this.lastPhotometricsKey = photometricsKey;
+      this.cachedPhotometrics = computeScenePhotometrics(
+        this.currentFixtures,
+        active,
+        this.currentLuxThreshold,
+      );
+    }
+
+    const metrics = this.cachedPhotometrics;
+    const statsKey = `${photometricsKey}|${
+      cursorWorld ? `${cursorWorld.x.toFixed(1)},${cursorWorld.z.toFixed(1)}` : 'none'
+    }|${cursorLux !== null ? cursorLux.toFixed(1) : 'null'}`;
+    if (statsKey === this.lastEmittedStatsKey) return;
+    this.lastEmittedStatsKey = statsKey;
+
+    this.callbacks.onStatsUpdate({
+      cursorWorld,
+      cursorLux,
+      peakGroundLux: metrics.peakGroundLux,
+      footprintAreaSqM: metrics.footprintAreaSqM,
+      centerThrowDistM: metrics.centerThrowDistM,
+    });
+  }
+
+  private afterDraw(cb: () => void): void {
+    const gl = this.renderer.getContext() as WebGL2RenderingContext;
+    const sync = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
+    gl.flush();
+    const poll = () => {
+      if (this.disposed) return;
+      const state = sync && gl.getSyncParameter(sync, gl.SYNC_STATUS);
+      if (state === gl.UNSIGNALED) {
+        this.frameId = window.setTimeout(poll, 5);
+      } else {
+        if (sync) gl.deleteSync(sync);
+        this.frameId = window.setTimeout(cb, 80);
+      }
+    };
+    this.frameId = window.setTimeout(poll, 5);
+  }
+
+  private assignInitialGraphRoute(actor: AnimatedActorState): void {
+    actor.graphNodeId = undefined;
+    actor.subPath = undefined;
+    actor.subPathIdx = 0;
+    const { nodes, edges } = this.roadGraph;
+    if (nodes.length === 0) return;
+
+    const fx = Math.cos(actor.rotationY);
+    const fz = -Math.sin(actor.rotationY);
+    const candidates: Array<{ edge: RoadGraphEdge; subIdx: number; score: number }> = [];
+    let bestScore = Infinity;
+
+    for (let uId = 0; uId < nodes.length; uId++) {
+      const startNode = nodes[uId];
+      const outEdges = edges[uId];
+      for (const edge of outEdges) {
+        if (edge.isWrap || edge.isUTurn || edge.points.length === 0) continue;
+        let prevX = startNode.x;
+        let prevZ = startNode.z;
+        for (let pIdx = 0; pIdx < edge.points.length; pIdx++) {
+          const pt = edge.points[pIdx];
+          const abX = pt.x - prevX;
+          const abZ = pt.z - prevZ;
+          const lenSq = abX * abX + abZ * abZ;
+          if (lenSq > 1e-4) {
+            const len = Math.sqrt(lenSq);
+            const t = clamp(
+              ((actor.x - prevX) * abX + (actor.z - prevZ) * abZ) / lenSq,
+              0,
+              1,
+            );
+            const projX = prevX + abX * t;
+            const projZ = prevZ + abZ * t;
+            const dist = Math.hypot(actor.x - projX, actor.z - projZ);
+            if (dist <= 6.5) {
+              const align = (abX / len) * fx + (abZ / len) * fz;
+              if (align >= 0.25) {
+                const score = dist + (1 - align) * 3.5;
+                if (score < bestScore) bestScore = score;
+                candidates.push({ edge, subIdx: pIdx, score });
+              }
+            }
+          }
+          prevX = pt.x;
+          prevZ = pt.z;
+        }
+      }
+    }
+
+    if (candidates.length > 0) {
+      const nearBest = candidates.filter((c) => c.score <= bestScore + 1.25);
+      const chosen = nearBest[Math.floor(Math.random() * nearBest.length)];
+      actor.graphNodeId = chosen.edge.toNodeId;
+      actor.subPath = chosen.edge.points;
+      actor.subPathIdx = chosen.subIdx;
+    }
+  }
+
+  private pickNextGraphEdge(
+    actorId: string,
+    actor: AnimatedActorState,
+    nodeId: number,
+  ): RoadGraphEdge | null {
+    const { nodes, edges } = this.roadGraph;
+    const outEdges = edges[nodeId];
+    if (!outEdges || outEdges.length === 0) return null;
+
+    const isWrapDestinationClear = (destId: number): boolean => {
+      const dest = nodes[destId];
+      for (const t of this.vehicleTargets) {
+        if (t.id === actorId) continue;
+        const other = this.animatedActors.get(t.id);
+        const ox = other ? other.x : t.position.x;
+        const oz = other ? other.z : t.position.z;
+        if (Math.hypot(ox - dest.x, oz - dest.z) < 10.5) return false;
+      }
+      return true;
+    };
+
+    const usable = outEdges.filter(
+      (e) => !e.isWrap || isWrapDestinationClear(e.toNodeId),
+    );
+    const nonUTurn = usable.filter((e) => !e.isUTurn);
+    let pool = nonUTurn.length > 0 ? nonUTurn : usable;
+    if (pool.length === 0) return null;
+
+    // Include occasional U-turns at open perimeter exits so traffic loops back unpredictably
+    if (usable.length > nonUTurn.length && Math.random() < 0.25) {
+      pool = usable;
+    }
+
+    const maxLoopSteps = actor.roundaboutTargetSteps ?? 3;
+    const exitEdges = pool.filter((e) => e.isRoundaboutExit);
+    if ((actor.roundaboutSteps ?? 0) >= maxLoopSteps && exitEdges.length > 0) {
+      pool = exitEdges;
+    }
+
+    let totalWeight = 0;
+    for (const e of pool) totalWeight += e.weight;
+    let r = Math.random() * totalWeight;
+    for (const e of pool) {
+      r -= e.weight;
+      if (r <= 0) return e;
+    }
+    return pool[pool.length - 1];
+  }
+
+  private isPointBlockedForPedestrian(px: number, pz: number): boolean {
+    if (Math.abs(px) > MAP_HALF_X - 1.0 || Math.abs(pz) > MAP_HALF_Z - 1.0) return true;
+    for (const t of this.currentTargets) {
+      if (t.motion || isRoadOrPathKind(t.kind) || t.kind === 'traffic-light') continue;
+      const rad =
+        t.kind.startsWith('building-')
+          ? 4.2
+          : t.kind === 'tree'
+            ? 1.5
+            : t.kind === 'hedge' || t.kind === 'bench'
+              ? 1.35
+              : 0.9;
+      if (Math.hypot(px - t.position.x, pz - t.position.z) < rad) return true;
+    }
+    return false;
+  }
+
+  private initPedestrianWalk(actor: AnimatedActorState): void {
+    actor.walkCurrNodeId = undefined;
+    actor.walkPrevNodeId = undefined;
+    actor.walkGoalX = undefined;
+    actor.walkGoalZ = undefined;
+    actor.walkIsCrosswalk = false;
+
+    const nodes = this.walkGraph.nodes;
+    if (nodes.length > 0) {
+      let bestId = -1;
+      let bestDist = 4.5;
+      for (const n of nodes) {
+        if (this.walkGraph.edges[n.id].length === 0) continue;
+        const d = Math.hypot(n.x - actor.x, n.z - actor.z);
+        if (d < bestDist) {
+          // Ensure acquiring the starting sidewalk node doesn't step across an unmarked road
+          const mx = (actor.x + n.x) * 0.5;
+          const mz = (actor.z + n.z) * 0.5;
+          if (!isPointInsideAnyRoadway(mx, mz, this.modularRoadEntries)) {
+            bestDist = d;
+            bestId = n.id;
+          }
+        }
+      }
+      if (bestId >= 0) {
+        actor.walkCurrNodeId = bestId;
+        this.pickNextWalkTarget(actor);
+        return;
+      }
+    }
+
+    this.pickRandomFreeWalkTarget(actor);
+  }
+
+  private pickRandomFreeWalkTarget(actor: AnimatedActorState): void {
+    actor.walkCurrNodeId = undefined;
+    actor.walkPrevNodeId = undefined;
+    actor.walkIsCrosswalk = false;
+
+    for (let attempt = 0; attempt < 18; attempt++) {
+      const ang = Math.random() * Math.PI * 2;
+      const dist = 3.0 + Math.random() * 8.0;
+      const gx = clamp(actor.x + Math.cos(ang) * dist, -MAP_HALF_X + 2.0, MAP_HALF_X - 2.0);
+      const gz = clamp(actor.z + Math.sin(ang) * dist, -MAP_HALF_Z + 2.0, MAP_HALF_Z - 2.0);
+      if (
+        !isPointInsideAnyRoadway(gx, gz, this.modularRoadEntries) &&
+        !this.isPointBlockedForPedestrian(gx, gz)
+      ) {
+        let crossesRoad = false;
+        for (const u of [0.25, 0.5, 0.75]) {
+          const sx = actor.x + (gx - actor.x) * u;
+          const sz = actor.z + (gz - actor.z) * u;
+          if (isPointInsideAnyRoadway(sx, sz, this.modularRoadEntries)) {
+            crossesRoad = true;
+            break;
+          }
+        }
+        if (!crossesRoad) {
+          actor.walkGoalX = gx;
+          actor.walkGoalZ = gz;
+          return;
+        }
+      }
+    }
+
+    actor.walkGoalX = actor.x;
+    actor.walkGoalZ = actor.z;
+    actor.walkPauseTimer = 0.8 + Math.random() * 1.4;
+  }
+
+  private pickNextWalkTarget(actor: AnimatedActorState): void {
+    const currId = actor.walkCurrNodeId;
+    if (currId === undefined || currId >= this.walkGraph.nodes.length) {
+      this.pickRandomFreeWalkTarget(actor);
+      return;
+    }
+
+    let outEdges = this.walkGraph.edges[currId];
+    if (!outEdges || outEdges.length === 0) {
+      this.pickRandomFreeWalkTarget(actor);
+      return;
+    }
+
+    // Avoid immediate ping-pong reversals most of the time, while still allowing occasional random turn-backs
+    if (outEdges.length > 1 && actor.walkPrevNodeId !== undefined) {
+      const nonBack = outEdges.filter((e) => e.toNodeId !== actor.walkPrevNodeId);
+      if (nonBack.length > 0 && Math.random() < 0.9) {
+        outEdges = nonBack;
+      }
+    }
+
+    const chosen = outEdges[Math.floor(Math.random() * outEdges.length)];
+    const prevNode = this.walkGraph.nodes[currId];
+    const nextNode = this.walkGraph.nodes[chosen.toNodeId];
+
+    actor.walkPrevNodeId = currId;
+    actor.walkCurrNodeId = chosen.toNodeId;
+    actor.walkIsCrosswalk = chosen.isCrosswalk;
+
+    const segDx = nextNode.x - prevNode.x;
+    const segDz = nextNode.z - prevNode.z;
+    const segLen = Math.hypot(segDx, segDz);
+    if (segLen > 2.2) {
+      const perpX = -segDz / segLen;
+      const perpZ = segDx / segLen;
+      const jitterMag = chosen.isCrosswalk ? 0.38 : 0.55;
+      const offset = (Math.random() - 0.5) * 2 * jitterMag;
+      actor.walkGoalX = nextNode.x + perpX * offset;
+      actor.walkGoalZ = nextNode.z + perpZ * offset;
+    } else {
+      actor.walkGoalX = nextNode.x;
+      actor.walkGoalZ = nextNode.z;
+    }
+  }
+
+  private isOnCrosswalkArea(px: number, pz: number): boolean {
+    return isPointInsideAnyRoadway(px, pz, this.modularRoadEntries);
+  }
+
+  private shouldPedestrianYield(
+    actor: AnimatedActorState,
+    dx: number,
+    dz: number,
+  ): boolean {
+    const stepLen = Math.hypot(dx, dz);
+    if (stepLen < 0.25) return false;
+    const dirX = dx / stepLen;
+    const dirZ = dz / stepLen;
+
+    // Strictly wait behind the curb at roads with traffic lights unless the crossing light is GREEN
+    if (this.trafficControllers.length > 0) {
+      const currentlyOnRoad = this.isOnCrosswalkArea(actor.x, actor.z);
+      const nearCurbEdge =
+        currentlyOnRoad && !this.isOnCrosswalkArea(actor.x - dirX * 0.45, actor.z - dirZ * 0.45);
+      const aheadNearX = actor.x + dirX * 1.35;
+      const aheadNearZ = actor.z + dirZ * 1.35;
+      const aheadFarX = actor.x + dirX * 2.15;
+      const aheadFarZ = actor.z + dirZ * 2.15;
+      const approachingRoad =
+        this.isOnCrosswalkArea(aheadNearX, aheadNearZ) ||
+        this.isOnCrosswalkArea(aheadFarX, aheadFarZ) ||
+        Boolean(actor.walkIsCrosswalk && !currentlyOnRoad);
+
+      if ((!currentlyOnRoad || nearCurbEdge) && approachingRoad) {
+        for (const ctrl of this.trafficControllers) {
+          if (Math.hypot(aheadNearX - ctrl.cx, aheadNearZ - ctrl.cz) > 11.5) continue;
+          const aspects = this.getTrafficSignalAspects(ctrl);
+          const dotZ = Math.abs(dirX * ctrl.axisZX + dirZ * ctrl.axisZZ);
+          const dotX = Math.abs(dirX * ctrl.axisXX + dirZ * ctrl.axisXZ);
+          // Walkers parallel to axisZ only cross when axisZ is green (and cross-traffic axisX is red), and vice versa
+          const walkAxisAspect = dotZ >= dotX ? aspects.axisZ : aspects.axisX;
+          const crossAxisAspect = dotZ >= dotX ? aspects.axisX : aspects.axisZ;
+          if (walkAxisAspect !== 'green' || crossAxisAspect !== 'red') {
+            return true;
+          }
+        }
+      }
+    }
+
+    // Only check oncoming car yield when about to enter or cross roadway ahead
+    const curbProbeX = actor.x + dirX * 1.8;
+    const curbProbeZ = actor.z + dirZ * 1.8;
+    if (
+      !this.isOnCrosswalkArea(actor.x, actor.z) &&
+      !this.isOnCrosswalkArea(curbProbeX, curbProbeZ)
+    ) {
+      return false;
+    }
+
+    const perpX = -dirZ;
+    const perpZ = dirX;
+    const safeZoneAcross = 1.55;
+    const checkWindowAhead = 3.6;
+
+    for (const other of this.animatedActors.values()) {
+      if (other.motion !== 'drive') continue;
+      // Do not yield to vehicles already braking/stopped for the crosswalk (prevents deadlock)
+      if (other.isYielding || other.currentSpeed < 1.8) continue;
+
+      const fx = Math.cos(other.rotationY);
+      const fz = -Math.sin(other.rotationY);
+
+      const relX = other.x - actor.x;
+      const relZ = other.z - actor.z;
+      const aheadCross = relX * dirX + relZ * dirZ;
+      const alongVehicleFlow = fx * perpX + fz * perpZ;
+
+      if (Math.abs(alongVehicleFlow) >= 0.65 && aheadCross >= 1.0 && aheadCross <= checkWindowAhead) {
+        const flowDir = Math.sign(alongVehicleFlow);
+        const flowSpeed = Math.abs(alongVehicleFlow) * other.currentSpeed;
+        const crossPad = other.halfLen + 1.25;
+        const tEnter = Math.max(0, (aheadCross - safeZoneAcross) / Math.max(actor.speed, 0.8));
+        const tExit = (aheadCross + safeZoneAcross) / Math.max(actor.speed, 0.8);
+        const tMin = Math.max(0, tEnter - 1.0);
+        const tMax = tExit + 0.8;
+
+        const actorLat = 0;
+        const vehLat0 = relX * perpX + relZ * perpZ;
+        const distAtTMin = (actorLat - (vehLat0 + flowDir * flowSpeed * tMin)) * flowDir;
+        const distAtTMax = (actorLat - (vehLat0 + flowDir * flowSpeed * tMax)) * flowDir;
+
+        if (distAtTMin >= -crossPad && distAtTMax <= crossPad) {
+          return true;
+        }
+      } else {
+        // Angled / turning vehicles: check upcoming trajectory proximity
+        for (let t = 0; t <= 2.2; t += 0.55) {
+          const px = other.x + fx * other.currentSpeed * t;
+          const pz = other.z + fz * other.currentSpeed * t;
+          if (Math.hypot(px - actor.x, pz - actor.z) < other.halfLen + 1.85) {
+            return true;
+          }
+        }
+      }
+    }
+
+    return false;
+  }
+
+  private isVehicleInIntersectionBox(
+    vx: number,
+    vz: number,
+    vfx: number,
+    vfz: number,
+    vHalfLen: number,
+    vHalfW: number,
+    ix: number,
+    iz: number,
+    boxHalf = 4.35,
+  ): boolean {
+    const extX = Math.abs(vfx) * vHalfLen + Math.abs(vfz) * vHalfW;
+    const extZ = Math.abs(vfz) * vHalfLen + Math.abs(vfx) * vHalfW;
+    return Math.abs(vx - ix) < boxHalf + extX && Math.abs(vz - iz) < boxHalf + extZ;
+  }
+
+  private getSweptCorridorHitFwd(
+    ax: number,
+    az: number,
+    fx: number,
+    fz: number,
+    rx: number,
+    rz: number,
+    corridorHalfW: number,
+    bx: number,
+    bz: number,
+    ofx: number,
+    ofz: number,
+    bHalfL: number,
+    bHalfW: number,
+  ): number {
+    const relX = bx - ax;
+    const relZ = bz - az;
+    const cFwd = relX * fx + relZ * fz;
+    const cLat = relX * rx + relZ * rz;
+
+    const uFwd = ofx * fx + ofz * fz;
+    const uLat = ofx * rx + ofz * rz;
+    const orx = -ofz;
+    const orz = ofx;
+    const vFwd = orx * fx + orz * fz;
+    const vLat = orx * rx + orz * rz;
+
+    const f0 = cFwd + uFwd * bHalfL + vFwd * bHalfW;
+    const l0 = cLat + uLat * bHalfL + vLat * bHalfW;
+    const f1 = cFwd + uFwd * bHalfL - vFwd * bHalfW;
+    const l1 = cLat + uLat * bHalfL - vLat * bHalfW;
+    const f2 = cFwd - uFwd * bHalfL - vFwd * bHalfW;
+    const l2 = cLat - uLat * bHalfL - vLat * bHalfW;
+    const f3 = cFwd - uFwd * bHalfL + vFwd * bHalfW;
+    const l3 = cLat - uLat * bHalfL + vLat * bHalfW;
+
+    const minL = Math.min(l0, l1, l2, l3);
+    const maxL = Math.max(l0, l1, l2, l3);
+    if (maxL < -corridorHalfW || minL > corridorHalfW) return Infinity;
+
+    const maxF = Math.max(f0, f1, f2, f3);
+    if (maxF <= 0.1) return Infinity;
+
+    let minHitFwd = Infinity;
+    const checkEdge = (af: number, al: number, bf: number, bl: number) => {
+      let t0 = 0;
+      let t1 = 1;
+      const dl = bl - al;
+      if (Math.abs(dl) < 1e-6) {
+        if (al < -corridorHalfW || al > corridorHalfW) return;
+      } else {
+        let aT = (-corridorHalfW - al) / dl;
+        let bT = (corridorHalfW - al) / dl;
+        if (aT > bT) {
+          const tmp = aT;
+          aT = bT;
+          bT = tmp;
+        }
+        t0 = Math.max(t0, aT);
+        t1 = Math.min(t1, bT);
+        if (t0 > t1) return;
+      }
+      const df = bf - af;
+      const hitF = Math.min(af + df * t0, af + df * t1);
+      if (hitF < minHitFwd) minHitFwd = hitF;
+    };
+
+    checkEdge(f0, l0, f1, l1);
+    checkEdge(f1, l1, f2, l2);
+    checkEdge(f2, l2, f3, l3);
+    checkEdge(f3, l3, f0, l0);
+    return minHitFwd;
+  }
+
+  private getVehicleTrafficScale(
+    id: string,
+    actor: AnimatedActorState,
+  ): { scale: number; yieldingToPed: boolean; hardStop: boolean } {
+    const fx = Math.cos(actor.rotationY);
+    const fz = -Math.sin(actor.rotationY);
+    const rx = -fz;
+    const rz = fx;
+    const myHalfW = getActorHalfWidth(actor.kind);
+    let minScale = 1;
+    let yieldingToPed = false;
+    let hardStop = false;
+
+    // Determine if actor is already inside any intersection clearing box
+    let actorInsideAnyIntersection = false;
+    for (const inter of this.intersectionEntries) {
+      if (
+        this.isVehicleInIntersectionBox(
+          actor.x,
+          actor.z,
+          fx,
+          fz,
+          actor.halfLen,
+          myHalfW,
+          inter.x,
+          inter.z,
+        )
+      ) {
+        actorInsideAnyIntersection = true;
+        break;
+      }
+    }
+
+    // 0. Obey intersection traffic signals (stop behind stop bar on Red / early Yellow)
+    for (const ctrl of this.trafficControllers) {
+      const relX = ctrl.cx - actor.x;
+      const relZ = ctrl.cz - actor.z;
+      const fwdToInt = relX * fx + relZ * fz;
+      if (fwdToInt <= 0 || fwdToInt >= 23.0) continue;
+      const latToInt = Math.abs(relX * rx + relZ * rz);
+      if (latToInt > 4.25) continue;
+
+      const aspects = this.getTrafficSignalAspects(ctrl);
+      const dotZ = Math.abs(fx * ctrl.axisZX + fz * ctrl.axisZZ);
+      const dotX = Math.abs(fx * ctrl.axisXX + fz * ctrl.axisXZ);
+      const aspect = dotZ >= dotX ? aspects.axisZ : aspects.axisX;
+
+      if (aspect === 'green') continue;
+
+      const distToStopBar = fwdToInt - actor.halfLen - ctrl.stopBarDist;
+      if (aspect === 'red') {
+        if (distToStopBar >= -0.35 && distToStopBar <= 16.5) {
+          const s = distToStopBar <= 0.15 ? 0 : clamp(distToStopBar / 8.5, 0, 1);
+          if (s < minScale) minScale = s;
+          if (distToStopBar <= 0.22) hardStop = true;
+        }
+      } else if (aspect === 'yellow') {
+        if (distToStopBar >= 0.8 && distToStopBar <= 16.5) {
+          const s = distToStopBar <= 0.95 ? 0 : clamp((distToStopBar - 0.9) / 8.0, 0, 1);
+          if (s < minScale) minScale = s;
+          if (distToStopBar <= 0.95) hardStop = true;
+        }
+      }
+    }
+
+    // 0b. Intersection occupancy & entry reservation guard:
+    // Never enter an intersection past the stop bar while another vehicle is inside or already entering from a conflicting/opposing approach
+    if (!actorInsideAnyIntersection) {
+      for (const inter of this.intersectionEntries) {
+        const relX = inter.x - actor.x;
+        const relZ = inter.z - actor.z;
+        const fwdToInt = relX * fx + relZ * fz;
+        if (fwdToInt <= 0 || fwdToInt >= 23.0) continue;
+        const latToInt = Math.abs(relX * rx + relZ * rz);
+        if (latToInt > 4.25) continue;
+
+        const distToStopBar = fwdToInt - actor.halfLen - 7.8;
+        if (distToStopBar < -0.35 || distToStopBar > 16.5) continue;
+
+        let occupiedByConflicting = false;
+        for (const t of this.vehicleTargets) {
+          if (t.id === id) continue;
+          const otherAnim = this.animatedActors.get(t.id);
+          const ox = otherAnim ? otherAnim.x : t.position.x;
+          const oz = otherAnim ? otherAnim.z : t.position.z;
+          const oRotY = otherAnim ? otherAnim.rotationY : t.rotationY;
+          const ofx = Math.cos(oRotY);
+          const ofz = -Math.sin(oRotY);
+          const oHalfL = otherAnim ? otherAnim.halfLen : getActorHalfLength(t.kind);
+          const oHalfW = getActorHalfWidth(t.kind);
+          const oSpeed = otherAnim ? otherAnim.currentSpeed : 0;
+
+          const otherInBox = this.isVehicleInIntersectionBox(
+            ox,
+            oz,
+            ofx,
+            ofz,
+            oHalfL,
+            oHalfW,
+            inter.x,
+            inter.z,
+            6.2,
+          );
+
+          // Also detect an opposing or cross-street moving vehicle actively entering past its stop bar
+          const oRelX = inter.x - ox;
+          const oRelZ = inter.z - oz;
+          const oFwdToInt = oRelX * ofx + oRelZ * ofz;
+          const oLatToInt = Math.abs(oRelX * -ofz + oRelZ * ofx);
+          const oDistToStopBar = oFwdToInt - oHalfL - 7.8;
+          const otherEnteringAhead =
+            oSpeed > 0.65 &&
+            oFwdToInt > 0 &&
+            oLatToInt <= 4.25 &&
+            oDistToStopBar < 2.2 &&
+            (oDistToStopBar + 0.35 < distToStopBar ||
+              (Math.abs(oDistToStopBar - distToStopBar) <= 0.35 && id > t.id));
+
+          if (!otherInBox && !otherEnteringAhead) {
+            continue;
+          }
+
+          // Allow following once a vehicle traveling in the exact same lane direction has cleared past center
+          const dotH = fx * ofx + fz * ofz;
+          const otherPastCenter = (ox - inter.x) * fx + (oz - inter.z) * fz > 1.5;
+          if (dotH > 0.78 && otherPastCenter) continue;
+
+          occupiedByConflicting = true;
+          break;
+        }
+
+        if (occupiedByConflicting) {
+          const s = distToStopBar <= 0.25 ? 0 : clamp(distToStopBar / 8.5, 0, 1);
+          if (s < minScale) minScale = s;
+          if (distToStopBar <= 0.35) hardStop = true;
+        }
+      }
+    }
+
+    // 1. Yield to pedestrians currently on any crosswalk / roadway ahead
+    for (const t of this.pedestrianTargets) {
+      const animPed = this.animatedActors.get(t.id);
+      const px = animPed ? animPed.x : t.position.x;
+      const pz = animPed ? animPed.z : t.position.z;
+      const pedRotY = animPed ? animPed.rotationY : t.rotationY;
+
+      if (!this.isOnCrosswalkArea(px, pz)) continue;
+
+      const relX = px - actor.x;
+      const relZ = pz - actor.z;
+      const fwdDist = relX * fx + relZ * fz;
+      const bumperDist = fwdDist - actor.halfLen;
+      if (bumperDist <= 0.35 || bumperDist >= 11.5) continue;
+
+      const signedLat = relX * rx + relZ * rz;
+      const latDist = Math.abs(signedLat);
+      const pedFx = Math.sin(pedRotY);
+      const pedFz = Math.cos(pedRotY);
+      const latApproach = -(pedFx * rx + pedFz * rz) * Math.sign(signedLat || 1);
+
+      const shouldYield =
+        latDist < 2.4 ||
+        (latDist < 5.6 && latApproach > 0.15) ||
+        (!animPed && latDist < 4.2);
+
+      if (shouldYield) {
+        const s = clamp((bumperDist - 2.6) / 8.0, 0, 1);
+        if (s < minScale) minScale = s;
+        if (bumperDist < 10.6) yieldingToPed = true;
+      }
+    }
+
+    // Check if actor is already inside any roundabout circulating ring
+    let actorRoundaboutIdx = -1;
+    let actorRbAngle = 0;
+    let actorRbR = Infinity;
+    let actorRbRingR = 8.55;
+    for (const rbInfo of this.roundaboutEntries) {
+      const rb = rbInfo.entry;
+      const d = Math.hypot(actor.x - rb.target.position.x, actor.z - rb.target.position.z);
+      if (d <= rbInfo.ringZoneR) {
+        actorRoundaboutIdx = rbInfo.idx;
+        actorRbR = d;
+        actorRbRingR = rbInfo.ringZoneR;
+        actorRbAngle = Math.atan2(actor.x - rb.target.position.x, actor.z - rb.target.position.z);
+        break;
+      }
+    }
+
+    // 2. Roundabout right-of-way: entering traffic MUST wait for vehicles already inside the roundabout
+    if (actorRoundaboutIdx < 0) {
+      for (const rbInfo of this.roundaboutEntries) {
+        const rb = rbInfo.entry;
+        const { isMini, ringZoneR, yieldLineR, approachMaxR } = rbInfo;
+
+        const rcx = rb.target.position.x;
+        const rcz = rb.target.position.z;
+        const dxC = actor.x - rcx;
+        const dzC = actor.z - rcz;
+        const rA = Math.hypot(dxC, dzC);
+        if (rA <= ringZoneR || rA >= approachMaxR) continue;
+
+        const approachCos = (-dxC * fx - dzC * fz) / rA;
+        if (approachCos < 0.15) continue;
+
+        const armAngle = Math.atan2(dxC, dzC);
+        for (const t of this.vehicleTargets) {
+          if (t.id === id) continue;
+          const otherAnim = this.animatedActors.get(t.id);
+          const ox = otherAnim ? otherAnim.x : t.position.x;
+          const oz = otherAnim ? otherAnim.z : t.position.z;
+          const oRotY = otherAnim ? otherAnim.rotationY : t.rotationY;
+          const rB = Math.hypot(ox - rcx, oz - rcz);
+          if (rB > ringZoneR + 0.65) continue;
+
+          // Ignore vehicles that have already turned outbound onto an exit arm
+          const ofx = Math.cos(oRotY);
+          const ofz = -Math.sin(oRotY);
+          const radialOutB =
+            rB > 0.1 ? ((ox - rcx) * ofx + (oz - rcz) * ofz) / rB : 0;
+          if (radialOutB > 0.65 && rB > (isMini ? 4.4 : 7.6)) continue;
+
+          const angleB = Math.atan2(ox - rcx, oz - rcz);
+          let delta = armAngle - angleB;
+          while (delta < 0) delta += Math.PI * 2;
+          if (delta <= 2.45 || delta >= Math.PI * 2 - 0.9) {
+            const stopDist = rA - (yieldLineR + actor.halfLen + 0.35);
+            const s = stopDist <= 0.2 ? 0 : clamp(stopDist / 8.5, 0, 1);
+            if (s < minScale) minScale = s;
+            if (stopDist <= 0.25) hardStop = true;
+          }
+        }
+      }
+    }
+
+    // 3. Vehicle-to-vehicle following, roundabout arc spacing, & intersection right-of-way
+    for (const t of this.vehicleTargets) {
+      if (t.id === id) continue;
+      const otherAnim = this.animatedActors.get(t.id);
+      const ox = otherAnim ? otherAnim.x : t.position.x;
+      const oz = otherAnim ? otherAnim.z : t.position.z;
+      const oRotY = otherAnim ? otherAnim.rotationY : t.rotationY;
+      const otherSpeed = otherAnim ? otherAnim.currentSpeed : 0;
+      const otherHalfLen = otherAnim ? otherAnim.halfLen : getActorHalfLength(t.kind);
+      const otherHalfW = getActorHalfWidth(t.kind);
+
+      const relX = ox - actor.x;
+      const relZ = oz - actor.z;
+      const maxCheckDist = actor.halfLen + otherHalfLen + 24.0;
+      if (relX * relX + relZ * relZ > maxCheckDist * maxCheckDist) continue;
+
+      const ofx = Math.cos(oRotY);
+      const ofz = -Math.sin(oRotY);
+      const dotHeading = fx * ofx + fz * ofz;
+
+      let skipIntersectionCrossing = false;
+      // Roundabout circulatory arc following (handles tight 60-120 deg curve spacing)
+      if (actorRoundaboutIdx >= 0) {
+        const rb = this.modularRoadEntries[actorRoundaboutIdx];
+        const rcx = rb.target.position.x;
+        const rcz = rb.target.position.z;
+        const rB = Math.hypot(ox - rcx, oz - rcz);
+        if (rB <= actorRbRingR + 0.65) {
+          const angleB = Math.atan2(ox - rcx, oz - rcz);
+          let arcAngle = angleB - actorRbAngle;
+          while (arcAngle < 0) arcAngle += Math.PI * 2;
+          if (arcAngle > 0.02 && arcAngle < Math.PI) {
+            const arcDist = arcAngle * ((actorRbR + rB) * 0.5);
+            const safeGap = actor.halfLen + otherHalfLen + 2.5;
+            if (arcDist < safeGap + 7.5) {
+              const s = arcDist <= safeGap ? 0 : clamp((arcDist - safeGap) / 7.5, 0, 1);
+              if (s < minScale) minScale = s;
+              if (arcDist <= safeGap + 0.35) hardStop = true;
+              if (otherAnim?.isYielding && arcDist < safeGap + 3.5) yieldingToPed = true;
+            }
+          }
+          continue;
+        }
+        // Circulating traffic inside a roundabout has right-of-way over outside entering arms
+        skipIntersectionCrossing = true;
+      }
+
+      const fwdDist = relX * fx + relZ * fz;
+      const latDist = Math.abs(relX * rx + relZ * rz);
+      const sinHeading = Math.sqrt(Math.max(0, 1 - dotHeading * dotHeading));
+      const otherProjHalfL = otherHalfLen * Math.abs(dotHeading) + otherHalfW * sinHeading;
+      const otherProjHalfW = otherHalfLen * sinHeading + otherHalfW * Math.abs(dotHeading);
+      const safeGap = actor.halfLen + otherProjHalfL + 2.4;
+
+      // A. Same-lane following / parked obstacle / direct-lane head-on guard
+      const isSameDirection = dotHeading > 0.35;
+      const isParkedAhead = otherSpeed < 0.25 && fwdDist > 0.2;
+      const isDirectLaneHeadOn =
+        dotHeading < -0.35 && latDist < myHalfW + otherProjHalfW + 0.3;
+
+      if (isSameDirection || isParkedAhead || isDirectLaneHeadOn) {
+        const laneHalfBand =
+          myHalfW + otherProjHalfW + (isSameDirection && dotHeading < 0.92 ? 0.85 : 0.45);
+        if (fwdDist > 0.2 && latDist < laneHalfBand && fwdDist < safeGap + 8.0) {
+          const s = fwdDist <= safeGap ? 0 : clamp((fwdDist - safeGap) / 8.0, 0, 1);
+          if (s < minScale) minScale = s;
+          if (fwdDist <= safeGap + 0.4) hardStop = true;
+          if (otherAnim?.isYielding && fwdDist < safeGap + 3.5) yieldingToPed = true;
+        }
+      }
+
+      // B. Crossing / Intersection right-of-way (4-way, T-junction, merging traffic)
+      const det = fz * ofx - fx * ofz;
+      if (!skipIntersectionCrossing && Math.abs(det) > 0.22) {
+        const sCross = (relZ * ofx - relX * ofz) / det;
+        const uCross = (fx * relZ - fz * relX) / det;
+        const clearA = actor.halfLen + otherHalfW + 2.0;
+        const clearB = otherHalfLen + myHalfW + 2.0;
+
+        if (
+          sCross >= -actor.halfLen - 0.5 &&
+          sCross <= actor.halfLen + 17.5 &&
+          uCross >= -otherHalfLen - 1.2 &&
+          uCross <= otherHalfLen + 18.0
+        ) {
+          // If moving other vehicle is already stopped outside the box yielding, don't deadlock
+          const otherStoppedYielding =
+            otherAnim && otherSpeed < 0.45 && uCross > clearB + 0.4;
+          if (!otherStoppedYielding) {
+            const vA = Math.max(actor.speed * 0.8, actor.currentSpeed, 2.5);
+            const tAEnter = Math.max(0, (sCross - clearA) / vA);
+            const tAExit = Math.max(0, (sCross + clearA) / vA);
+            const tBEnter = otherSpeed < 0.45 ? 0 : Math.max(0, (uCross - clearB) / otherSpeed);
+            const tBExit = otherSpeed < 0.45 ? 99 : Math.max(0, (uCross + clearB) / otherSpeed);
+
+            if (tAEnter <= tBExit + 1.0 && tBEnter <= tAExit + 1.0) {
+              let mustYield = false;
+              const iz = actor.z + fz * sCross;
+
+              if (uCross <= clearB && sCross > clearA) {
+                // Other vehicle is already occupying the crossing point
+                mustYield = true;
+              } else if (
+                (sCross <= clearA || actorInsideAnyIntersection) &&
+                uCross > clearB
+              ) {
+                // We are already inside the intersection / crossing; finish clearing
+                mustYield = false;
+              } else {
+                // Through-traffic on main corridor has priority over side-street merging traffic
+                const aMainThrough =
+                  Math.abs(iz) <= 4.5 && Math.abs(actor.z) <= 4.0 && Math.abs(fx) >= 0.85;
+                const bMainThrough =
+                  Math.abs(iz) <= 4.5 && Math.abs(oz) <= 4.0 && Math.abs(ofx) >= 0.85;
+
+                if (!aMainThrough && bMainThrough) {
+                  mustYield = true;
+                } else if (aMainThrough && !bMainThrough) {
+                  mustYield = false;
+                } else {
+                  const bumperDistA = sCross - actor.halfLen;
+                  const bumperDistB = uCross - otherHalfLen;
+                  if (bumperDistB + 2.0 < bumperDistA) {
+                    mustYield = true;
+                  } else if (bumperDistA + 2.0 < bumperDistB) {
+                    mustYield = false;
+                  } else {
+                    // Equal arrival: Yield to vehicle approaching from the RIGHT
+                    const rightDot = relX * rx + relZ * rz;
+                    if (rightDot > 0.6) mustYield = true;
+                    else if (rightDot < -0.6) mustYield = false;
+                    else mustYield = id > t.id;
+                  }
+                }
+              }
+
+              if (mustYield) {
+                const stopDist = sCross - clearA;
+                const brakeWindow = Math.max(7.5, actor.speed * 1.2);
+                const scale = stopDist <= 0.15 ? 0 : clamp(stopDist / brakeWindow, 0, 1);
+                if (scale < minScale) minScale = scale;
+                if (stopDist <= 0.25 && sCross > -actor.halfLen * 0.4) hardStop = true;
+              }
+            }
+          }
+        }
+      }
+
+      // C. Exact oriented-box forward corridor collision guard (prevents angled/turning bumper contact)
+      const hitFwd = this.getSweptCorridorHitFwd(
+        actor.x,
+        actor.z,
+        fx,
+        fz,
+        rx,
+        rz,
+        myHalfW + 0.32,
+        ox,
+        oz,
+        ofx,
+        ofz,
+        otherHalfLen,
+        otherHalfW,
+      );
+      if (hitFwd < Infinity && hitFwd >= -actor.halfLen * 0.35) {
+        let ignoreStationarySideTurn = false;
+        if (
+          otherSpeed < 0.35 &&
+          actor.subPath &&
+          actor.subPath.length >= 2 &&
+          actor.graphNodeId !== undefined
+        ) {
+          const destNode = this.roadGraph.nodes[actor.graphNodeId];
+          if (destNode) {
+            const turnDot = fx * destNode.dirX + fz * destNode.dirZ;
+            if (turnDot < 0.9) {
+              let minPathDistSq = Infinity;
+              let px = actor.x;
+              let pz = actor.z;
+              const startIdx = actor.subPathIdx ?? 0;
+              for (let k = startIdx; k < actor.subPath.length; k++) {
+                const wp = actor.subPath[k];
+                const abx = wp.x - px;
+                const abz = wp.z - pz;
+                const abLenSq = abx * abx + abz * abz;
+                const t =
+                  abLenSq > 1e-4
+                    ? clamp(((ox - px) * abx + (oz - pz) * abz) / abLenSq, 0, 1)
+                    : 0;
+                const qx = px + abx * t;
+                const qz = pz + abz * t;
+                const dSq = (ox - qx) * (ox - qx) + (oz - qz) * (oz - qz);
+                if (dSq < minPathDistSq) minPathDistSq = dSq;
+                px = wp.x;
+                pz = wp.z;
+              }
+              // Include 4.5m exit tangent along destination node direction
+              const ex = px + destNode.dirX * 4.5;
+              const ez = pz + destNode.dirZ * 4.5;
+              const abx = ex - px;
+              const abz = ez - pz;
+              const abLenSq = abx * abx + abz * abz;
+              const t =
+                abLenSq > 1e-4
+                  ? clamp(((ox - px) * abx + (oz - pz) * abz) / abLenSq, 0, 1)
+                  : 0;
+              const qx = px + abx * t;
+              const qz = pz + abz * t;
+              const dSq = (ox - qx) * (ox - qx) + (oz - qz) * (oz - qz);
+              if (dSq < minPathDistSq) minPathDistSq = dSq;
+
+              const pathClearance = myHalfW + Math.max(otherHalfW, otherHalfLen) + 0.65;
+              if (minPathDistSq > pathClearance * pathClearance) {
+                ignoreStationarySideTurn = true;
+              }
+            }
+          }
+        }
+
+        const bumperGap = Math.max(0, hitFwd) - actor.halfLen;
+        if (!ignoreStationarySideTurn || bumperGap <= 1.2) {
+          if (bumperGap <= 1.5) {
+            minScale = 0;
+            hardStop = true;
+          } else if (bumperGap < 7.5) {
+            const s = clamp((bumperGap - 1.5) / 6.0, 0, 1);
+            if (s < minScale) minScale = s;
+          }
+        }
+      }
+    }
+
+    return { scale: minScale, yieldingToPed, hardStop };
+  }
+
+  public requestRender(): void {
+    if (this.disposed) return;
+    if (this.renderBusy) {
+      this.renderDirty = true;
+      return;
+    }
+
+    this.renderBusy = true;
+    this.frameId = requestAnimationFrame(() => {
+      if (this.disposed) return;
+      this.renderDirty = false;
+
+      const now = performance.now();
+      const delta = Math.min((now - this.lastTickTime) / 1000, 0.1);
+      this.lastTickTime = now;
+
+      let keepAnimating = false;
+
+      if (this.cameraTransition.active) {
+        const lambda = 7.5;
+        this.camera.position.x = THREE.MathUtils.damp(
+          this.camera.position.x,
+          this.cameraTransition.targetPos.x,
+          lambda,
+          delta,
+        );
+        this.camera.position.y = THREE.MathUtils.damp(
+          this.camera.position.y,
+          this.cameraTransition.targetPos.y,
+          lambda,
+          delta,
+        );
+        this.camera.position.z = THREE.MathUtils.damp(
+          this.camera.position.z,
+          this.cameraTransition.targetPos.z,
+          lambda,
+          delta,
+        );
+        this.controls.target.x = THREE.MathUtils.damp(
+          this.controls.target.x,
+          this.cameraTransition.targetLookAt.x,
+          lambda,
+          delta,
+        );
+        this.controls.target.y = THREE.MathUtils.damp(
+          this.controls.target.y,
+          this.cameraTransition.targetLookAt.y,
+          lambda,
+          delta,
+        );
+        this.controls.target.z = THREE.MathUtils.damp(
+          this.controls.target.z,
+          this.cameraTransition.targetLookAt.z,
+          lambda,
+          delta,
+        );
+
+        const posDist = _vec3A
+          .copy(this.camera.position)
+          .distanceTo(this.cameraTransition.targetPos);
+        const tgtDist = _vec3B
+          .copy(this.controls.target)
+          .distanceTo(this.cameraTransition.targetLookAt);
+
+        if (this.cameraControlMode === 'pan') {
+          this.camera.lookAt(this.controls.target);
+        }
+
+        if (posDist < 0.04 && tgtDist < 0.04) {
+          this.camera.position.copy(this.cameraTransition.targetPos);
+          this.controls.target.copy(this.cameraTransition.targetLookAt);
+          if (this.cameraControlMode === 'pan') {
+            this.camera.lookAt(this.controls.target);
+            _euler.setFromQuaternion(this.camera.quaternion, 'YXZ');
+            this.freePitch = _euler.x;
+            this.freeYaw = _euler.y;
+          }
+          this.cameraTransition.active = false;
+        } else {
+          keepAnimating = true;
+        }
+      }
+
+      // Free camera translation using customizable keybinds + unbound secondary arrows/Q/E
+      const kb = this.controlsConfig.keybinds;
+      const hasBoundFwd =
+        this.pressedKeys.has(kb.moveForward) ||
+        (!this.isAnyActionBoundTo('ArrowUp') && this.pressedKeys.has('ArrowUp'));
+      const hasBoundBack =
+        this.pressedKeys.has(kb.moveBackward) ||
+        (!this.isAnyActionBoundTo('ArrowDown') && this.pressedKeys.has('ArrowDown'));
+      const hasBoundRight =
+        this.pressedKeys.has(kb.moveRight) ||
+        (!this.isAnyActionBoundTo('ArrowRight') && this.pressedKeys.has('ArrowRight'));
+      const hasBoundLeft =
+        this.pressedKeys.has(kb.moveLeft) ||
+        (!this.isAnyActionBoundTo('ArrowLeft') && this.pressedKeys.has('ArrowLeft'));
+      const hasBoundUp =
+        this.pressedKeys.has(kb.moveUp) ||
+        (!this.isAnyActionBoundTo('KeyE') && this.pressedKeys.has('KeyE'));
+      const hasBoundDown =
+        this.pressedKeys.has(kb.moveDown) ||
+        (kb.moveDown === 'ShiftLeft' && this.pressedKeys.has('ShiftRight')) ||
+        (!this.isAnyActionBoundTo('KeyQ') && this.pressedKeys.has('KeyQ'));
+
+      const moveFwd = (hasBoundFwd ? 1 : 0) - (hasBoundBack ? 1 : 0);
+      const moveRight = (hasBoundRight ? 1 : 0) - (hasBoundLeft ? 1 : 0);
+      const moveUp = (hasBoundUp ? 1 : 0) - (hasBoundDown ? 1 : 0);
+
+      if (moveFwd !== 0 || moveRight !== 0 || moveUp !== 0) {
+        const speed = 15.5 * this.controlsConfig.moveSpeed * Math.max(delta, 0.016);
+
+        this.camera.getWorldDirection(_vec3A);
+        _vec3A.y = 0;
+        if (_vec3A.lengthSq() < 1e-5) {
+          _vec3A.set(0, 0, -1);
+        } else {
+          _vec3A.normalize();
+        }
+        _vec3B.crossVectors(_vec3A, this.camera.up).normalize();
+
+        _vec3C.set(0, 0, 0);
+        if (moveFwd !== 0) _vec3C.addScaledVector(_vec3A, moveFwd);
+        if (moveRight !== 0) _vec3C.addScaledVector(_vec3B, moveRight);
+        if (_vec3C.lengthSq() > 1) _vec3C.normalize();
+        _vec3C.multiplyScalar(speed);
+        _vec3C.y = moveUp * speed * 0.75;
+
+        const nextCamX = clamp(this.camera.position.x + _vec3C.x, -110, 110);
+        const nextCamZ = clamp(this.camera.position.z + _vec3C.z, -110, 110);
+        const nextCamY = clamp(this.camera.position.y + _vec3C.y, 0.45, 75);
+
+        const actualDx = nextCamX - this.camera.position.x;
+        const actualDy = nextCamY - this.camera.position.y;
+        const actualDz = nextCamZ - this.camera.position.z;
+
+        this.camera.position.set(nextCamX, nextCamY, nextCamZ);
+        this.controls.target.set(
+          clamp(this.controls.target.x + actualDx, -110, 110),
+          clamp(this.controls.target.y + actualDy, 0, 40),
+          clamp(this.controls.target.z + actualDz, -110, 110),
+        );
+        keepAnimating = true;
+      }
+
+      if (this.cameraControlMode === 'orbit') {
+        const dampingMoved = this.controls.update();
+        if (dampingMoved && !this.isSoftwareGl) {
+          keepAnimating = true;
+        }
+      }
+
+      // 3b. Advance synchronized traffic signals
+      if (this.trafficControllers.length > 0 && delta > 0) {
+        this.trafficSignalClock += Math.min(delta, 0.1);
+        this.updateTrafficLightVisuals();
+        keepAnimating = true;
+      }
+
+      // 4. Advance walking pedestrian & driving cars
+      if (this.animatedActors.size > 0 && delta > 0) {
+        const stepDelta = Math.min(delta, 0.08);
+        for (const [id, actor] of this.animatedActors.entries()) {
+          const group = this.targetGroups.get(id);
+          if (!group) continue;
+
+          if (this.draggingTargetId === id) {
+            actor.x = group.position.x;
+            actor.z = group.position.z;
+            continue;
+          }
+
+          if (actor.motion === 'walk') {
+            if (actor.walkGoalX === undefined || actor.walkGoalZ === undefined) {
+              this.initPedestrianWalk(actor);
+            }
+
+            // Periodically drift walking speed naturally
+            actor.speedDriftTimer = (actor.speedDriftTimer ?? 5.0) - stepDelta;
+            if (actor.speedDriftTimer <= 0) {
+              actor.speedDriftTimer = 3.5 + Math.random() * 6.0;
+              actor.speed =
+                getActorBaseSpeed(actor.kind, actor.rotationY) * (0.76 + Math.random() * 0.48);
+            }
+
+            // Handle random corner/stroll pauses
+            if ((actor.walkPauseTimer ?? 0) > 0) {
+              actor.walkPauseTimer = Math.max(0, (actor.walkPauseTimer ?? 0) - stepDelta);
+              if (actor.walkPauseTimer === 0) {
+                if (actor.walkCurrNodeId !== undefined) {
+                  this.pickNextWalkTarget(actor);
+                } else {
+                  this.pickRandomFreeWalkTarget(actor);
+                }
+              }
+            }
+
+            const goalX = actor.walkGoalX ?? actor.x;
+            const goalZ = actor.walkGoalZ ?? actor.z;
+            const dx = goalX - actor.x;
+            const dz = goalZ - actor.z;
+            const dist = Math.hypot(dx, dz);
+            const paused = (actor.walkPauseTimer ?? 0) > 0;
+            const waiting = paused || this.shouldPedestrianYield(actor, dx, dz);
+
+            if (!waiting) {
+              const step = actor.speed * stepDelta;
+
+              if (dist <= step + 0.08) {
+                actor.x = goalX;
+                actor.z = goalZ;
+                if (actor.walkCurrNodeId !== undefined) {
+                  // Random brief stop at corners or after crossing street
+                  if (Math.random() < (actor.walkIsCrosswalk ? 0.28 : 0.16)) {
+                    actor.walkPauseTimer = 0.45 + Math.random() * 1.9;
+                  } else {
+                    let hops = 0;
+                    while (hops < 4) {
+                      hops++;
+                      this.pickNextWalkTarget(actor);
+                      if (
+                        Math.hypot(
+                          (actor.walkGoalX ?? actor.x) - actor.x,
+                          (actor.walkGoalZ ?? actor.z) - actor.z,
+                        ) > 0.2
+                      ) {
+                        break;
+                      }
+                    }
+                  }
+                } else {
+                  if (Math.random() < 0.45) {
+                    actor.walkPauseTimer = 0.6 + Math.random() * 2.1;
+                  } else {
+                    this.pickRandomFreeWalkTarget(actor);
+                  }
+                }
+              } else if (dist > 1e-4) {
+                let moveX = dx / dist;
+                let moveZ = dz / dist;
+
+                // Soft personal-space sidestep around other pedestrians
+                for (const [otherId, otherActor] of this.animatedActors.entries()) {
+                  if (otherId === id || otherActor.motion !== 'walk') continue;
+                  const rx = actor.x - otherActor.x;
+                  const rz = actor.z - otherActor.z;
+                  const d = Math.hypot(rx, rz);
+                  if (d > 0.05 && d < 0.85) {
+                    const push = ((0.85 - d) / 0.85) * 0.45;
+                    moveX += (rx / d) * push;
+                    moveZ += (rz / d) * push;
+                  }
+                }
+                const mLen = Math.hypot(moveX, moveZ) || 1;
+                actor.x += (moveX / mLen) * step;
+                actor.z += (moveZ / mLen) * step;
+              }
+            }
+
+            if (dist > 1e-4) {
+              // Keep facing movement/crosswalk direction smoothly even while yielding
+              const targetRotY = Math.atan2(dx, dz);
+              let angleDiff = targetRotY - actor.rotationY;
+              while (angleDiff > Math.PI) angleDiff -= Math.PI * 2;
+              while (angleDiff < -Math.PI) angleDiff += Math.PI * 2;
+              actor.rotationY += angleDiff * Math.min(1, 10 * stepDelta);
+            }
+
+            const targetY = this.getGroundPlacementHeight(actor.x, actor.z, 'pedestrian');
+            group.position.x = actor.x;
+            group.position.z = actor.z;
+            group.position.y = THREE.MathUtils.damp(group.position.y, targetY, 12, stepDelta);
+            group.rotation.y = actor.rotationY;
+
+            actor.strideBlend = THREE.MathUtils.damp(
+              actor.strideBlend,
+              waiting ? 0 : 1,
+              10,
+              stepDelta,
+            );
+            if (!waiting) {
+              actor.phase += stepDelta * (4.1 * actor.speed);
+            }
+            const pedRefs = group.userData.pedestrianRefs as PedestrianRigRefs | undefined;
+            if (pedRefs) {
+              const swing = Math.sin(actor.phase) * 0.56 * actor.strideBlend;
+              pedRefs.legL.rotation.x = swing;
+              pedRefs.legR.rotation.x = -swing;
+              pedRefs.armL.rotation.x = -swing * 0.85;
+              pedRefs.armR.rotation.x = swing * 0.85;
+              pedRefs.upperBody.position.y =
+                Math.abs(Math.sin(actor.phase)) * 0.032 * actor.strideBlend;
+            }
+          } else if (actor.motion === 'drive') {
+            actor.speedDriftTimer = (actor.speedDriftTimer ?? 4.0) - stepDelta;
+            if (actor.speedDriftTimer <= 0) {
+              actor.speedDriftTimer = 3.5 + Math.random() * 5.0;
+              actor.speed =
+                getActorBaseSpeed(actor.kind, actor.rotationY) * (0.82 + Math.random() * 0.36);
+            }
+
+            if (actor.subPath === undefined && this.roadGraph.nodes.length > 0) {
+              this.assignInitialGraphRoute(actor);
+            }
+
+            let cornerScale = 1;
+            const activeWp =
+              actor.subPath && actor.graphNodeId !== undefined
+                ? actor.subPath[actor.subPathIdx ?? 0]
+                : undefined;
+            if (activeWp) {
+              const adx = activeWp.x - actor.x;
+              const adz = activeWp.z - actor.z;
+              if (Math.hypot(adx, adz) > 1e-4) {
+                const tRot = Math.atan2(-adz, adx);
+                let diff = tRot - actor.rotationY;
+                while (diff > Math.PI) diff -= Math.PI * 2;
+                while (diff < -Math.PI) diff += Math.PI * 2;
+                if (Math.abs(diff) > 0.25) {
+                  cornerScale = clamp(1 - Math.abs(diff) * 0.42, 0.48, 1);
+                }
+              }
+            }
+
+            const traffic = this.getVehicleTrafficScale(id, actor);
+            actor.isYielding = traffic.yieldingToPed || traffic.scale < 0.15;
+            if (traffic.hardStop) {
+              actor.currentSpeed = 0;
+            } else {
+              const targetSpeed = actor.speed * traffic.scale * cornerScale;
+              const dampRate = targetSpeed < actor.currentSpeed ? 12.0 : 4.2;
+              actor.currentSpeed = THREE.MathUtils.damp(
+                actor.currentSpeed,
+                targetSpeed,
+                dampRate,
+                stepDelta,
+              );
+              if (targetSpeed === 0 && actor.currentSpeed < 0.08) {
+                actor.currentSpeed = 0;
+              }
+            }
+
+            if (
+              actor.subPath &&
+              actor.graphNodeId !== undefined &&
+              actor.graphNodeId < this.roadGraph.nodes.length
+            ) {
+              const wp = actor.subPath[actor.subPathIdx ?? 0];
+              if (wp) {
+                const dx = wp.x - actor.x;
+                const dz = wp.z - actor.z;
+                const dist = Math.hypot(dx, dz);
+                const step = actor.currentSpeed * stepDelta;
+
+                if (dist > 1e-4) {
+                  const targetRotY = Math.atan2(-dz, dx);
+                  let angleDiff = targetRotY - actor.rotationY;
+                  while (angleDiff > Math.PI) angleDiff -= Math.PI * 2;
+                  while (angleDiff < -Math.PI) angleDiff += Math.PI * 2;
+                  const turnGain = actor.subPath.length >= 3 ? 12.5 : 10.0;
+                  actor.rotationY += angleDiff * Math.min(1, turnGain * stepDelta);
+                }
+
+                if (dist <= step + 0.35) {
+                  actor.x = wp.x;
+                  actor.z = wp.z;
+                  actor.subPathIdx = (actor.subPathIdx ?? 0) + 1;
+
+                  let hops = 0;
+                  while (
+                    actor.subPath &&
+                    (actor.subPathIdx ?? 0) >= actor.subPath.length &&
+                    actor.graphNodeId !== undefined &&
+                    hops < 8
+                  ) {
+                    hops++;
+                    const nextEdge = this.pickNextGraphEdge(id, actor, actor.graphNodeId);
+                    if (!nextEdge) {
+                      actor.subPath = undefined;
+                      actor.graphNodeId = undefined;
+                      break;
+                    }
+                    if (nextEdge.isRoundaboutStay) {
+                      actor.roundaboutSteps = (actor.roundaboutSteps ?? 0) + 1;
+                    } else if (nextEdge.isRoundaboutExit) {
+                      actor.roundaboutSteps = 0;
+                      actor.roundaboutTargetSteps = 1 + Math.floor(Math.random() * 8);
+                    }
+                    if (nextEdge.isWrap) {
+                      const destNode = this.roadGraph.nodes[nextEdge.toNodeId];
+                      if (destNode) {
+                        actor.x = destNode.x;
+                        actor.z = destNode.z;
+                        actor.rotationY = Math.atan2(-destNode.dirZ, destNode.dirX);
+                      }
+                      actor.graphNodeId = nextEdge.toNodeId;
+                      actor.subPath = [];
+                      actor.subPathIdx = 0;
+                      continue;
+                    }
+                    actor.graphNodeId = nextEdge.toNodeId;
+                    actor.subPath = nextEdge.points;
+                    actor.subPathIdx = 0;
+                  }
+                } else if (dist > 1e-4) {
+                  actor.x += (dx / dist) * step;
+                  actor.z += (dz / dist) * step;
+                }
+              }
+            } else {
+              // Off-graph random steering wander + periodic road network re-entry
+              actor.offGraphTimer = (actor.offGraphTimer ?? 2.0) - stepDelta;
+              if (actor.offGraphTimer <= 0) {
+                actor.offGraphTimer = 1.5 + Math.random() * 3.0;
+                actor.offGraphTurnRate = (Math.random() - 0.5) * 0.7;
+                if (this.roadGraph.nodes.length > 0) {
+                  this.assignInitialGraphRoute(actor);
+                }
+              }
+              actor.rotationY += (actor.offGraphTurnRate ?? 0) * stepDelta;
+              const fx = Math.cos(actor.rotationY);
+              const fz = -Math.sin(actor.rotationY);
+
+              actor.x += fx * actor.currentSpeed * stepDelta;
+              actor.z += fz * actor.currentSpeed * stepDelta;
+
+              if (
+                Math.abs(actor.x) > FIXTURE_MAX_X - 3.0 ||
+                Math.abs(actor.z) > FIXTURE_MAX_Z - 3.0
+              ) {
+                actor.x = clamp(actor.x, -FIXTURE_MAX_X + 2.5, FIXTURE_MAX_X - 2.5);
+                actor.z = clamp(actor.z, -FIXTURE_MAX_Z + 2.5, FIXTURE_MAX_Z - 2.5);
+                const inwardRot = Math.atan2(actor.z, -actor.x) + (Math.random() - 0.5) * 0.8;
+                actor.rotationY = inwardRot;
+              }
+            }
+
+            group.position.x = actor.x;
+            group.position.z = actor.z;
+            group.position.y = this.getGroundPlacementHeight(actor.x, actor.z, actor.kind);
+            group.rotation.y = actor.rotationY;
+
+            const wheelPivots = group.userData.wheelPivots as THREE.Group[] | undefined;
+            if (wheelPivots && actor.currentSpeed > 0) {
+              const wheelR = (group.userData.wheelRadius as number | undefined) ?? 0.32;
+              const spinAngle = (actor.currentSpeed * stepDelta) / wheelR;
+              for (const pivot of wheelPivots) {
+                pivot.rotation.z -= spinAngle;
+              }
+            }
+          }
+        }
+        keepAnimating = true;
+      }
+
+      this.camera.layers.mask = (1 << 0) | (1 << 2);
+      this.renderer.render(this.scene, this.camera);
+
+      const done = () => {
+        this.renderBusy = false;
+        if (this.renderDirty || keepAnimating) {
+          this.requestRender();
+        }
+      };
+
+      if (this.isSoftwareGl) {
+        this.afterDraw(done);
+      } else {
+        done();
+      }
+    });
+  }
+
+  public dispose(): void {
+    this.disposed = true;
+    cancelAnimationFrame(this.frameId);
+    clearTimeout(this.frameId);
+    this.unbindEvents();
+    this.controls.dispose();
+
+    disposeObject3DResources(this.scene);
+
+    for (const entry of this.lightEntries.values()) {
+      entry.spotLight.map = null;
+      entry.goboTex?.dispose();
+      entry.poleRefs.shieldTex.dispose();
+    }
+    disposeLuxOverlayState(this.luxOverlayState);
+
+    this.asphaltTex.dispose();
+    this.sidewalkTex.dispose();
+    this.contactShadowTex.dispose();
+    this.curbMat.dispose();
+    this.sidewalkMat.dispose();
+    this.selectedSidewalkMat.dispose();
+    disposeCachedRoadTextures();
+    this.renderer.dispose();
+    if (this.renderer.domElement.parentNode === this.container) {
+      this.container.removeChild(this.renderer.domElement);
+    }
+  }
+}
