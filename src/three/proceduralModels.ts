@@ -1100,9 +1100,15 @@ export function updateStreetPoleRig(
 export interface PedestrianRigRefs {
   legL: THREE.Group;
   legR: THREE.Group;
+  kneeL: THREE.Group;
+  kneeR: THREE.Group;
   armL: THREE.Group;
   armR: THREE.Group;
+  elbowL: THREE.Group;
+  elbowR: THREE.Group;
   upperBody: THREE.Group;
+  head: THREE.Group;
+  heightScale: number;
 }
 
 export function createStreetTargetGroup(
@@ -1132,6 +1138,12 @@ export function createStreetTargetGroup(
     'building-small': { sx: 5.8, sz: 5.8, ringR: 3.15 },
     'building-tall': { sx: 6.6, sz: 6.6, ringR: 3.65 },
     'building-highrise': { sx: 7.4, sz: 7.4, ringR: 4.05 },
+    'building-rowhouse': { sx: 11.2, sz: 6.0, ringR: 5.4 },
+    'building-commercial': { sx: 12.2, sz: 6.2, ringR: 5.8 },
+    'building-warehouse': { sx: 11.8, sz: 7.8, ringR: 6.2 },
+    'building-civic': { sx: 12.0, sz: 8.2, ringR: 6.4 },
+    'building-apartments': { sx: 10.6, sz: 8.4, ringR: 6.0 },
+    'building-skyscraper': { sx: 9.4, sz: 7.6, ringR: 5.2 },
     tree: { sx: 2.8, sz: 2.8, ringR: 1.35 },
     hedge: { sx: 3.1, sz: 1.5, ringR: 1.45 },
     bench: { sx: 2.6, sz: 1.6, ringR: 1.15 },
@@ -1167,6 +1179,7 @@ export function createStreetTargetGroup(
   contactPlane.rotation.x = -Math.PI / 2;
   contactPlane.position.y = 0.014;
   contactPlane.visible = !isGroundSegment;
+  group.userData.contactPlane = contactPlane;
   group.add(contactPlane);
 
   // Selection highlight ring
@@ -1787,75 +1800,202 @@ export function createStreetTargetGroup(
       group.add(tail);
     }
   } else if (kind === 'pedestrian') {
-    const shoeMat = new THREE.MeshStandardMaterial({ color: 0x1e293b, roughness: 0.85, metalness: 0.05 });
-    const trouserMat = new THREE.MeshStandardMaterial({ color: 0x334155, roughness: 0.82, metalness: 0.04 });
-    const jacketMat = new THREE.MeshStandardMaterial({
-      color: customColor ? new THREE.Color(customColor) : 0xc26d38,
-      roughness: 0.62,
-      metalness: 0.08,
-    });
-    const skinMat = new THREE.MeshStandardMaterial({ color: 0xd8a888, roughness: 0.55, metalness: 0.02 });
-
-    // Articulated leg hip pivots (y = 0.80)
-    const makeLegPivot = (sideX: number) => {
-      const pivot = new THREE.Group();
-      pivot.position.set(sideX, 0.8, 0);
-
-      const leg = new THREE.Mesh(new THREE.CapsuleGeometry(0.075, 0.68, 4, 10), trouserMat);
-      leg.position.set(0, -0.34, 0);
-      leg.castShadow = true;
-      leg.receiveShadow = true;
-      pivot.add(leg);
-
-      const shoe = new THREE.Mesh(new THREE.BoxGeometry(0.12, 0.08, 0.22), shoeMat);
-      shoe.position.set(0, -0.76, 0.03);
-      shoe.castShadow = true;
-      pivot.add(shoe);
-
-      group.add(pivot);
-      return pivot;
+    // Deterministic per-person appearance hash so each pedestrian keeps consistent build, skin, hair, trousers & accessories
+    let hash = 2166136261;
+    for (let i = 0; i < id.length; i++) {
+      hash ^= id.charCodeAt(i);
+      hash = Math.imul(hash, 16777619);
+    }
+    const rand01 = (salt: number) => {
+      let x = hash ^ (salt * 0x9e3779b9);
+      x = Math.imul(x ^ (x >>> 16), 0x85ebca6b);
+      x = Math.imul(x ^ (x >>> 13), 0xc2b2ae35);
+      return ((x ^ (x >>> 16)) >>> 0) / 4294967295;
     };
 
-    const legL = makeLegPivot(-0.11);
-    const legR = makeLegPivot(0.11);
+    const SKIN_TONES = [0xf2cbb0, 0xe2b290, 0xd49c79, 0xb87d59, 0x8d583b, 0x613a26];
+    const TROUSER_TONES = [0x1e293b, 0x334155, 0x273449, 0x3f3f46, 0x57534e, 0x6b5b45, 0x2f3e34];
+    const HAIR_TONES = [0x171412, 0x2e1e14, 0x4a2e1b, 0x6e4226, 0x9c7440, 0x8c8c94];
+    const SHOE_TONES = [0x111827, 0x1e293b, 0x3b2f2f, 0x475569];
+    const BAG_TONES = [0x1e293b, 0x374151, 0x475569, 0x7c2d12, 0x1e3a5f];
+
+    const skinColor = SKIN_TONES[Math.floor(rand01(1) * SKIN_TONES.length)];
+    const trouserColor = TROUSER_TONES[Math.floor(rand01(2) * TROUSER_TONES.length)];
+    const hairColor = HAIR_TONES[Math.floor(rand01(3) * HAIR_TONES.length)];
+    const shoeColor = SHOE_TONES[Math.floor(rand01(4) * SHOE_TONES.length)];
+    const bagColor = BAG_TONES[Math.floor(rand01(5) * BAG_TONES.length)];
+    const heightScale = 0.93 + rand01(6) * 0.14;
+    const widthScale = 0.94 + rand01(7) * 0.12;
+    const hasBackpack = rand01(8) < 0.36;
+    const hasCap = rand01(9) < 0.22;
+
+    const shoeMat = new THREE.MeshStandardMaterial({ color: shoeColor, roughness: 0.85, metalness: 0.05 });
+    const trouserMat = new THREE.MeshStandardMaterial({ color: trouserColor, roughness: 0.84, metalness: 0.04 });
+    const jacketMat = new THREE.MeshStandardMaterial({
+      color: customColor ? new THREE.Color(customColor) : 0xc26d38,
+      roughness: 0.65,
+      metalness: 0.06,
+    });
+    const skinMat = new THREE.MeshStandardMaterial({ color: skinColor, roughness: 0.58, metalness: 0.02 });
+    const hairMat = new THREE.MeshStandardMaterial({ color: hairColor, roughness: 0.82, metalness: 0.04 });
+
+    const bodyRoot = new THREE.Group();
+    bodyRoot.scale.set(widthScale, heightScale, widthScale);
+    group.add(bodyRoot);
+
+    // Articulated leg hip + knee pivots (hip at y = 0.80, knee at -0.38, shoe sole at y = 0)
+    const makeLegRig = (sideX: number) => {
+      const hip = new THREE.Group();
+      hip.position.set(sideX, 0.8, 0);
+
+      const thigh = new THREE.Mesh(new THREE.CapsuleGeometry(0.068, 0.28, 4, 10), trouserMat);
+      thigh.position.set(0, -0.19, 0);
+      thigh.castShadow = true;
+      thigh.receiveShadow = true;
+      hip.add(thigh);
+
+      const knee = new THREE.Group();
+      knee.position.set(0, -0.38, 0);
+
+      const shin = new THREE.Mesh(new THREE.CapsuleGeometry(0.055, 0.28, 4, 10), trouserMat);
+      shin.position.set(0, -0.19, 0);
+      shin.castShadow = true;
+      shin.receiveShadow = true;
+      knee.add(shin);
+
+      const shoe = new THREE.Mesh(new THREE.BoxGeometry(0.115, 0.075, 0.22), shoeMat);
+      shoe.position.set(0, -0.382, 0.032);
+      shoe.castShadow = true;
+      knee.add(shoe);
+
+      hip.add(knee);
+      bodyRoot.add(hip);
+      return { hip, knee };
+    };
+
+    const leftLeg = makeLegRig(-0.105);
+    const rightLeg = makeLegRig(0.105);
 
     const upperBody = new THREE.Group();
-    group.add(upperBody);
+    bodyRoot.add(upperBody);
+
+    // Subtle pelvis bridge so hip joint gap is filled cleanly
+    const hips = new THREE.Mesh(new THREE.CapsuleGeometry(0.145, 0.14, 4, 10), trouserMat);
+    hips.rotation.z = Math.PI / 2;
+    hips.scale.set(0.82, 1, 0.72);
+    hips.position.set(0, 0.83, 0);
+    hips.castShadow = true;
+    upperBody.add(hips);
 
     // Torso jacket
-    const torso = new THREE.Mesh(new THREE.CapsuleGeometry(0.18, 0.48, 6, 12), jacketMat);
-    torso.scale.set(1.1, 1, 0.68);
+    const torso = new THREE.Mesh(new THREE.CapsuleGeometry(0.175, 0.44, 6, 12), jacketMat);
+    torso.scale.set(1.08, 1, 0.66);
     torso.position.set(0, 1.14, 0);
     torso.castShadow = true;
     torso.receiveShadow = true;
     upperBody.add(torso);
 
-    // Articulated shoulder arm pivots
-    const makeArmPivot = (sideX: number) => {
-      const pivot = new THREE.Group();
-      pivot.position.set(sideX, 1.32, 0);
+    // Optional casual backpack
+    if (hasBackpack) {
+      const bagMat = new THREE.MeshStandardMaterial({ color: bagColor, roughness: 0.78, metalness: 0.06 });
+      const pack = new THREE.Mesh(new THREE.BoxGeometry(0.24, 0.34, 0.13), bagMat);
+      pack.position.set(0, 1.15, -0.15);
+      pack.castShadow = true;
+      pack.receiveShadow = true;
+      upperBody.add(pack);
+    }
 
-      const arm = new THREE.Mesh(new THREE.CapsuleGeometry(0.055, 0.44, 4, 8), jacketMat);
-      arm.position.set(0, -0.22, 0);
-      arm.rotation.z = sideX < 0 ? 0.1 : -0.1;
-      arm.castShadow = true;
-      pivot.add(arm);
+    // Articulated shoulder + elbow + hand pivots
+    const makeArmRig = (sideX: number) => {
+      const shoulder = new THREE.Group();
+      shoulder.position.set(sideX, 1.32, 0);
+      shoulder.rotation.z = sideX < 0 ? 0.08 : -0.08;
 
-      upperBody.add(pivot);
-      return pivot;
+      const upperArm = new THREE.Mesh(new THREE.CapsuleGeometry(0.052, 0.16, 4, 8), jacketMat);
+      upperArm.position.set(0, -0.12, 0);
+      upperArm.castShadow = true;
+      shoulder.add(upperArm);
+
+      const elbow = new THREE.Group();
+      elbow.position.set(0, -0.23, 0);
+
+      const forearm = new THREE.Mesh(new THREE.CapsuleGeometry(0.044, 0.16, 4, 8), jacketMat);
+      forearm.position.set(0, -0.11, 0);
+      forearm.castShadow = true;
+      elbow.add(forearm);
+
+      const hand = new THREE.Mesh(new THREE.SphereGeometry(0.042, 8, 8), skinMat);
+      hand.position.set(0, -0.23, 0);
+      hand.castShadow = true;
+      elbow.add(hand);
+
+      shoulder.add(elbow);
+      upperBody.add(shoulder);
+      return { shoulder, elbow };
     };
 
-    const armL = makeArmPivot(-0.26);
-    const armR = makeArmPivot(0.26);
+    const leftArm = makeArmRig(-0.255);
+    const rightArm = makeArmRig(0.255);
 
-    // Head
-    const head = new THREE.Mesh(new THREE.SphereGeometry(0.125, 16, 14), skinMat);
-    head.position.set(0, 1.62, 0);
-    head.castShadow = true;
-    head.receiveShadow = true;
+    // Neck + pivoting head group + hair/cap
+    const head = new THREE.Group();
+    head.position.set(0, 1.46, 0);
+
+    const neck = new THREE.Mesh(new THREE.CylinderGeometry(0.048, 0.056, 0.09, 10), skinMat);
+    neck.position.set(0, 0.04, 0);
+    neck.castShadow = true;
+    head.add(neck);
+
+    const skull = new THREE.Mesh(new THREE.SphereGeometry(0.12, 16, 14), skinMat);
+    skull.scale.set(0.94, 1.06, 0.98);
+    skull.position.set(0, 0.155, 0);
+    skull.castShadow = true;
+    skull.receiveShadow = true;
+    head.add(skull);
+
+    if (hasCap) {
+      const capMat = new THREE.MeshStandardMaterial({ color: bagColor, roughness: 0.72, metalness: 0.05 });
+      const crown = new THREE.Mesh(
+        new THREE.SphereGeometry(0.126, 14, 10, 0, Math.PI * 2, 0, Math.PI * 0.52),
+        capMat,
+      );
+      crown.position.set(0, 0.162, 0);
+      crown.rotation.x = -0.14;
+      crown.castShadow = true;
+      head.add(crown);
+
+      const brim = new THREE.Mesh(new THREE.CylinderGeometry(0.12, 0.125, 0.018, 12, 1, false, -0.9, 1.8), capMat);
+      brim.position.set(0, 0.185, 0.075);
+      brim.rotation.x = 0.15;
+      brim.castShadow = true;
+      head.add(brim);
+    } else {
+      const hairCap = new THREE.Mesh(
+        new THREE.SphereGeometry(0.125, 14, 10, 0, Math.PI * 2, 0, Math.PI * 0.58),
+        hairMat,
+      );
+      hairCap.scale.set(0.96, 1.06, 1.02);
+      hairCap.position.set(0, 0.16, -0.01);
+      hairCap.rotation.x = -0.3;
+      hairCap.castShadow = true;
+      head.add(hairCap);
+    }
+
     upperBody.add(head);
 
-    const pedRefs: PedestrianRigRefs = { legL, legR, armL, armR, upperBody };
+    const pedRefs: PedestrianRigRefs = {
+      legL: leftLeg.hip,
+      legR: rightLeg.hip,
+      kneeL: leftLeg.knee,
+      kneeR: rightLeg.knee,
+      armL: leftArm.shoulder,
+      armR: rightArm.shoulder,
+      elbowL: leftArm.elbow,
+      elbowR: rightArm.elbow,
+      upperBody,
+      head,
+      heightScale,
+    };
     group.userData.pedestrianRefs = pedRefs;
   } else if (kind === 'bollard') {
     const ironMat = getSharedStdMat('bollard:iron', { color: 0x334155, metalness: 0.72, roughness: 0.36 });
@@ -2333,6 +2473,416 @@ export function createStreetTargetGroup(
     mechBox.position.y = 21.45;
     mechBox.castShadow = true;
     bodyGroup.add(mechBox);
+  } else if (kind === 'building-rowhouse') {
+    // 3-bay brick/brownstone rowhouse terrace (9.4m W x 4.6m D x 8.2m H)
+    const bodyGroup = new THREE.Group();
+    bodyGroup.name = 'buildingBody';
+    group.userData.buildingBody = bodyGroup;
+    group.add(bodyGroup);
+
+    let hIdx = 0;
+    for (let i = 0; i < id.length; i++) hIdx = (hIdx * 31 + id.charCodeAt(i)) >>> 0;
+    const bayPalettes = [0x7c3f34, 0x855a44, 0x5c473e, 0x6c4c48, 0x475569];
+    const stoneMat = getSharedStdMat('brh:stone', { color: 0x3b3836, roughness: 0.88, metalness: 0.06 });
+    const trimMat = getSharedStdMat('brh:trim', { color: 0x9ca3af, roughness: 0.72, metalness: 0.08 });
+    const roofMat = getSharedStdMat('brh:roof', { color: 0x1e2430, roughness: 0.68, metalness: 0.2 });
+    const glassMat = getSharedStdMat('brh:glass', {
+      color: 0x17253b,
+      emissive: 0xfbbf24,
+      emissiveIntensity: 0.16,
+      roughness: 0.15,
+      metalness: 0.75,
+    });
+
+    const bayXs = [-3.1, 0, 3.1];
+    const bayHeights = [6.6, 7.1, 6.4];
+    for (let b = 0; b < 3; b++) {
+      const bx = bayXs[b];
+      const bh = bayHeights[b];
+      const cHex = bayPalettes[(hIdx + b) % bayPalettes.length];
+      const wallMat = getSharedStdMat(`brh:wall:${cHex}`, { color: cHex, roughness: 0.84, metalness: 0.04 });
+
+      const plinth = new THREE.Mesh(getSharedBoxGeo(3.06, 0.75, 4.55), stoneMat);
+      plinth.position.set(bx, 0.375, 0);
+      plinth.castShadow = true;
+      plinth.receiveShadow = true;
+      bodyGroup.add(plinth);
+
+      const bayBody = new THREE.Mesh(getSharedBoxGeo(3.0, bh - 0.75, 4.36), wallMat);
+      bayBody.position.set(bx, 0.75 + (bh - 0.75) * 0.5, 0);
+      bayBody.castShadow = true;
+      bayBody.receiveShadow = true;
+      bodyGroup.add(bayBody);
+
+      // Front stoop & doorway
+      const stoop = new THREE.Mesh(getSharedBoxGeo(1.15, 0.55, 0.8), stoneMat);
+      stoop.position.set(bx - 0.65, 0.275, 2.45);
+      stoop.castShadow = true;
+      bodyGroup.add(stoop);
+
+      const cornice = new THREE.Mesh(getSharedBoxGeo(3.14, 0.28, 4.55), trimMat);
+      cornice.position.set(bx, bh + 0.12, 0.04);
+      cornice.castShadow = true;
+      bodyGroup.add(cornice);
+
+      // Pitched slate mansard/gable crown
+      const roofSlope = new THREE.Mesh(getSharedBoxGeo(2.96, 1.05, 4.18), roofMat);
+      roofSlope.position.set(bx, bh + 0.72, -0.05);
+      roofSlope.castShadow = true;
+      bodyGroup.add(roofSlope);
+
+      // Windows on 2 upper tiers + ground parlor
+      for (const wy of [1.85, 3.85, 5.65]) {
+        if (wy > bh - 0.4) continue;
+        for (const wxOff of [-0.68, 0.68]) {
+          const wF = new THREE.Mesh(getSharedBoxGeo(0.68, 1.12, 0.08), glassMat);
+          wF.position.set(bx + wxOff, wy, 2.19);
+          bodyGroup.add(wF);
+          const wB = new THREE.Mesh(getSharedBoxGeo(0.68, 1.12, 0.08), glassMat);
+          wB.position.set(bx + wxOff, wy, -2.19);
+          bodyGroup.add(wB);
+        }
+      }
+    }
+  } else if (kind === 'building-commercial') {
+    // Wide modern retail plaza strip (10.6m W x 4.8m D x 4.8m H)
+    const bodyGroup = new THREE.Group();
+    bodyGroup.name = 'buildingBody';
+    group.userData.buildingBody = bodyGroup;
+    group.add(bodyGroup);
+
+    const wallMat = getSharedStdMat('bcm:wall', { color: 0x3b4454, roughness: 0.74, metalness: 0.14 });
+    const woodMat = getSharedStdMat('bcm:wood', { color: 0x7c5338, roughness: 0.76, metalness: 0.04 });
+    const steelMat = getSharedStdMat('bcm:steel', { color: 0x1e293b, roughness: 0.42, metalness: 0.65 });
+    const glassMat = getSharedStdMat('bcm:glass', {
+      color: 0x162940,
+      emissive: 0xfde68a,
+      emissiveIntensity: 0.24,
+      roughness: 0.1,
+      metalness: 0.82,
+    });
+
+    const slab = new THREE.Mesh(getSharedBoxGeo(10.6, 0.3, 4.8), steelMat);
+    slab.position.y = 0.15;
+    slab.castShadow = true;
+    slab.receiveShadow = true;
+    bodyGroup.add(slab);
+
+    const core = new THREE.Mesh(getSharedBoxGeo(10.2, 3.9, 4.3), wallMat);
+    core.position.set(0, 2.25, -0.1);
+    core.castShadow = true;
+    core.receiveShadow = true;
+    bodyGroup.add(core);
+
+    // 3 wide retail storefront bays + timber piers
+    for (const sx of [-3.3, 0, 3.3]) {
+      const bayGlass = new THREE.Mesh(getSharedBoxGeo(2.65, 2.55, 0.1), glassMat);
+      bayGlass.position.set(sx, 1.65, 2.06);
+      bodyGroup.add(bayGlass);
+
+      const signPanel = new THREE.Mesh(getSharedBoxGeo(2.5, 0.42, 0.12), woodMat);
+      signPanel.position.set(sx, 3.45, 2.1);
+      bodyGroup.add(signPanel);
+    }
+
+    // Overhanging cantilevered canopy
+    const canopy = new THREE.Mesh(getSharedBoxGeo(10.6, 0.22, 1.35), woodMat);
+    canopy.position.set(0, 3.12, 2.45);
+    canopy.castShadow = true;
+    bodyGroup.add(canopy);
+
+    const fascia = new THREE.Mesh(getSharedBoxGeo(10.68, 0.42, 4.56), steelMat);
+    fascia.position.set(0, 4.35, -0.05);
+    fascia.castShadow = true;
+    bodyGroup.add(fascia);
+
+    const hvac = new THREE.Mesh(getSharedBoxGeo(2.8, 0.55, 1.8), steelMat);
+    hvac.position.set(-2.2, 4.78, -0.4);
+    hvac.castShadow = true;
+    bodyGroup.add(hvac);
+  } else if (kind === 'building-warehouse') {
+    // Industrial brick & steel hall with sawtooth skylight bays (10.2m W x 6.4m D x 7.4m H)
+    const bodyGroup = new THREE.Group();
+    bodyGroup.name = 'buildingBody';
+    group.userData.buildingBody = bodyGroup;
+    group.add(bodyGroup);
+
+    const brickMat = getSharedStdMat('bwh:brick', { color: 0x6b3a32, roughness: 0.88, metalness: 0.04 });
+    const steelMat = getSharedStdMat('bwh:steel', { color: 0x263242, roughness: 0.52, metalness: 0.55 });
+    const doorMat = getSharedStdMat('bwh:door', { color: 0x475569, roughness: 0.58, metalness: 0.48 });
+    const skyGlassMat = getSharedStdMat('bwh:glass', {
+      color: 0x1e293b,
+      emissive: 0xfef3c7,
+      emissiveIntensity: 0.18,
+      roughness: 0.16,
+      metalness: 0.72,
+    });
+
+    const base = new THREE.Mesh(getSharedBoxGeo(10.3, 0.55, 6.4), steelMat);
+    base.position.y = 0.275;
+    base.castShadow = true;
+    base.receiveShadow = true;
+    bodyGroup.add(base);
+
+    const hall = new THREE.Mesh(getSharedBoxGeo(10.0, 5.2, 6.0), brickMat);
+    hall.position.y = 3.15;
+    hall.castShadow = true;
+    hall.receiveShadow = true;
+    bodyGroup.add(hall);
+
+    // Exterior steel pilasters
+    for (const px of [-4.6, -1.55, 1.55, 4.6]) {
+      const pilaster = new THREE.Mesh(getSharedBoxGeo(0.32, 5.3, 6.22), steelMat);
+      pilaster.position.set(px, 3.18, 0);
+      pilaster.castShadow = true;
+      bodyGroup.add(pilaster);
+    }
+
+    // Loading dock bays on front
+    for (const dx of [-3.1, 0]) {
+      const dock = new THREE.Mesh(getSharedBoxGeo(2.3, 2.8, 0.14), doorMat);
+      dock.position.set(dx, 1.95, 3.02);
+      bodyGroup.add(dock);
+    }
+
+    // Upper clerestory industrial windows
+    for (const wx of [-3.1, 0, 3.1]) {
+      const cWin = new THREE.Mesh(getSharedBoxGeo(2.3, 1.05, 0.1), skyGlassMat);
+      cWin.position.set(wx, 4.55, 3.02);
+      bodyGroup.add(cWin);
+      const cWinB = new THREE.Mesh(getSharedBoxGeo(2.3, 1.05, 0.1), skyGlassMat);
+      cWinB.position.set(wx, 4.55, -3.02);
+      bodyGroup.add(cWinB);
+    }
+
+    // 3-bay sawtooth industrial roof ridges
+    for (const sx of [-3.2, 0, 3.2]) {
+      const ridge = new THREE.Mesh(getSharedBoxGeo(2.9, 1.55, 5.8), steelMat);
+      ridge.position.set(sx, 6.45, 0);
+      ridge.rotation.z = 0.22;
+      ridge.castShadow = true;
+      bodyGroup.add(ridge);
+
+      const skylight = new THREE.Mesh(getSharedBoxGeo(0.14, 1.1, 5.4), skyGlassMat);
+      skylight.position.set(sx + 1.38, 6.45, 0);
+      bodyGroup.add(skylight);
+    }
+  } else if (kind === 'building-civic') {
+    // Neoclassical limestone civic hall with colonnade & cupola (10.4m W x 6.8m D x 10.4m H)
+    const bodyGroup = new THREE.Group();
+    bodyGroup.name = 'buildingBody';
+    group.userData.buildingBody = bodyGroup;
+    group.add(bodyGroup);
+
+    const stoneMat = getSharedStdMat('bcv:stone', { color: 0x8f887d, roughness: 0.8, metalness: 0.06 });
+    const darkStoneMat = getSharedStdMat('bcv:dark', { color: 0x474540, roughness: 0.85, metalness: 0.08 });
+    const roofMat = getSharedStdMat('bcv:roof', { color: 0x283546, roughness: 0.55, metalness: 0.35 });
+    const glassMat = getSharedStdMat('bcv:glass', {
+      color: 0x162436,
+      emissive: 0xfde68a,
+      emissiveIntensity: 0.2,
+      roughness: 0.14,
+      metalness: 0.78,
+    });
+
+    // Grand entrance steps / podium
+    const step1 = new THREE.Mesh(getSharedBoxGeo(10.4, 0.42, 6.8), darkStoneMat);
+    step1.position.y = 0.21;
+    step1.castShadow = true;
+    step1.receiveShadow = true;
+    bodyGroup.add(step1);
+
+    const step2 = new THREE.Mesh(getSharedBoxGeo(9.8, 0.42, 6.1), stoneMat);
+    step2.position.y = 0.63;
+    step2.castShadow = true;
+    step2.receiveShadow = true;
+    bodyGroup.add(step2);
+
+    // Main civic mass
+    const hall = new THREE.Mesh(getSharedBoxGeo(9.4, 6.6, 4.9), stoneMat);
+    hall.position.set(0, 4.14, -0.35);
+    hall.castShadow = true;
+    hall.receiveShadow = true;
+    bodyGroup.add(hall);
+
+    // Front classical colonnade pillars
+    const colGeo = getSharedCylinderGeo(0.24, 0.28, 6.3, 12);
+    for (const cx of [-3.9, -2.35, -0.8, 0.8, 2.35, 3.9]) {
+      const col = new THREE.Mesh(colGeo, stoneMat);
+      col.position.set(cx, 3.99, 2.52);
+      col.castShadow = true;
+      col.receiveShadow = true;
+      bodyGroup.add(col);
+    }
+
+    // Tall recessed civic windows
+    for (const wx of [-3.1, -1.55, 0, 1.55, 3.1]) {
+      const winF = new THREE.Mesh(getSharedBoxGeo(0.85, 3.6, 0.12), glassMat);
+      winF.position.set(wx, 4.2, 2.12);
+      bodyGroup.add(winF);
+      const winB = new THREE.Mesh(getSharedBoxGeo(0.85, 3.6, 0.12), glassMat);
+      winB.position.set(wx, 4.2, -2.82);
+      bodyGroup.add(winB);
+    }
+
+    // Entablature & stepped pediment roof
+    const entablature = new THREE.Mesh(getSharedBoxGeo(10.0, 0.72, 6.0), stoneMat);
+    entablature.position.set(0, 7.6, -0.05);
+    entablature.castShadow = true;
+    bodyGroup.add(entablature);
+
+    const roofTier = new THREE.Mesh(getSharedBoxGeo(8.8, 0.85, 4.8), roofMat);
+    roofTier.position.set(0, 8.38, -0.15);
+    roofTier.castShadow = true;
+    bodyGroup.add(roofTier);
+
+    const cupolaBase = new THREE.Mesh(getSharedCylinderGeo(1.15, 1.28, 1.15, 16), stoneMat);
+    cupolaBase.position.set(0, 9.35, -0.2);
+    cupolaBase.castShadow = true;
+    bodyGroup.add(cupolaBase);
+
+    const cupolaDome = new THREE.Mesh(
+      sharedGeo('civicDome', () => new THREE.SphereGeometry(1.12, 16, 10, 0, Math.PI * 2, 0, Math.PI * 0.55)),
+      roofMat,
+    );
+    cupolaDome.position.set(0, 9.88, -0.2);
+    cupolaDome.castShadow = true;
+    bodyGroup.add(cupolaDome);
+  } else if (kind === 'building-apartments') {
+    // Stepped L-wing mid-rise apartment complex with balconies (9.0m W x 7.0m D x 15.2m H)
+    const bodyGroup = new THREE.Group();
+    bodyGroup.name = 'buildingBody';
+    group.userData.buildingBody = bodyGroup;
+    group.add(bodyGroup);
+
+    const podiumMat = getSharedStdMat('bap:podium', { color: 0x262e3d, roughness: 0.78, metalness: 0.16 });
+    const facadeMat = getSharedStdMat('bap:facade', { color: 0x6a6e75, roughness: 0.76, metalness: 0.08 });
+    const wingMat = getSharedStdMat('bap:wing', { color: 0x4b5563, roughness: 0.74, metalness: 0.12 });
+    const balcMat = getSharedStdMat('bap:balc', { color: 0x1e293b, roughness: 0.55, metalness: 0.4 });
+    const glassMat = getSharedStdMat('bap:glass', {
+      color: 0x111c2d,
+      emissive: 0xfef08a,
+      emissiveIntensity: 0.15,
+      roughness: 0.12,
+      metalness: 0.85,
+    });
+
+    // Ground commercial podium
+    const podium = new THREE.Mesh(getSharedBoxGeo(9.0, 2.5, 6.8), podiumMat);
+    podium.position.y = 1.25;
+    podium.castShadow = true;
+    podium.receiveShadow = true;
+    bodyGroup.add(podium);
+
+    // Tall main L-spine wing (15.2m)
+    const mainWing = new THREE.Mesh(getSharedBoxGeo(8.6, 11.8, 3.6), facadeMat);
+    mainWing.position.set(0, 8.4, -1.4);
+    mainWing.castShadow = true;
+    mainWing.receiveShadow = true;
+    bodyGroup.add(mainWing);
+
+    // Lower forward projecting wing (10.6m)
+    const sideWing = new THREE.Mesh(getSharedBoxGeo(4.0, 8.2, 3.4), wingMat);
+    sideWing.position.set(-2.3, 6.6, 1.5);
+    sideWing.castShadow = true;
+    sideWing.receiveShadow = true;
+    bodyGroup.add(sideWing);
+
+    // Projecting balcony slabs + window bands
+    for (let fl = 0; fl < 4; fl++) {
+      const fy = 4.2 + fl * 2.55;
+      const winBand = new THREE.Mesh(getSharedBoxGeo(8.72, 1.15, 3.72), glassMat);
+      winBand.position.set(0, fy, -1.4);
+      bodyGroup.add(winBand);
+
+      const balc = new THREE.Mesh(getSharedBoxGeo(3.8, 0.2, 0.9), balcMat);
+      balc.position.set(2.1, fy - 0.58, 0.8);
+      balc.castShadow = true;
+      bodyGroup.add(balc);
+
+      if (fl < 3) {
+        const wingGlass = new THREE.Mesh(getSharedBoxGeo(4.12, 1.1, 3.52), glassMat);
+        wingGlass.position.set(-2.3, fy, 1.5);
+        bodyGroup.add(wingGlass);
+      }
+    }
+
+    // Rooftop crown & penthouse pergola
+    const crown = new THREE.Mesh(getSharedBoxGeo(8.8, 0.35, 3.8), balcMat);
+    crown.position.set(0, 14.48, -1.4);
+    crown.castShadow = true;
+    bodyGroup.add(crown);
+
+    const penthouse = new THREE.Mesh(getSharedBoxGeo(3.6, 0.9, 2.2), podiumMat);
+    penthouse.position.set(-1.5, 14.95, -1.4);
+    penthouse.castShadow = true;
+    bodyGroup.add(penthouse);
+  } else if (kind === 'building-skyscraper') {
+    // Tall setback Art-Deco glass skyscraper with podium & spire (7.8m W x 6.2m D x 30.0m H)
+    const bodyGroup = new THREE.Group();
+    bodyGroup.name = 'buildingBody';
+    group.userData.buildingBody = bodyGroup;
+    group.add(bodyGroup);
+
+    const podiumMat = getSharedStdMat('bsk:podium', { color: 0x1b2230, roughness: 0.68, metalness: 0.25 });
+    const stoneMat = getSharedStdMat('bsk:stone', { color: 0x3b485e, roughness: 0.64, metalness: 0.22 });
+    const glassMat = getSharedStdMat('bsk:glass', {
+      color: 0x0d1b2e,
+      emissive: 0xfde68a,
+      emissiveIntensity: 0.14,
+      roughness: 0.08,
+      metalness: 0.92,
+    });
+    const spireMat = getSharedStdMat('bsk:spire', {
+      color: 0x94a3b8,
+      emissive: 0x38bdf8,
+      emissiveIntensity: 0.22,
+      roughness: 0.3,
+      metalness: 0.85,
+    });
+
+    const podium = new THREE.Mesh(getSharedBoxGeo(7.8, 4.2, 6.2), podiumMat);
+    podium.position.y = 2.1;
+    podium.castShadow = true;
+    podium.receiveShadow = true;
+    bodyGroup.add(podium);
+
+    // Lower tower shaft
+    const shaft1 = new THREE.Mesh(getSharedBoxGeo(6.8, 13.5, 5.4), glassMat);
+    shaft1.position.y = 10.95;
+    shaft1.castShadow = true;
+    shaft1.receiveShadow = true;
+    bodyGroup.add(shaft1);
+
+    // Vertical stone piers along shaft1
+    for (const px of [-3.25, -1.1, 1.1, 3.25]) {
+      const pier = new THREE.Mesh(getSharedBoxGeo(0.42, 13.8, 5.65), stoneMat);
+      pier.position.set(px, 11.0, 0);
+      pier.castShadow = true;
+      bodyGroup.add(pier);
+    }
+
+    // Mid setback tier
+    const shaft2 = new THREE.Mesh(getSharedBoxGeo(5.2, 6.6, 4.2), stoneMat);
+    shaft2.position.y = 21.0;
+    shaft2.castShadow = true;
+    shaft2.receiveShadow = true;
+    bodyGroup.add(shaft2);
+
+    const band2 = new THREE.Mesh(getSharedBoxGeo(5.35, 4.8, 4.35), glassMat);
+    band2.position.y = 21.0;
+    bodyGroup.add(band2);
+
+    // Upper crown & lantern spire (reaching 30.0m)
+    const crown = new THREE.Mesh(getSharedBoxGeo(3.4, 2.8, 3.0), podiumMat);
+    crown.position.y = 25.7;
+    crown.castShadow = true;
+    bodyGroup.add(crown);
+
+    const spire = new THREE.Mesh(getSharedCylinderGeo(0.06, 0.28, 3.0, 10), spireMat);
+    spire.position.y = 28.5;
+    spire.castShadow = true;
+    bodyGroup.add(spire);
   } else if (kind === 'tree') {
     const trunkMat = getSharedStdMat('tree:trunk', { color: 0x45352b, roughness: 0.92, metalness: 0.0 });
     const leafMat1 = getSharedStdMat('tree:leaf1', { color: 0x224131, roughness: 0.85, metalness: 0.0 });
@@ -3031,6 +3581,18 @@ export function createBuilderGhostGroup(tool: Exclude<BuilderTool, null>): THREE
     addBox(5.1, 11.6, 5.1);
   } else if (tool === 'building-highrise') {
     addBox(5.6, 22.0, 5.6);
+  } else if (tool === 'building-rowhouse') {
+    addBox(9.4, 8.2, 4.6);
+  } else if (tool === 'building-commercial') {
+    addBox(10.6, 4.8, 4.8);
+  } else if (tool === 'building-warehouse') {
+    addBox(10.2, 7.4, 6.4);
+  } else if (tool === 'building-civic') {
+    addBox(10.4, 10.4, 6.8);
+  } else if (tool === 'building-apartments') {
+    addBox(9.0, 15.2, 7.0);
+  } else if (tool === 'building-skyscraper') {
+    addBox(7.8, 30.0, 6.2);
   } else if (tool === 'bike') {
     addBox(1.8, 1.05, 0.55);
   } else if (tool === 'motorcycle') {
@@ -3166,28 +3728,40 @@ export function createBuilderGhostGroup(tool: Exclude<BuilderTool, null>): THREE
                   ? 4.8
                   : tool === 'road-crosswalk'
                     ? 4.6
-                    : tool === 'building-highrise'
-                      ? 4.05
-                      : tool === 'truck'
-                        ? 3.7
-                        : tool === 'building-tall'
-                          ? 3.65
-                          : tool === 'path-cobble'
-                            ? 3.6
-                            : tool === 'path-sidewalk'
-                              ? 3.2
-                              : tool === 'building-small'
-                                ? 3.15
-                                : tool === 'path-bike'
-                                  ? 3.0
-                                  : tool === 'path-gravel'
-                                    ? 2.9
-                                    : tool === 'van'
-                                      ? 2.85
-                                      : tool === 'building-kiosk'
-                                        ? 2.65
-                                        : tool === 'sedan'
-                                          ? 2.35
+                    : tool === 'building-civic'
+                      ? 6.4
+                      : tool === 'building-warehouse'
+                        ? 6.2
+                        : tool === 'building-apartments'
+                          ? 6.0
+                          : tool === 'building-commercial'
+                            ? 5.8
+                            : tool === 'building-rowhouse'
+                              ? 5.4
+                              : tool === 'building-skyscraper'
+                                ? 5.2
+                                : tool === 'building-highrise'
+                                  ? 4.05
+                                  : tool === 'truck'
+                                    ? 3.7
+                                    : tool === 'building-tall'
+                                      ? 3.65
+                                      : tool === 'path-cobble'
+                                        ? 3.6
+                                        : tool === 'path-sidewalk'
+                                          ? 3.2
+                                          : tool === 'building-small'
+                                            ? 3.15
+                                            : tool === 'path-bike'
+                                              ? 3.0
+                                              : tool === 'path-gravel'
+                                                ? 2.9
+                                                : tool === 'van'
+                                                  ? 2.85
+                                                  : tool === 'building-kiosk'
+                                                    ? 2.65
+                                                    : tool === 'sedan'
+                                                      ? 2.35
                                           : tool === 'hedge'
                                             ? 1.45
                                             : tool === 'tree'

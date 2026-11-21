@@ -38,6 +38,12 @@ export type TargetKind =
   | 'building-small'
   | 'building-tall'
   | 'building-highrise'
+  | 'building-rowhouse'
+  | 'building-commercial'
+  | 'building-warehouse'
+  | 'building-civic'
+  | 'building-apartments'
+  | 'building-skyscraper'
   | 'tree'
   | 'hedge'
   | 'bench'
@@ -57,11 +63,36 @@ export type TargetKind =
 
 export type BuilderTool = TargetKind | 'light' | null;
 
+export interface BuildingDimensions {
+  width: number;
+  length: number;
+  height: number;
+}
+
+export const BUILDING_DEFAULT_DIMENSIONS: Partial<Record<TargetKind, BuildingDimensions>> = {
+  'building-kiosk': { width: 3.8, length: 3.8, height: 3.8 },
+  'building-small': { width: 4.4, length: 4.4, height: 6.3 },
+  'building-tall': { width: 5.2, length: 5.2, height: 11.6 },
+  'building-highrise': { width: 5.6, length: 5.6, height: 22.0 },
+  'building-rowhouse': { width: 9.4, length: 4.6, height: 8.2 },
+  'building-commercial': { width: 10.6, length: 4.8, height: 4.8 },
+  'building-warehouse': { width: 10.2, length: 6.4, height: 7.4 },
+  'building-civic': { width: 10.4, length: 6.8, height: 10.4 },
+  'building-apartments': { width: 9.0, length: 7.0, height: 15.2 },
+  'building-skyscraper': { width: 7.8, length: 6.2, height: 30.0 },
+};
+
 export const BUILDING_DEFAULT_HEIGHTS: Partial<Record<TargetKind, number>> = {
   'building-kiosk': 3.8,
   'building-small': 6.3,
   'building-tall': 11.6,
   'building-highrise': 22.0,
+  'building-rowhouse': 8.2,
+  'building-commercial': 4.8,
+  'building-warehouse': 7.4,
+  'building-civic': 10.4,
+  'building-apartments': 15.2,
+  'building-skyscraper': 30.0,
 };
 
 export function isBuildingKind(kind: TargetKind): boolean {
@@ -117,8 +148,9 @@ export interface StreetTarget {
   label: string;
   position: { x: number; z: number };
   rotationY: number; // Radians
-  height?: number; // Custom height in meters for building targets
-  length?: number; // Custom segment length in meters for modular straight roads
+  width?: number; // Custom width (X) in meters for building targets
+  height?: number; // Custom height (Y) in meters for building targets
+  length?: number; // Custom depth (Z) for buildings or segment length (X) for modular roads
   hiddenSidewalks?: string[]; // Removed attached sidewalk part keys for road targets
   motion?: 'walk' | 'drive';
   routeId?: StreetRouteId;
@@ -135,7 +167,26 @@ export interface SelectedSidewalkInfo {
 
 export type CameraPresetId = 'perspective' | 'top' | 'side' | 'closeup';
 export type CameraControlMode = 'orbit' | 'pan';
-export type AmbientMode = 'night' | 'twilight';
+export type AmbientMode =
+  | 'dawn'
+  | 'morning'
+  | 'noon'
+  | 'sunset'
+  | 'twilight'
+  | 'night';
+
+export const TIME_OF_DAY_OPTIONS: ReadonlyArray<{
+  id: AmbientMode;
+  label: string;
+  timeLabel: string;
+}> = [
+  { id: 'dawn', label: 'Dawn', timeLabel: '06:00' },
+  { id: 'morning', label: 'Morning', timeLabel: '09:30' },
+  { id: 'noon', label: 'Midday', timeLabel: '13:00' },
+  { id: 'sunset', label: 'Sunset', timeLabel: '18:30' },
+  { id: 'twilight', label: 'Twilight', timeLabel: '20:00' },
+  { id: 'night', label: 'Night', timeLabel: '23:00' },
+];
 
 export interface ViewportSettings {
   showBeamEnvelope: boolean;

@@ -622,37 +622,41 @@ const CORRIDOR_SCENERY_TARGETS: StreetTarget[] = [
   { id: 'env-road-4e-s2', kind: 'road-2lane', label: '4th Ave E South 2', position: { x: 47.5, z: 33.5 }, rotationY: Math.PI / 2 },
   { id: 'env-road-4e-s3', kind: 'road-2lane', label: '4th Ave E South Exit', position: { x: 47.5, z: 41.5 }, rotationY: Math.PI / 2 },
 
-  // 5. Organized City Block Architecture (aligned cleanly inside parcel footprints clear of sidewalks)
-  // North-Side Midtown Blocks
-  { id: 'env-bldg-fw-n', kind: 'building-small', label: '1st Ave NW Storefront', position: { x: -58.0, z: -14.5 }, rotationY: 0, height: 6.3 },
-  { id: 'env-bldg-0', kind: 'building-tall', label: 'Midtown West Residences', position: { x: -35.0, z: -14.5 }, rotationY: 0, height: 11.6 },
-  { id: 'env-bldg-1', kind: 'building-tall', label: 'Civic Plaza West Tower', position: { x: -12.5, z: -13.8 }, rotationY: 0, height: 11.6 },
-  { id: 'env-bldg-4', kind: 'building-highrise', label: 'Civic Plaza High-Rise', position: { x: 12.5, z: -13.8 }, rotationY: 0, height: 22.0 },
-  { id: 'env-bldg-5', kind: 'building-tall', label: 'Midtown East Offices', position: { x: 35.0, z: -14.5 }, rotationY: 0, height: 11.6 },
-  { id: 'env-bldg-fe-n', kind: 'building-highrise', label: '4th Ave Financial Tower', position: { x: 58.0, z: -14.5 }, rotationY: 0, height: 22.0 },
+  // 5. Organized City Block Architecture (varied widths, lengths, heights & architectural styles clear of sidewalks)
+  // North-Side Midtown Blocks (z: -18.0 .. -7.0)
+  { id: 'env-bldg-fw-n', kind: 'building-rowhouse', label: '1st Ave Brownstones', position: { x: -59.0, z: -12.6 }, rotationY: Math.PI / 2, width: 9.0, length: 4.8, height: 8.4 },
+  { id: 'env-bldg-0', kind: 'building-apartments', label: 'Midtown West Courtyard', position: { x: -35.0, z: -12.8 }, rotationY: 0, width: 9.8, length: 6.8, height: 15.8 },
+  { id: 'env-bldg-1', kind: 'building-apartments', label: 'Civic Plaza West Lofts', position: { x: -12.2, z: -13.2 }, rotationY: 0, width: 6.8, length: 5.8, height: 14.5 },
+  { id: 'env-bldg-civic-n', kind: 'building-civic', label: 'Civic Center Library', position: { x: 0.0, z: -10.2 }, rotationY: 0, width: 9.6, length: 4.5, height: 9.8 },
+  { id: 'env-bldg-4', kind: 'building-skyscraper', label: 'Civic Plaza Landmark Tower', position: { x: 12.0, z: -13.0 }, rotationY: 0, width: 7.2, length: 6.0, height: 31.0 },
+  { id: 'env-bldg-5', kind: 'building-skyscraper', label: 'Midtown East Exchange', position: { x: 35.0, z: -13.0 }, rotationY: 0, width: 7.8, length: 6.2, height: 26.0 },
+  { id: 'env-bldg-fe-n', kind: 'building-highrise', label: '4th Ave Financial Tower', position: { x: 59.0, z: -12.8 }, rotationY: -Math.PI / 2, width: 7.4, length: 5.8, height: 23.5 },
 
-  // North Outer Edge Blocks
-  { id: 'env-bldg-nw', kind: 'building-small', label: 'North-West Annex', position: { x: -58.0, z: -35.5 }, rotationY: Math.PI, height: 6.3 },
-  { id: 'env-bldg-wn', kind: 'building-tall', label: 'North Blvd West Lofts', position: { x: -35.0, z: -36.0 }, rotationY: Math.PI, height: 11.6 },
-  { id: 'env-bldg-6', kind: 'building-small', label: 'Roundabout North-W Shop', position: { x: -12.5, z: -36.0 }, rotationY: Math.PI, height: 6.3 },
-  { id: 'env-bldg-7', kind: 'building-tall', label: 'Roundabout North-E Plaza', position: { x: 12.5, z: -36.0 }, rotationY: Math.PI, height: 11.6 },
-  { id: 'env-bldg-en', kind: 'building-small', label: 'North Blvd East Lofts', position: { x: 35.0, z: -35.5 }, rotationY: Math.PI, height: 6.3 },
-  { id: 'env-bldg-ne', kind: 'building-tall', label: 'North-East Exchange', position: { x: 58.0, z: -36.0 }, rotationY: Math.PI, height: 11.6 },
+  // North Outer Edge Blocks (z: -44.0 .. -32.2)
+  { id: 'env-bldg-nw', kind: 'building-warehouse', label: 'West Depot Logistics Hall', position: { x: -59.0, z: -38.0 }, rotationY: Math.PI / 2, width: 9.8, length: 6.2, height: 7.6 },
+  { id: 'env-bldg-wn', kind: 'building-warehouse', label: 'North Blvd Freight Hall', position: { x: -35.0, z: -38.0 }, rotationY: Math.PI, width: 10.2, length: 6.4, height: 7.2 },
+  { id: 'env-bldg-6', kind: 'building-small', label: 'Roundabout North-W Shop', position: { x: -12.6, z: -39.8 }, rotationY: Math.PI, width: 5.2, length: 4.6, height: 7.0 },
+  { id: 'env-bldg-7', kind: 'building-tall', label: 'Roundabout North-E Plaza', position: { x: 12.6, z: -39.8 }, rotationY: Math.PI, width: 5.8, length: 5.0, height: 13.4 },
+  { id: 'env-bldg-en', kind: 'building-rowhouse', label: 'North Blvd East Terrace', position: { x: 35.0, z: -38.0 }, rotationY: Math.PI, width: 9.8, length: 4.8, height: 8.6 },
+  { id: 'env-bldg-ne', kind: 'building-tall', label: 'North-East Corner Tower', position: { x: 59.0, z: -38.0 }, rotationY: -Math.PI / 2, width: 6.8, length: 5.2, height: 12.8 },
 
-  // South-Side Midtown Blocks
-  { id: 'env-bldg-fw-s', kind: 'building-kiosk', label: '1st Ave Corner Pavilion', position: { x: -58.0, z: 14.5 }, rotationY: Math.PI, height: 3.8 },
-  { id: 'env-bldg-12', kind: 'building-small', label: 'West Ave South Clinic', position: { x: -35.0, z: 14.5 }, rotationY: Math.PI, height: 6.3 },
-  { id: 'env-bldg-10', kind: 'building-tall', label: 'South Block Apartments', position: { x: -11.5, z: 14.5 }, rotationY: Math.PI, height: 11.6 },
-  { id: 'env-bldg-11', kind: 'building-small', label: 'South Block Cafe', position: { x: 0.0, z: 14.5 }, rotationY: Math.PI, height: 6.3 },
-  { id: 'env-bldg-3', kind: 'building-kiosk', label: 'South Block Market', position: { x: 11.5, z: 14.5 }, rotationY: Math.PI, height: 3.8 },
-  { id: 'env-bldg-8', kind: 'building-kiosk', label: 'East Ave Pavilion', position: { x: 35.0, z: 14.5 }, rotationY: Math.PI, height: 3.8 },
-  { id: 'env-bldg-fe-s', kind: 'building-small', label: '4th Ave South Gallery', position: { x: 58.0, z: 14.5 }, rotationY: Math.PI, height: 6.3 },
+  // South-Side Midtown Blocks (z: +7.0 .. +18.0, clear behind trees at z = 8.6)
+  { id: 'env-bldg-fw-s', kind: 'building-commercial', label: '1st Ave Corner Market', position: { x: -59.0, z: 12.6 }, rotationY: -Math.PI / 2, width: 9.2, length: 4.6, height: 4.9 },
+  { id: 'env-bldg-12', kind: 'building-rowhouse', label: 'West Ave Brick Rowhouses', position: { x: -35.0, z: 14.0 }, rotationY: Math.PI, width: 10.2, length: 4.8, height: 8.4 },
+  { id: 'env-bldg-10', kind: 'building-tall', label: 'South Block Mid-Rise', position: { x: -10.8, z: 14.2 }, rotationY: Math.PI, width: 6.8, length: 5.2, height: 13.8 },
+  { id: 'env-bldg-11', kind: 'building-commercial', label: 'South Block Retail Strip', position: { x: 0.4, z: 14.2 }, rotationY: Math.PI, width: 9.6, length: 4.8, height: 4.8 },
+  { id: 'env-bldg-3', kind: 'building-kiosk', label: 'South Block Pavilion', position: { x: 11.4, z: 14.2 }, rotationY: Math.PI, width: 4.4, length: 4.0, height: 3.9 },
+  { id: 'env-bldg-8', kind: 'building-warehouse', label: 'East Ave Artisan Depot', position: { x: 35.0, z: 13.8 }, rotationY: Math.PI, width: 9.8, length: 5.8, height: 7.6 },
+  { id: 'env-bldg-fe-s', kind: 'building-rowhouse', label: '4th Ave South Rowhouses', position: { x: 59.0, z: 12.6 }, rotationY: -Math.PI / 2, width: 9.0, length: 4.6, height: 8.0 },
 
-  // South Outer Edge Blocks
-  { id: 'env-bldg-ws', kind: 'building-small', label: 'South Blvd West Depot', position: { x: -35.0, z: 35.5 }, rotationY: 0, height: 6.3 },
-  { id: 'env-bldg-9', kind: 'building-small', label: 'South District Townhouse', position: { x: -10.0, z: 35.5 }, rotationY: 0, height: 6.3 },
-  { id: 'env-bldg-cs2', kind: 'building-tall', label: 'South Promenade Hall', position: { x: 10.0, z: 35.5 }, rotationY: 0, height: 11.6 },
-  { id: 'env-bldg-es', kind: 'building-small', label: 'South Blvd East Depot', position: { x: 35.0, z: 35.5 }, rotationY: 0, height: 6.3 },
+  // South Outer Edge Blocks (z: +32.2 .. +44.0)
+  { id: 'env-bldg-sw', kind: 'building-apartments', label: 'Westgate Outer Residences', position: { x: -59.0, z: 38.0 }, rotationY: Math.PI / 2, width: 9.6, length: 6.2, height: 14.6 },
+  { id: 'env-bldg-ws', kind: 'building-commercial', label: 'South Blvd Retail Plaza', position: { x: -35.0, z: 38.0 }, rotationY: 0, width: 10.4, length: 5.0, height: 5.2 },
+  { id: 'env-bldg-9', kind: 'building-rowhouse', label: 'South District Townhomes', position: { x: -9.6, z: 38.0 }, rotationY: 0, width: 10.2, length: 4.8, height: 8.8 },
+  { id: 'env-bldg-cs2', kind: 'building-civic', label: 'South Promenade Courthouse', position: { x: 2.6, z: 38.0 }, rotationY: 0, width: 9.8, length: 6.6, height: 11.0 },
+  { id: 'env-bldg-cs3', kind: 'building-small', label: 'South Promenade Annex', position: { x: 12.4, z: 38.0 }, rotationY: 0, width: 5.0, length: 4.8, height: 6.6 },
+  { id: 'env-bldg-es', kind: 'building-apartments', label: 'South Blvd East Lofts', position: { x: 35.0, z: 38.0 }, rotationY: 0, width: 9.4, length: 6.6, height: 15.0 },
+  { id: 'env-bldg-se', kind: 'building-commercial', label: '4th Ave South Plaza', position: { x: 59.0, z: 38.0 }, rotationY: Math.PI / 2, width: 9.6, length: 4.8, height: 5.0 },
 
   // 6. Symmetrical Street Trees & Park Plazas
   { id: 'env-tree-0', kind: 'tree', label: 'South Boulevard Tree W1', position: { x: -35.0, z: 8.6 }, rotationY: 0.4 },

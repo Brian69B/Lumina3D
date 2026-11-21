@@ -9,6 +9,7 @@ import { ControlDock } from './components/ControlDock';
 import { TopTelemetryBar } from './components/TopTelemetryBar';
 import { StreetSimulatorScene } from './three/StreetSimulatorScene';
 import {
+  BUILDING_DEFAULT_DIMENSIONS,
   BUILDING_DEFAULT_HEIGHTS,
   BuilderTool,
   CameraPresetId,
@@ -50,6 +51,12 @@ const TARGET_LABELS: Record<TargetKind, string> = {
   'building-small': '2-Story Storefront',
   'building-tall': '4-Story Mid-Rise',
   'building-highrise': '8-Story Tower',
+  'building-rowhouse': 'Rowhouse Terrace',
+  'building-commercial': 'Retail Plaza Strip',
+  'building-warehouse': 'Industrial Hall',
+  'building-civic': 'Neoclassical Civic Hall',
+  'building-apartments': 'L-Court Apartments',
+  'building-skyscraper': 'Setback Skyscraper',
   tree: 'Street Tree',
   hedge: 'Hedge',
   bench: 'Park Bench',
@@ -95,6 +102,12 @@ const VALID_DROP_TOOLS: ReadonlySet<string> = new Set([
   'building-small',
   'building-tall',
   'building-highrise',
+  'building-rowhouse',
+  'building-commercial',
+  'building-warehouse',
+  'building-civic',
+  'building-apartments',
+  'building-skyscraper',
   'tree',
   'hedge',
   'bench',
@@ -308,6 +321,7 @@ export default function App() {
                 Math.floor(Math.random() * PEDESTRIAN_JACKET_PALETTE.length)
               ]
             : undefined;
+      const bDims = BUILDING_DEFAULT_DIMENSIONS[tool];
       const newTarget: StreetTarget = {
         id: `tgt-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
         kind: tool,
@@ -317,6 +331,8 @@ export default function App() {
           z: clamp(pos.z, -MAP_HALF_Z, MAP_HALF_Z),
         },
         rotationY,
+        width: bDims?.width,
+        length: bDims?.length,
         height: BUILDING_DEFAULT_HEIGHTS[tool],
         motion,
         color,
@@ -328,18 +344,24 @@ export default function App() {
     [],
   );
 
-  const handleAdjustTargetHeight = useCallback((id: string, deltaM: number) => {
-    setTargets((prev) =>
-      prev.map((t) => {
-        if (t.id !== id) return t;
-        const baseH = BUILDING_DEFAULT_HEIGHTS[t.kind];
-        if (!baseH) return t;
-        const curH = t.height ?? baseH;
-        const nextH = clamp(Math.round((curH + deltaM) * 10) / 10, 2.5, 36.0);
-        return { ...t, height: nextH };
-      }),
-    );
-  }, []);
+  const handleAdjustTargetDimension = useCallback(
+    (id: string, axis: 'width' | 'length' | 'height', deltaM: number) => {
+      setTargets((prev) =>
+        prev.map((t) => {
+          if (t.id !== id) return t;
+          const bDims = BUILDING_DEFAULT_DIMENSIONS[t.kind];
+          if (!bDims) return t;
+          const baseVal = bDims[axis];
+          const curVal = t[axis] ?? baseVal;
+          const minV = axis === 'height' ? 2.5 : Math.max(2.4, baseVal * 0.5);
+          const maxV = axis === 'height' ? 42.0 : Math.min(20.0, baseVal * 2.2);
+          const nextVal = clamp(Math.round((curVal + deltaM) * 10) / 10, minV, maxV);
+          return { ...t, [axis]: nextVal };
+        }),
+      );
+    },
+    [],
+  );
 
   const handleRotateTarget = useCallback((id: string, deltaRad = Math.PI / 4) => {
     setTargets((prev) =>
@@ -730,6 +752,8 @@ export default function App() {
                       : Math.round((Math.random() * 4 - 2) * 2) / 2,
       },
       rotationY: isWestbound ? Math.PI : 0,
+      width: BUILDING_DEFAULT_DIMENSIONS[kind]?.width,
+      length: BUILDING_DEFAULT_DIMENSIONS[kind]?.length,
       height: BUILDING_DEFAULT_HEIGHTS[kind],
       motion,
       color,
@@ -897,29 +921,79 @@ export default function App() {
                   : `(${canvasSelectedFixture!.position.x.toFixed(1)}, ${canvasSelectedFixture!.position.z.toFixed(1)}) · Pole ${canvasSelectedFixture!.poleYawAngle ?? canvasSelectedFixture!.yawAngle}° · Aim ${canvasSelectedFixture!.yawAngle}°`}
             </span>
 
-            {selectedTarget && isBuildingKind(selectedTarget.kind) && (
-              <div className="flex items-center gap-1 border-l border-slate-800 pl-2">
-                <span className="font-mono-tabular text-[11px] text-cyan-300 whitespace-nowrap">
-                  H {(selectedTarget.height ?? BUILDING_DEFAULT_HEIGHTS[selectedTarget.kind] ?? 6).toFixed(1)}m
-                </span>
-                <button
-                  type="button"
-                  onClick={() => handleAdjustTargetHeight(selectedTarget.id, -2)}
-                  className="rounded border border-slate-700 bg-slate-900 px-1.5 py-1 text-[11px] font-medium text-slate-200 hover:border-cyan-500/60 hover:text-white whitespace-nowrap shrink-0"
-                  title="Decrease building height by 2m"
-                >
-                  -2m
-                </button>
-                <button
-                  type="button"
-                  onClick={() => handleAdjustTargetHeight(selectedTarget.id, 2)}
-                  className="rounded border border-slate-700 bg-slate-900 px-1.5 py-1 text-[11px] font-medium text-slate-200 hover:border-cyan-500/60 hover:text-white whitespace-nowrap shrink-0"
-                  title="Increase building height by 2m"
-                >
-                  +2m
-                </button>
-              </div>
-            )}
+            {selectedTarget && isBuildingKind(selectedTarget.kind) && (() => {
+              const bDims = BUILDING_DEFAULT_DIMENSIONS[selectedTarget.kind] ?? {
+                width: 5,
+                length: 5,
+                height: 6,
+              };
+              const curW = selectedTarget.width ?? bDims.width;
+              const curL = selectedTarget.length ?? bDims.length;
+              const curH = selectedTarget.height ?? bDims.height;
+              return (
+                <div className="flex flex-wrap items-center gap-1.5 border-l border-slate-800 pl-2">
+                  <span className="font-mono-tabular text-[11px] text-cyan-300 whitespace-nowrap">
+                    W {curW.toFixed(1)}m
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => handleAdjustTargetDimension(selectedTarget.id, 'width', -1)}
+                    className="rounded border border-slate-700 bg-slate-900 px-1.5 py-0.5 text-[10px] font-medium text-slate-200 hover:border-cyan-500/60 hover:text-white"
+                    title="Decrease width by 1m"
+                  >
+                    -1
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleAdjustTargetDimension(selectedTarget.id, 'width', 1)}
+                    className="rounded border border-slate-700 bg-slate-900 px-1.5 py-0.5 text-[10px] font-medium text-slate-200 hover:border-cyan-500/60 hover:text-white"
+                    title="Increase width by 1m"
+                  >
+                    +1
+                  </button>
+
+                  <span className="font-mono-tabular text-[11px] text-cyan-300 whitespace-nowrap ml-1">
+                    L {curL.toFixed(1)}m
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => handleAdjustTargetDimension(selectedTarget.id, 'length', -1)}
+                    className="rounded border border-slate-700 bg-slate-900 px-1.5 py-0.5 text-[10px] font-medium text-slate-200 hover:border-cyan-500/60 hover:text-white"
+                    title="Decrease length by 1m"
+                  >
+                    -1
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleAdjustTargetDimension(selectedTarget.id, 'length', 1)}
+                    className="rounded border border-slate-700 bg-slate-900 px-1.5 py-0.5 text-[10px] font-medium text-slate-200 hover:border-cyan-500/60 hover:text-white"
+                    title="Increase length by 1m"
+                  >
+                    +1
+                  </button>
+
+                  <span className="font-mono-tabular text-[11px] text-cyan-300 whitespace-nowrap ml-1">
+                    H {curH.toFixed(1)}m
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => handleAdjustTargetDimension(selectedTarget.id, 'height', -2)}
+                    className="rounded border border-slate-700 bg-slate-900 px-1.5 py-0.5 text-[10px] font-medium text-slate-200 hover:border-cyan-500/60 hover:text-white"
+                    title="Decrease height by 2m"
+                  >
+                    -2
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleAdjustTargetDimension(selectedTarget.id, 'height', 2)}
+                    className="rounded border border-slate-700 bg-slate-900 px-1.5 py-0.5 text-[10px] font-medium text-slate-200 hover:border-cyan-500/60 hover:text-white"
+                    title="Increase height by 2m"
+                  >
+                    +2
+                  </button>
+                </div>
+              );
+            })()}
 
             {selectedTarget && getRoadSidewalkPartKeys(selectedTarget.kind).length > 0 && (
               <div className="flex items-center gap-1 border-l border-slate-800 pl-2">

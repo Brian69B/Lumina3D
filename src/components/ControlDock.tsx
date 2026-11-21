@@ -21,6 +21,7 @@ import {
   LayoutGrid,
   Lightbulb,
   Milestone,
+  Moon,
   MousePointer2,
   Plus,
   RotateCw,
@@ -28,6 +29,9 @@ import {
   Sliders,
   Sprout,
   Spline,
+  Sun,
+  Sunrise,
+  Sunset,
   Trash2,
   Trees,
   Truck,
@@ -50,6 +54,7 @@ import {
   PhotometricStats,
   StreetTarget,
   TargetKind,
+  TIME_OF_DAY_OPTIONS,
   ViewportSettings,
 } from '../types/lighting';
 import { getFixtureHex, kelvinToRgb, rgbToHex, SCENE_PRESETS } from '../utils/photometrics';
@@ -221,28 +226,70 @@ const BUILDER_CATALOG: Array<{
   {
     id: 'building-kiosk',
     label: '1-Story',
-    detail: 'Pavilion · 3.8m',
+    detail: 'Pavilion · 3.8×3.8×3.8m',
     category: 'Buildings & Scenery',
     icon: Building2,
   },
   {
     id: 'building-small',
     label: '2-Story',
-    detail: 'Storefront · 6.3m',
+    detail: 'Storefront · 4.4×4.4×6.3m',
     category: 'Buildings & Scenery',
     icon: Building2,
   },
   {
     id: 'building-tall',
     label: '4-Story',
-    detail: 'Mid-Rise · 11.6m',
+    detail: 'Mid-Rise · 5.2×5.2×11.6m',
     category: 'Buildings & Scenery',
     icon: Building2,
   },
   {
     id: 'building-highrise',
     label: '8-Story',
-    detail: 'Tower · 22.0m',
+    detail: 'Tower · 5.6×5.6×22m',
+    category: 'Buildings & Scenery',
+    icon: Building2,
+  },
+  {
+    id: 'building-rowhouse',
+    label: 'Rowhouse',
+    detail: 'Brownstone · 9.4×4.6×8.2m',
+    category: 'Buildings & Scenery',
+    icon: Building2,
+  },
+  {
+    id: 'building-commercial',
+    label: 'Retail Strip',
+    detail: 'Canopy Plaza · 10.6×4.8×4.8m',
+    category: 'Buildings & Scenery',
+    icon: Building2,
+  },
+  {
+    id: 'building-warehouse',
+    label: 'Industrial Hall',
+    detail: 'Sawtooth · 10.2×6.4×7.4m',
+    category: 'Buildings & Scenery',
+    icon: Building2,
+  },
+  {
+    id: 'building-civic',
+    label: 'Civic Hall',
+    detail: 'Colonnade · 10.4×6.8×10.4m',
+    category: 'Buildings & Scenery',
+    icon: Building2,
+  },
+  {
+    id: 'building-apartments',
+    label: 'L-Apartments',
+    detail: 'Balcony · 9.0×7.0×15.2m',
+    category: 'Buildings & Scenery',
+    icon: Building2,
+  },
+  {
+    id: 'building-skyscraper',
+    label: 'Skyscraper',
+    detail: 'Setback · 7.8×6.2×30m',
     category: 'Buildings & Scenery',
     icon: Building2,
   },
@@ -1026,18 +1073,29 @@ export const ControlDock = memo(function ControlDock({
                         >
                           1m Grid
                         </button>
-                        <button
-                          type="button"
-                          onClick={() =>
-                            onUpdateSettings({
-                              ambientMode:
-                                settings.ambientMode === 'night' ? 'twilight' : 'night',
-                            })
-                          }
-                          className="rounded border border-slate-700 bg-slate-900 px-2 py-0.5 text-[11px] font-medium text-slate-200 hover:bg-slate-800 whitespace-nowrap shrink-0"
-                        >
-                          Sky: {settings.ambientMode === 'night' ? 'Night' : 'Twilight'}
-                        </button>
+                        <label className="flex items-center gap-1 rounded border border-slate-700 bg-slate-900 px-2 py-0.5 text-[11px] font-medium text-slate-300 whitespace-nowrap shrink-0">
+                          <span className="text-slate-400">Time:</span>
+                          <select
+                            aria-label="Time of day"
+                            value={settings.ambientMode}
+                            onChange={(e) =>
+                              onUpdateSettings({
+                                ambientMode: e.target.value as ViewportSettings['ambientMode'],
+                              })
+                            }
+                            className="bg-transparent text-slate-100 outline-none cursor-pointer"
+                          >
+                            {TIME_OF_DAY_OPTIONS.map((opt) => (
+                              <option
+                                key={opt.id}
+                                value={opt.id}
+                                className="bg-slate-900 text-slate-100"
+                              >
+                                {opt.label}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
                       </div>
                     </div>
                   </div>
@@ -1438,6 +1496,43 @@ export const ControlDock = memo(function ControlDock({
                           <div className="mt-1 text-[11px] leading-snug text-slate-400">
                             {preset.subtitle}
                           </div>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                <div className="flex flex-wrap items-center justify-between gap-3 border-t border-slate-800/80 pt-3">
+                  <span className="text-xs font-semibold text-slate-300">
+                    Time of Day
+                  </span>
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    {TIME_OF_DAY_OPTIONS.map((opt) => {
+                      const active = settings.ambientMode === opt.id;
+                      const Icon =
+                        opt.id === 'dawn'
+                          ? Sunrise
+                          : opt.id === 'morning' || opt.id === 'noon'
+                            ? Sun
+                            : opt.id === 'sunset'
+                              ? Sunset
+                              : Moon;
+                      return (
+                        <button
+                          key={opt.id}
+                          type="button"
+                          onClick={() => onUpdateSettings({ ambientMode: opt.id })}
+                          className={`flex items-center gap-1.5 rounded-md border px-2.5 py-1.5 text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
+                            active
+                              ? 'border-amber-500 bg-amber-500/20 text-amber-200'
+                              : 'border-slate-700 bg-slate-900 text-slate-300 hover:border-slate-600 hover:bg-slate-800'
+                          }`}
+                        >
+                          <Icon className="h-3.5 w-3.5" />
+                          <span>{opt.label}</span>
+                          <span className="font-mono-tabular text-[10px] text-slate-400">
+                            {opt.timeLabel}
+                          </span>
                         </button>
                       );
                     })}

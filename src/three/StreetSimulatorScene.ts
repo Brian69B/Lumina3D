@@ -2,6 +2,8 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 import {
+  AmbientMode,
+  BUILDING_DEFAULT_DIMENSIONS,
   BUILDING_DEFAULT_HEIGHTS,
   BuilderTool,
   CameraControlMode,
@@ -124,6 +126,12 @@ interface AnimatedActorState {
   walkGoalZ?: number;
   walkIsCrosswalk?: boolean;
   walkPauseTimer?: number;
+  walkReactionTimer?: number;
+  walkWasYielding?: boolean;
+  walkIdleTime?: number;
+  walkSeed?: number;
+  walkLookYaw?: number;
+  walkLookPitch?: number;
 }
 
 export interface SceneCallbacks {
@@ -1275,7 +1283,7 @@ export class StreetSimulatorScene {
   private prevSelectedFixtureId: string | null = null;
   private prevSelectedTargetId: string | null = null;
   private prevShowBeamEnvelope: boolean | null = null;
-  private prevAmbientMode: 'night' | 'twilight' | null = null;
+  private prevAmbientMode: AmbientMode | null = null;
   private prevShowLuxHeatmap: boolean | null = null;
   private prevLuxThreshold: number | null = null;
   private currentLuxThreshold = 2.0;
@@ -1407,12 +1415,22 @@ export class StreetSimulatorScene {
       this.requestRender();
     });
 
-    // Ambient twilight hemisphere + soft moonlight key
+    // Ambient sky hemisphere + directional sun/moon key
     this.hemiLight = new THREE.HemisphereLight(0x385178, 0x10141c, 0.42);
     this.scene.add(this.hemiLight);
 
     this.moonLight = new THREE.DirectionalLight(0x9ab8e8, 0.26);
     this.moonLight.position.set(-16, 22, 14);
+    this.moonLight.castShadow = false;
+    this.moonLight.shadow.mapSize.set(1024, 1024);
+    this.moonLight.shadow.camera.near = 1;
+    this.moonLight.shadow.camera.far = 140;
+    this.moonLight.shadow.camera.left = -48;
+    this.moonLight.shadow.camera.right = 48;
+    this.moonLight.shadow.camera.top = 48;
+    this.moonLight.shadow.camera.bottom = -48;
+    this.moonLight.shadow.bias = -0.0007;
+    this.moonLight.shadow.normalBias = 0.03;
     this.scene.add(this.moonLight);
 
     // Procedural textures & shared sidewalk materials
@@ -2940,22 +2958,122 @@ export class StreetSimulatorScene {
       settings.showBeamEnvelope !== this.prevShowBeamEnvelope;
     const targetsChanged = targets !== this.prevTargetsProp;
 
-    // 1. Ambient sky & fog mode (only update when changed)
+    // 1. Ambient sky, fog & sun/moon mode (only update when changed)
     if (this.prevAmbientMode !== settings.ambientMode) {
       this.prevAmbientMode = settings.ambientMode;
-      if (settings.ambientMode === 'twilight') {
-        (this.scene.background as THREE.Color).setHex(0x11192b);
-        (this.scene.fog as THREE.FogExp2).color.setHex(0x11192b);
-        this.hemiLight.intensity = 0.85;
-        this.moonLight.intensity = 0.55;
-        this.scene.environmentIntensity = 0.48;
-      } else {
-        (this.scene.background as THREE.Color).setHex(0x070a12);
-        (this.scene.fog as THREE.FogExp2).color.setHex(0x070a12);
-        this.hemiLight.intensity = 0.36;
-        this.moonLight.intensity = 0.22;
-        this.scene.environmentIntensity = 0.22;
-      }
+      const presetMap: Record<
+        AmbientMode,
+        {
+          skyHex: number;
+          fogDensity: number;
+          hemiSky: number;
+          hemiGround: number;
+          hemiIntensity: number;
+          keyColor: number;
+          keyIntensity: number;
+          keyPos: [number, number, number];
+          castSunShadow: boolean;
+          envIntensity: number;
+          exposure: number;
+        }
+      > = {
+        dawn: {
+          skyHex: 0x526180,
+          fogDensity: 0.0068,
+          hemiSky: 0xf4b698,
+          hemiGround: 0x222a3a,
+          hemiIntensity: 0.96,
+          keyColor: 0xffb375,
+          keyIntensity: 1.45,
+          keyPos: [-36, 12, 22],
+          castSunShadow: true,
+          envIntensity: 0.56,
+          exposure: 1.06,
+        },
+        morning: {
+          skyHex: 0x89bce8,
+          fogDensity: 0.004,
+          hemiSky: 0xd0e9ff,
+          hemiGround: 0x38414e,
+          hemiIntensity: 1.18,
+          keyColor: 0xfff4de,
+          keyIntensity: 2.3,
+          keyPos: [-24, 30, 18],
+          castSunShadow: true,
+          envIntensity: 0.8,
+          exposure: 0.96,
+        },
+        noon: {
+          skyHex: 0x76b8f2,
+          fogDensity: 0.0032,
+          hemiSky: 0xdff0ff,
+          hemiGround: 0x454e59,
+          hemiIntensity: 1.3,
+          keyColor: 0xffffff,
+          keyIntensity: 2.75,
+          keyPos: [10, 48, 14],
+          castSunShadow: true,
+          envIntensity: 0.92,
+          exposure: 0.92,
+        },
+        sunset: {
+          skyHex: 0x6a4962,
+          fogDensity: 0.0062,
+          hemiSky: 0xff9a69,
+          hemiGround: 0x261f2f,
+          hemiIntensity: 0.94,
+          keyColor: 0xff8c3d,
+          keyIntensity: 1.8,
+          keyPos: [38, 10, -18],
+          castSunShadow: true,
+          envIntensity: 0.56,
+          exposure: 1.08,
+        },
+        twilight: {
+          skyHex: 0x131d33,
+          fogDensity: 0.007,
+          hemiSky: 0x4b6a9e,
+          hemiGround: 0x121824,
+          hemiIntensity: 0.85,
+          keyColor: 0x94b5eb,
+          keyIntensity: 0.55,
+          keyPos: [-16, 22, 14],
+          castSunShadow: false,
+          envIntensity: 0.48,
+          exposure: 1.15,
+        },
+        night: {
+          skyHex: 0x070a12,
+          fogDensity: 0.0075,
+          hemiSky: 0x385178,
+          hemiGround: 0x10141c,
+          hemiIntensity: 0.36,
+          keyColor: 0x9ab8e8,
+          keyIntensity: 0.22,
+          keyPos: [-16, 22, 14],
+          castSunShadow: false,
+          envIntensity: 0.22,
+          exposure: 1.15,
+        },
+      };
+
+      const cfg = presetMap[settings.ambientMode] ?? presetMap.night;
+      (this.scene.background as THREE.Color).setHex(cfg.skyHex);
+      const fog = this.scene.fog as THREE.FogExp2;
+      fog.color.setHex(cfg.skyHex);
+      fog.density = cfg.fogDensity;
+
+      this.hemiLight.color.setHex(cfg.hemiSky);
+      this.hemiLight.groundColor.setHex(cfg.hemiGround);
+      this.hemiLight.intensity = cfg.hemiIntensity;
+
+      this.moonLight.color.setHex(cfg.keyColor);
+      this.moonLight.intensity = cfg.keyIntensity;
+      this.moonLight.position.set(cfg.keyPos[0], cfg.keyPos[1], cfg.keyPos[2]);
+      this.moonLight.castShadow = !this.isSoftwareGl && cfg.castSunShadow;
+
+      this.scene.environmentIntensity = cfg.envIntensity;
+      this.renderer.toneMappingExposure = cfg.exposure;
     }
 
     this.currentLuxThreshold = settings.luxThreshold;
@@ -3194,7 +3312,7 @@ export class StreetSimulatorScene {
 
         let group = this.targetGroups.get(t.id);
         const colorKey = t.color ?? '';
-        const lenKey = t.length ?? 0;
+        const lenKey = isRoadOrPathKind(t.kind) ? (t.length ?? 0) : 0;
         if (
           group &&
           (group.userData.targetKind !== t.kind ||
@@ -3264,6 +3382,12 @@ export class StreetSimulatorScene {
               offGraphTurnRate: (Math.random() - 0.5) * 0.45,
               offGraphTimer: 1.5 + Math.random() * 3.0,
               walkPauseTimer: t.motion === 'walk' && Math.random() < 0.25 ? Math.random() * 1.4 : 0,
+              walkReactionTimer: 0,
+              walkWasYielding: false,
+              walkIdleTime: Math.random() * 12,
+              walkSeed: Math.random() * Math.PI * 2,
+              walkLookYaw: 0,
+              walkLookPitch: 0,
             };
             if (actor.motion === 'drive') {
               this.assignInitialGraphRoute(actor);
@@ -3311,21 +3435,43 @@ export class StreetSimulatorScene {
         group.position.set(liveX, groundY, liveZ);
         group.rotation.y = liveRotY;
 
+        const defaultDims = BUILDING_DEFAULT_DIMENSIONS[t.kind];
         const defaultH = BUILDING_DEFAULT_HEIGHTS[t.kind];
+        const wScale =
+          defaultDims && t.width !== undefined
+            ? clamp(t.width / defaultDims.width, 0.45, 2.8)
+            : 1;
+        const lScale =
+          defaultDims && t.length !== undefined
+            ? clamp(t.length / defaultDims.length, 0.45, 2.8)
+            : 1;
+        const hScale =
+          defaultH !== undefined
+            ? clamp((t.height ?? defaultH) / defaultH, 0.35, 3.0)
+            : 1;
+
         if (defaultH) {
           const bodyGroup =
             (group.userData.buildingBody as THREE.Group | undefined) ??
             group.getObjectByName('buildingBody');
           if (bodyGroup) {
-            const targetH = t.height ?? defaultH;
-            bodyGroup.scale.y = clamp(targetH / defaultH, 0.35, 3.0);
+            bodyGroup.scale.set(wScale, hScale, lScale);
+          }
+          const contactPlane = group.userData.contactPlane as THREE.Mesh | undefined;
+          if (contactPlane) {
+            contactPlane.scale.set(wScale, lScale, 1);
           }
         }
 
         const ring =
           (group.userData.selectionRing as THREE.Mesh | undefined) ??
-          group.getObjectByName('selectionRing');
-        if (ring) ring.visible = t.id === selectedTargetId;
+          (group.getObjectByName('selectionRing') as THREE.Mesh | undefined);
+        if (ring) {
+          ring.visible = t.id === selectedTargetId;
+          if (defaultH) {
+            ring.scale.set(wScale, lScale, 1);
+          }
+        }
 
         if (t.kind === 'road-roundabout') {
           const armMask =
@@ -3790,14 +3936,25 @@ export class StreetSimulatorScene {
     if (Math.abs(px) > MAP_HALF_X - 1.0 || Math.abs(pz) > MAP_HALF_Z - 1.0) return true;
     for (const t of this.currentTargets) {
       if (t.motion || isRoadOrPathKind(t.kind) || t.kind === 'traffic-light') continue;
+      const bDims = BUILDING_DEFAULT_DIMENSIONS[t.kind];
+      if (bDims) {
+        const hw = (t.width ?? bDims.width) * 0.5 + 0.55;
+        const hl = (t.length ?? bDims.length) * 0.5 + 0.55;
+        const dx = px - t.position.x;
+        const dz = pz - t.position.z;
+        const cosR = Math.cos(t.rotationY);
+        const sinR = Math.sin(t.rotationY);
+        const lx = dx * cosR - dz * sinR;
+        const lz = dx * sinR + dz * cosR;
+        if (Math.abs(lx) < hw && Math.abs(lz) < hl) return true;
+        continue;
+      }
       const rad =
-        t.kind.startsWith('building-')
-          ? 4.2
-          : t.kind === 'tree'
-            ? 1.5
-            : t.kind === 'hedge' || t.kind === 'bench'
-              ? 1.35
-              : 0.9;
+        t.kind === 'tree'
+          ? 1.5
+          : t.kind === 'hedge' || t.kind === 'bench'
+            ? 1.35
+            : 0.9;
       if (Math.hypot(px - t.position.x, pz - t.position.z) < rad) return true;
     }
     return false;
@@ -3932,11 +4089,15 @@ export class StreetSimulatorScene {
     const dirX = dx / stepLen;
     const dirZ = dz / stepLen;
 
+    const currentlyOnRoad = this.isOnCrosswalkArea(actor.x, actor.z);
+    // Once a pedestrian has stepped into the roadway/crosswalk, they MUST finish crossing
+    // to the opposite sidewalk instead of freezing mid-intersection when the light turns red.
+    if (currentlyOnRoad) {
+      return false;
+    }
+
     // Strictly wait behind the curb at roads with traffic lights unless the crossing light is GREEN
     if (this.trafficControllers.length > 0) {
-      const currentlyOnRoad = this.isOnCrosswalkArea(actor.x, actor.z);
-      const nearCurbEdge =
-        currentlyOnRoad && !this.isOnCrosswalkArea(actor.x - dirX * 0.45, actor.z - dirZ * 0.45);
       const aheadNearX = actor.x + dirX * 1.35;
       const aheadNearZ = actor.z + dirZ * 1.35;
       const aheadFarX = actor.x + dirX * 2.15;
@@ -3944,9 +4105,9 @@ export class StreetSimulatorScene {
       const approachingRoad =
         this.isOnCrosswalkArea(aheadNearX, aheadNearZ) ||
         this.isOnCrosswalkArea(aheadFarX, aheadFarZ) ||
-        Boolean(actor.walkIsCrosswalk && !currentlyOnRoad);
+        Boolean(actor.walkIsCrosswalk);
 
-      if ((!currentlyOnRoad || nearCurbEdge) && approachingRoad) {
+      if (approachingRoad) {
         for (const ctrl of this.trafficControllers) {
           if (Math.hypot(aheadNearX - ctrl.cx, aheadNearZ - ctrl.cz) > 11.5) continue;
           const aspects = this.getTrafficSignalAspects(ctrl);
@@ -3962,13 +4123,10 @@ export class StreetSimulatorScene {
       }
     }
 
-    // Only check oncoming car yield when about to enter or cross roadway ahead
+    // Only check oncoming car yield when about to enter the roadway at the curb
     const curbProbeX = actor.x + dirX * 1.8;
     const curbProbeZ = actor.z + dirZ * 1.8;
-    if (
-      !this.isOnCrosswalkArea(actor.x, actor.z) &&
-      !this.isOnCrosswalkArea(curbProbeX, curbProbeZ)
-    ) {
+    if (!this.isOnCrosswalkArea(curbProbeX, curbProbeZ)) {
       return false;
     }
 
@@ -4759,7 +4917,10 @@ export class StreetSimulatorScene {
               this.initPedestrianWalk(actor);
             }
 
-            // Periodically drift walking speed naturally
+            actor.walkIdleTime = (actor.walkIdleTime ?? 0) + stepDelta;
+            const walkSeed = actor.walkSeed ?? 0;
+
+            // Periodically vary natural stroll pace
             actor.speedDriftTimer = (actor.speedDriftTimer ?? 5.0) - stepDelta;
             if (actor.speedDriftTimer <= 0) {
               actor.speedDriftTimer = 3.5 + Math.random() * 6.0;
@@ -4784,19 +4945,77 @@ export class StreetSimulatorScene {
             const dx = goalX - actor.x;
             const dz = goalZ - actor.z;
             const dist = Math.hypot(dx, dz);
-            const paused = (actor.walkPauseTimer ?? 0) > 0;
-            const waiting = paused || this.shouldPedestrianYield(actor, dx, dz);
+            const onRoadNow = this.isOnCrosswalkArea(actor.x, actor.z);
+            if (onRoadNow && (actor.walkPauseTimer ?? 0) > 0) {
+              actor.walkPauseTimer = 0;
+            }
+            const paused = !onRoadNow && (actor.walkPauseTimer ?? 0) > 0;
+            const curbYielding = !paused && this.shouldPedestrianYield(actor, dx, dz);
+
+            // Realistic staggered human reaction delay when light turns green or traffic clears (never mid-road!)
+            if (onRoadNow) {
+              actor.walkWasYielding = false;
+              actor.walkReactionTimer = 0;
+            } else if (curbYielding) {
+              actor.walkWasYielding = true;
+              actor.walkReactionTimer = 0.14 + Math.random() * 0.48;
+            } else if (actor.walkWasYielding) {
+              actor.walkReactionTimer = Math.max(0, (actor.walkReactionTimer ?? 0) - stepDelta);
+              if ((actor.walkReactionTimer ?? 0) <= 0) {
+                actor.walkWasYielding = false;
+              }
+            }
+
+            const reacting = !onRoadNow && !curbYielding && (actor.walkReactionTimer ?? 0) > 0;
+            const waiting = paused || curbYielding || reacting;
+
+            // Hustle briskly across crosswalks—even faster (1.42x) if still crossing when light isn't green
+            let paceBoost = 1.0;
+            if (onRoadNow) {
+              paceBoost = 1.24;
+              if (this.trafficControllers.length > 0 && dist > 1e-4) {
+                const ndx = dx / dist;
+                const ndz = dz / dist;
+                for (const ctrl of this.trafficControllers) {
+                  if (Math.hypot(actor.x - ctrl.cx, actor.z - ctrl.cz) > 12.0) continue;
+                  const aspects = this.getTrafficSignalAspects(ctrl);
+                  const dotZ = Math.abs(ndx * ctrl.axisZX + ndz * ctrl.axisZZ);
+                  const dotX = Math.abs(ndx * ctrl.axisXX + ndz * ctrl.axisXZ);
+                  const walkAxisAspect = dotZ >= dotX ? aspects.axisZ : aspects.axisX;
+                  if (walkAxisAspect !== 'green') {
+                    paceBoost = 1.48;
+                  }
+                  break;
+                }
+              }
+            }
+            const targetWalkSpeed = waiting ? 0 : actor.speed * paceBoost;
+            actor.currentSpeed = THREE.MathUtils.damp(
+              actor.currentSpeed,
+              targetWalkSpeed,
+              waiting ? 12 : onRoadNow ? 7.5 : 4.6,
+              stepDelta,
+            );
+            if (waiting && actor.currentSpeed < 0.05) {
+              actor.currentSpeed = 0;
+            }
+
+            let faceDirX = dx;
+            let faceDirZ = dz;
 
             if (!waiting) {
-              const step = actor.speed * stepDelta;
+              const step = actor.currentSpeed * stepDelta;
 
               if (dist <= step + 0.08) {
                 actor.x = goalX;
                 actor.z = goalZ;
                 if (actor.walkCurrNodeId !== undefined) {
-                  // Random brief stop at corners or after crossing street
-                  if (Math.random() < (actor.walkIsCrosswalk ? 0.28 : 0.16)) {
-                    actor.walkPauseTimer = 0.45 + Math.random() * 1.9;
+                  // Never pause while still on a roadway; only pause briefly once safely on a sidewalk
+                  if (
+                    !this.isOnCrosswalkArea(actor.x, actor.z) &&
+                    Math.random() < (actor.walkIsCrosswalk ? 0.22 : 0.16)
+                  ) {
+                    actor.walkPauseTimer = 0.65 + Math.random() * 2.3;
                   } else {
                     let hops = 0;
                     while (hops < 4) {
@@ -4814,40 +5033,125 @@ export class StreetSimulatorScene {
                   }
                 } else {
                   if (Math.random() < 0.45) {
-                    actor.walkPauseTimer = 0.6 + Math.random() * 2.1;
+                    actor.walkPauseTimer = 0.8 + Math.random() * 2.4;
                   } else {
                     this.pickRandomFreeWalkTarget(actor);
                   }
                 }
               } else if (dist > 1e-4) {
-                let moveX = dx / dist;
-                let moveZ = dz / dist;
+                const dirX = dx / dist;
+                const dirZ = dz / dist;
+                const rightX = -dirZ;
+                const rightZ = dirX;
+                let moveX = dirX;
+                let moveZ = dirZ;
 
-                // Soft personal-space sidestep around other pedestrians
+                // Subtle organic sidewalk meander (no robotic laser-straight marching)
+                if (!onRoadNow && dist > 1.8) {
+                  const meander =
+                    Math.sin((actor.walkIdleTime ?? 0) * 0.55 + walkSeed) * 0.09;
+                  moveX += rightX * meander;
+                  moveZ += rightZ * meander;
+                }
+
+                // Predictive keep-right passing & personal-space steering around other pedestrians
                 for (const [otherId, otherActor] of this.animatedActors.entries()) {
                   if (otherId === id || otherActor.motion !== 'walk') continue;
                   const rx = actor.x - otherActor.x;
                   const rz = actor.z - otherActor.z;
                   const d = Math.hypot(rx, rz);
-                  if (d > 0.05 && d < 0.85) {
-                    const push = ((0.85 - d) / 0.85) * 0.45;
-                    moveX += (rx / d) * push;
-                    moveZ += (rz / d) * push;
+                  if (d > 0.05 && d < 2.2) {
+                    // Forward dot product to check if the other person is ahead of us
+                    const toOtherX = -rx / d;
+                    const toOtherZ = -rz / d;
+                    const ahead = toOtherX * dirX + toOtherZ * dirZ;
+                    if (ahead > 0.35 && d < 2.1) {
+                      const oFx = Math.sin(otherActor.rotationY);
+                      const oFz = Math.cos(otherActor.rotationY);
+                      const oncoming = oFx * dirX + oFz * dirZ < -0.25;
+                      const latOffset = (-rx * rightX - rz * rightZ);
+                      const steerSign = oncoming ? 1 : latOffset >= 0 ? -1 : 1;
+                      const passStrength = ((2.1 - d) / 2.1) * (oncoming ? 0.52 : 0.36);
+                      moveX += rightX * steerSign * passStrength;
+                      moveZ += rightZ * steerSign * passStrength;
+                    }
+                    if (d < 0.92) {
+                      const push = ((0.92 - d) / 0.92) * 0.58;
+                      moveX += (rx / d) * push;
+                      moveZ += (rz / d) * push;
+                    }
                   }
                 }
+
+                // Softly curve around trees, benches, bollards, and oriented buildings on sidewalks
+                if (!onRoadNow) {
+                  for (const prop of this.currentTargets) {
+                    if (
+                      prop.motion ||
+                      isRoadOrPathKind(prop.kind) ||
+                      prop.kind === 'traffic-light'
+                    ) {
+                      continue;
+                    }
+                    const bDims = BUILDING_DEFAULT_DIMENSIONS[prop.kind];
+                    if (bDims) {
+                      const hw = (prop.width ?? bDims.width) * 0.5 + 0.75;
+                      const hl = (prop.length ?? bDims.length) * 0.5 + 0.75;
+                      const rx = actor.x - prop.position.x;
+                      const rz = actor.z - prop.position.z;
+                      const cosR = Math.cos(prop.rotationY);
+                      const sinR = Math.sin(prop.rotationY);
+                      const lx = rx * cosR - rz * sinR;
+                      const lz = rx * sinR + rz * cosR;
+                      if (Math.abs(lx) < hw && Math.abs(lz) < hl) {
+                        const penX = hw - Math.abs(lx);
+                        const penZ = hl - Math.abs(lz);
+                        let pushLX = 0;
+                        let pushLZ = 0;
+                        if (penX < penZ) {
+                          pushLX = (lx >= 0 ? 1 : -1) * Math.min(1, penX * 1.2);
+                        } else {
+                          pushLZ = (lz >= 0 ? 1 : -1) * Math.min(1, penZ * 1.2);
+                        }
+                        moveX += pushLX * cosR + pushLZ * sinR;
+                        moveZ += -pushLX * sinR + pushLZ * cosR;
+                      }
+                      continue;
+                    }
+                    const minClear =
+                      prop.kind === 'tree'
+                        ? 1.55
+                        : prop.kind === 'bench' || prop.kind === 'hedge'
+                          ? 1.4
+                          : 0.95;
+                    const ox = actor.x - prop.position.x;
+                    const oz = actor.z - prop.position.z;
+                    const od = Math.hypot(ox, oz);
+                    if (od > 0.05 && od < minClear) {
+                      const push = ((minClear - od) / minClear) * 0.85;
+                      moveX += (ox / od) * push;
+                      moveZ += (oz / od) * push;
+                    }
+                  }
+                }
+
                 const mLen = Math.hypot(moveX, moveZ) || 1;
-                actor.x += (moveX / mLen) * step;
-                actor.z += (moveZ / mLen) * step;
+                const stepX = moveX / mLen;
+                const stepZ = moveZ / mLen;
+                actor.x += stepX * step;
+                actor.z += stepZ * step;
+                faceDirX = stepX;
+                faceDirZ = stepZ;
               }
             }
 
-            if (dist > 1e-4) {
-              // Keep facing movement/crosswalk direction smoothly even while yielding
-              const targetRotY = Math.atan2(dx, dz);
+            if (Math.hypot(faceDirX, faceDirZ) > 1e-4) {
+              // Smoothly turn body toward actual travel direction (or crosswalk when waiting at curb)
+              const targetRotY = Math.atan2(faceDirX, faceDirZ);
               let angleDiff = targetRotY - actor.rotationY;
               while (angleDiff > Math.PI) angleDiff -= Math.PI * 2;
               while (angleDiff < -Math.PI) angleDiff += Math.PI * 2;
-              actor.rotationY += angleDiff * Math.min(1, 10 * stepDelta);
+              actor.rotationY += angleDiff * Math.min(1, 7.5 * stepDelta);
             }
 
             const targetY = this.getGroundPlacementHeight(actor.x, actor.z, 'pedestrian');
@@ -4856,24 +5160,107 @@ export class StreetSimulatorScene {
             group.position.y = THREE.MathUtils.damp(group.position.y, targetY, 12, stepDelta);
             group.rotation.y = actor.rotationY;
 
+            const pedRefs = group.userData.pedestrianRefs as PedestrianRigRefs | undefined;
+            const heightInv = pedRefs ? 1 / pedRefs.heightScale : 1;
+            const normSpeed = clamp(actor.currentSpeed / Math.max(0.5, actor.speed), 0, 1.25);
+
             actor.strideBlend = THREE.MathUtils.damp(
               actor.strideBlend,
-              waiting ? 0 : 1,
-              10,
+              waiting ? 0 : normSpeed,
+              9,
               stepDelta,
             );
-            if (!waiting) {
-              actor.phase += stepDelta * (4.1 * actor.speed);
+            if (actor.currentSpeed > 0.06) {
+              actor.phase += stepDelta * (3.95 * actor.currentSpeed * heightInv);
             }
-            const pedRefs = group.userData.pedestrianRefs as PedestrianRigRefs | undefined;
+
+            // Natural human head look-around & intersection traffic check
+            const tIdle = actor.walkIdleTime ?? 0;
+            let desiredLookYaw = Math.sin(tIdle * 0.48 + walkSeed) * 0.1;
+            let desiredLookPitch = 0;
+
+            if (curbYielding || reacting) {
+              // Actively glance left & right to check oncoming traffic at the curb
+              const scanWave = Math.sin(tIdle * 1.45 + walkSeed * 2.1);
+              desiredLookYaw = Math.tanh(scanWave * 1.8) * 0.56;
+              desiredLookPitch = 0.04 + Math.sin(tIdle * 0.9 + walkSeed) * 0.03;
+            } else if (paused) {
+              // Stroll pause: casual look around or brief downward glance (e.g. checking watch/phone)
+              const modeCycle = Math.sin(tIdle * 0.4 + walkSeed);
+              if (modeCycle < -0.35) {
+                desiredLookPitch = 0.28;
+                desiredLookYaw = Math.sin(tIdle * 0.65 + walkSeed) * 0.14;
+              } else {
+                desiredLookYaw = Math.sin(tIdle * 0.85 + walkSeed) * 0.42;
+                desiredLookPitch = -0.04;
+              }
+            } else if (onRoadNow || actor.walkIsCrosswalk) {
+              // Quick glance left/right while stepping across a street
+              desiredLookYaw = Math.sin(tIdle * 1.65 + walkSeed) * 0.28;
+            }
+
+            actor.walkLookYaw = THREE.MathUtils.damp(
+              actor.walkLookYaw ?? 0,
+              desiredLookYaw,
+              5.5,
+              stepDelta,
+            );
+            actor.walkLookPitch = THREE.MathUtils.damp(
+              actor.walkLookPitch ?? 0,
+              desiredLookPitch,
+              5.5,
+              stepDelta,
+            );
+
             if (pedRefs) {
-              const swing = Math.sin(actor.phase) * 0.56 * actor.strideBlend;
-              pedRefs.legL.rotation.x = swing;
-              pedRefs.legR.rotation.x = -swing;
-              pedRefs.armL.rotation.x = -swing * 0.85;
-              pedRefs.armR.rotation.x = swing * 0.85;
-              pedRefs.upperBody.position.y =
-                Math.abs(Math.sin(actor.phase)) * 0.032 * actor.strideBlend;
+              const sb = actor.strideBlend;
+              const idleMix = Math.max(0, 1 - sb);
+              const sinP = Math.sin(actor.phase);
+              const swingAmp = 0.54 * sb;
+              const legLSwing = sinP * swingAmp;
+              const legRSwing = -sinP * swingAmp;
+
+              // Subtle relaxed stance when waiting instead of locking ramrod straight
+              const weightShift = Math.sin(tIdle * 1.1 + walkSeed) * 0.045 * idleMix;
+              pedRefs.legL.rotation.x = legLSwing + weightShift * 0.7;
+              pedRefs.legR.rotation.x = legRSwing - weightShift * 0.9;
+
+              // Realistic knee bend (flexes smoothly through toe-off & swing clearance, straightens cleanly at heel strike)
+              const kneeLWalk =
+                Math.max(0, Math.sin(actor.phase - 0.5)) * 0.68 +
+                Math.max(0, -Math.sin(actor.phase + 0.55)) * 0.16;
+              const kneeRWalk =
+                Math.max(0, -Math.sin(actor.phase - 0.5)) * 0.68 +
+                Math.max(0, Math.sin(actor.phase + 0.55)) * 0.16;
+              pedRefs.kneeL.rotation.x =
+                kneeLWalk * sb + Math.max(0, -weightShift) * 1.4 * idleMix;
+              pedRefs.kneeR.rotation.x =
+                kneeRWalk * sb + Math.max(0, weightShift) * 1.4 * idleMix;
+
+              // Counter-swinging shoulders & forward-flexing elbows
+              const armLSwing = -sinP * 0.44 * sb;
+              const armRSwing = sinP * 0.44 * sb;
+              const idleArmSway = Math.sin(tIdle * 1.3 + walkSeed) * 0.028 * idleMix;
+              pedRefs.armL.rotation.x = armLSwing + idleArmSway;
+              pedRefs.armR.rotation.x = armRSwing - idleArmSway;
+              // Negative X bends forearm forward naturally; greater bend on forward swing
+              pedRefs.elbowL.rotation.x = -(0.16 + 0.14 * sb + Math.max(0, sinP) * 0.36 * sb);
+              pedRefs.elbowR.rotation.x = -(0.16 + 0.14 * sb + Math.max(0, -sinP) * 0.36 * sb);
+
+              // Upper body stride bounce + breathing, forward lean, shoulder twist, and subtle weight shift
+              const strideBob = Math.abs(sinP) * 0.036 * sb;
+              const breathe = Math.sin(tIdle * 2.1 + walkSeed) * 0.006 * idleMix;
+              pedRefs.upperBody.position.y = strideBob + breathe;
+              pedRefs.upperBody.rotation.x = 0.055 * sb + Math.sin(tIdle * 1.1 + walkSeed) * 0.012 * idleMix;
+              pedRefs.upperBody.rotation.y = sinP * 0.075 * sb;
+              pedRefs.upperBody.rotation.z =
+                Math.cos(actor.phase) * 0.022 * sb + weightShift * 0.45;
+
+              // Head scan + natural stabilization against torso lean
+              pedRefs.head.rotation.y = actor.walkLookYaw ?? 0;
+              pedRefs.head.rotation.x =
+                (actor.walkLookPitch ?? 0) - 0.035 * sb + Math.sin(tIdle * 2.1 + walkSeed) * 0.015 * idleMix;
+              pedRefs.head.rotation.z = Math.sin(tIdle * 0.75 + walkSeed) * 0.03 * idleMix;
             }
           } else if (actor.motion === 'drive') {
             actor.speedDriftTimer = (actor.speedDriftTimer ?? 4.0) - stepDelta;
