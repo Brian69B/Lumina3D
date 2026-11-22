@@ -13,6 +13,7 @@ import {
   FIXTURE_MAX_X,
   FIXTURE_MAX_Z,
   InputControlsConfig,
+  isBuildingKind,
   isRoadOrPathKind,
   isVehicleKind,
   LightFixture,
@@ -52,14 +53,17 @@ import {
   updateLuxOverlayUniforms,
 } from './luxHeatmapShader';
 import {
+  BikeRiderRefs,
   createBuilderGhostGroup,
   createStreetPoleRig,
   createStreetTargetGroup,
   disposeObject3DResources,
   getParkingLotOpenStalls,
+  MotoRiderRefs,
   ParkingStallSpec,
   PedestrianRigRefs,
   PoleVisualRefs,
+  poseBikeRiderPedaling,
   TrafficSignalMaterials,
   updateStreetPoleRig,
 } from './proceduralModels';
@@ -148,6 +152,9 @@ interface AnimatedActorState {
   walkSeed?: number;
   walkLookYaw?: number;
   walkLookPitch?: number;
+  walkProgressTimer?: number;
+  walkProgressAnchorX?: number;
+  walkProgressAnchorZ?: number;
   crossingWaypoints?: CrossingWaypoint[];
   crossingStepIdx?: number;
   crossingCurbPaused?: boolean;
@@ -1309,6 +1316,124 @@ function isPointInsideAnyParkingDriveway(
   return false;
 }
 
+interface BuildingDoorWorldAnchor {
+  wx: number;
+  wz: number;
+  nx: number;
+  nz: number;
+  width: number;
+}
+
+function getBuildingDoorWorldAnchors(t: StreetTarget): BuildingDoorWorldAnchor[] {
+  const bDims = BUILDING_DEFAULT_DIMENSIONS[t.kind];
+  if (!bDims) return [];
+
+  const wScale =
+    t.width !== undefined ? clamp(t.width / bDims.width, 0.45, 2.8) : 1;
+  const lScale =
+    t.length !== undefined ? clamp(t.length / bDims.length, 0.45, 2.8) : 1;
+  const cosR = Math.cos(t.rotationY);
+  const sinR = Math.sin(t.rotationY);
+
+  const raw: Array<[number, number, number, number, number]> = [];
+  switch (t.kind) {
+    case 'building-kiosk':
+      raw.push([0.88, 1.8, 0, 1, 1.15], [0, -1.8, 0, -1, 1.05]);
+      break;
+    case 'building-small':
+      raw.push([1.08, 2.12, 0, 1, 1.15], [0, -2.12, 0, -1, 1.1]);
+      break;
+    case 'building-tall':
+      raw.push([0, 2.55, 0, 1, 2.2], [0, -2.55, 0, -1, 1.9]);
+      break;
+    case 'building-highrise':
+      raw.push([0, 2.82, 0, 1, 2.5], [0, -2.82, 0, -1, 2.1]);
+      break;
+    case 'building-rowhouse':
+      for (const bx of [-3.1, 0, 3.1]) {
+        raw.push([bx - 0.65, 2.68, 0, 1, 1.18], [bx - 0.65, -2.14, 0, -1, 1.06]);
+      }
+      break;
+    case 'building-commercial':
+      for (const sx of [-3.3, 0, 3.3]) {
+        raw.push([sx + 0.78, 2.25, 0, 1, 1.16]);
+      }
+      raw.push([2.4, -2.25, 0, -1, 1.12]);
+      break;
+    case 'building-warehouse':
+      raw.push([3.1, 3.05, 0, 1, 1.22], [-3.1, -3.05, 0, -1, 1.18]);
+      break;
+    case 'building-civic':
+      raw.push([0, 3.22, 0, 1, 2.3], [0, -3.22, 0, -1, 1.85]);
+      break;
+    case 'building-apartments':
+      raw.push([1.9, 3.28, 0, 1, 2.2], [-2.3, 3.28, 0, 1, 1.22], [0, -3.28, 0, -1, 1.82]);
+      break;
+    case 'building-skyscraper':
+      raw.push([0, 2.98, 0, 1, 2.7], [3.78, 0, 1, 0, 2.0], [0, -2.98, 0, -1, 2.25]);
+      break;
+    default:
+      return [];
+  }
+
+  return raw.map(([lx, lz, lnx, lnz, width]) => {
+    const sx = lx * wScale;
+    const sz = lz * lScale;
+    const wx = t.position.x + sx * cosR + sz * sinR;
+    const wz = t.position.z - sx * sinR + sz * cosR;
+    const rawNx = lnx * cosR + lnz * sinR;
+    const rawNz = -lnx * sinR + lnz * cosR;
+    const nLen = Math.hypot(rawNx, rawNz) || 1;
+    const perpScale = Math.abs(lnx) > 0.5 ? lScale : wScale;
+    return {
+      wx,
+      wz,
+      nx: rawNx / nLen,
+      nz: rawNz / nLen,
+      width: clamp(width * clamp(perpScale, 0.7, 1.8), 0.9, 3.6),
+    };
+  });
+}
+
+function classifySidewalkAtPoint(
+  wx: number,
+  wz: number,
+  roadEntries: RoadSpatialEntry[],
+  pathSidewalks: Array<{ x: number; z: number; cos: number; sin: number }>,
+): 'road' | 'path' | null {
+  for (let i = 0; i < roadEntries.length; i++) {
+    const entry = roadEntries[i];
+    const dx = wx - entry.target.position.x;
+    const dz = wz - entry.target.position.z;
+    if (dx * dx + dz * dz > entry.maxRadiusSq) continue;
+    const { lx, lz } = toRoadLocal(wx, wz, entry);
+    if (
+      isPointInsideTargetSidewalkLocal(
+        entry.target.kind,
+        lx,
+        lz,
+        entry.armMask,
+        entry.target.length,
+        entry.hiddenSet,
+      )
+    ) {
+      return 'road';
+    }
+  }
+  for (let i = 0; i < pathSidewalks.length; i++) {
+    const p = pathSidewalks[i];
+    const dx = wx - p.x;
+    const dz = wz - p.z;
+    if (dx * dx + dz * dz > 22) continue;
+    const lx = dx * p.cos - dz * p.sin;
+    const lz = dx * p.sin + dz * p.cos;
+    if (Math.abs(lx) <= 4.0 && Math.abs(lz) <= 1.5) {
+      return 'path';
+    }
+  }
+  return null;
+}
+
 function formatCompassSideLabel(dx: number, dz: number, roadLabel: string): string {
   if (Math.hypot(dx, dz) < 0.25) return `Sidewalk · ${roadLabel}`;
   const angle = Math.atan2(dz, dx); // +X=0 (East), +Z=PI/2 (South), -X=PI (West), -Z=-PI/2 (North)
@@ -1358,6 +1483,17 @@ export class StreetSimulatorScene {
   private selectedSidewalkMat: THREE.MeshStandardMaterial;
   private sidewalkGroup = new THREE.Group();
   private sidewalkMeshes: THREE.Mesh[] = [];
+  private doorConnectorMesh: THREE.Mesh | null = null;
+  private doorConnectorBoxes: Array<{
+    ox: number;
+    oz: number;
+    nx: number;
+    nz: number;
+    tx: number;
+    tz: number;
+    halfW: number;
+    len: number;
+  }> = [];
   private baseGroundMeshes: THREE.Object3D[] = [];
   private modularRoadEntries: RoadSpatialEntry[] = [];
   private roundaboutEntries: Array<{
@@ -1376,6 +1512,7 @@ export class StreetSimulatorScene {
   private simElapsedSeconds = 0;
   private nextParkingEventTimer = 600 + Math.random() * 300;
   private lastRoadSignature = '__init__';
+  private lastDoorLayoutSignature = '__init__';
 
   private raycaster = new THREE.Raycaster();
   private pickables: THREE.Object3D[] = [];
@@ -1927,9 +2064,8 @@ export class StreetSimulatorScene {
       }
     }
 
-    const nextPickMeshes: THREE.Object3D[] = [...this.baseGroundMeshes];
     if (roadEntries.length === 0) {
-      this.groundPickMeshes = nextPickMeshes;
+      this.refreshGroundPickMeshes();
       return;
     }
 
@@ -1996,7 +2132,6 @@ export class StreetSimulatorScene {
 
       this.sidewalkGroup.add(mesh);
       this.sidewalkMeshes.push(mesh);
-      nextPickMeshes.push(mesh);
     };
 
     for (let idx = 0; idx < roadEntries.length; idx++) {
@@ -2173,7 +2308,426 @@ export class StreetSimulatorScene {
       }
     }
 
-    this.groundPickMeshes = nextPickMeshes;
+    this.refreshGroundPickMeshes();
+  }
+
+  private refreshGroundPickMeshes(): void {
+    const next: THREE.Object3D[] = [...this.baseGroundMeshes, ...this.sidewalkMeshes];
+    if (this.doorConnectorMesh) {
+      next.push(this.doorConnectorMesh);
+    }
+    this.groundPickMeshes = next;
+  }
+
+  private rebuildDoorConnectors(targets: StreetTarget[]): void {
+    if (this.doorConnectorMesh) {
+      this.scene.remove(this.doorConnectorMesh);
+      this.doorConnectorMesh.geometry.dispose();
+      this.doorConnectorMesh = null;
+    }
+    this.doorConnectorBoxes = [];
+
+    const roadEntries = this.modularRoadEntries;
+    const pathSidewalks = targets
+      .filter((t) => t.kind === 'path-sidewalk')
+      .map((t) => ({
+        x: t.position.x,
+        z: t.position.z,
+        cos: Math.cos(t.rotationY),
+        sin: Math.sin(t.rotationY),
+      }));
+
+    if (roadEntries.length === 0 && pathSidewalks.length === 0) {
+      this.refreshGroundPickMeshes();
+      return;
+    }
+
+    const solidObstacles: Array<{
+      id: string;
+      x: number;
+      z: number;
+      cos: number;
+      sin: number;
+      hw: number;
+      hl: number;
+      maxRSq: number;
+    }> = [];
+    const pointObstacles: Array<{ x: number; z: number; radSq: number }> = [];
+
+    for (const t of targets) {
+      if (t.motion) continue;
+      if (t.kind === 'tree' || t.kind === 'traffic-light') {
+        pointObstacles.push({ x: t.position.x, z: t.position.z, radSq: 0.42 * 0.42 });
+        continue;
+      }
+      const dims =
+        t.kind === 'parking-lot'
+          ? { width: 12.8, length: 9.4 }
+          : BUILDING_DEFAULT_DIMENSIONS[t.kind];
+      if (!dims) continue;
+      const hw = (t.width ?? dims.width) * 0.5 - 0.04;
+      const hl = (t.length ?? dims.length) * 0.5 - 0.04;
+      solidObstacles.push({
+        id: t.id,
+        x: t.position.x,
+        z: t.position.z,
+        cos: Math.cos(t.rotationY),
+        sin: Math.sin(t.rotationY),
+        hw: Math.max(0.2, hw),
+        hl: Math.max(0.2, hl),
+        maxRSq: (hw + 0.5) * (hw + 0.5) + (hl + 0.5) * (hl + 0.5),
+      });
+    }
+
+    const isBlockedOutsideOwner = (
+      wx: number,
+      wz: number,
+      ownerId: string,
+      checkBuildings: boolean,
+      checkPointObs: boolean,
+    ): boolean => {
+      if (Math.abs(wx) > MAP_HALF_X + 1.2 || Math.abs(wz) > MAP_HALF_Z + 1.2) return true;
+      if (isPointInsideAnyRoadway(wx, wz, roadEntries)) return true;
+      if (isPointInsideAnyParkingDriveway(wx, wz, targets)) return true;
+      if (checkBuildings) {
+        for (let i = 0; i < solidObstacles.length; i++) {
+          const ob = solidObstacles[i];
+          if (ob.id === ownerId) continue;
+          const dx = wx - ob.x;
+          const dz = wz - ob.z;
+          if (dx * dx + dz * dz > ob.maxRSq) continue;
+          const lx = dx * ob.cos - dz * ob.sin;
+          const lz = dx * ob.sin + dz * ob.cos;
+          if (Math.abs(lx) < ob.hw && Math.abs(lz) < ob.hl) return true;
+        }
+      }
+      if (checkPointObs) {
+        for (let i = 0; i < pointObstacles.length; i++) {
+          const po = pointObstacles[i];
+          const dx = wx - po.x;
+          const dz = wz - po.z;
+          if (dx * dx + dz * dz < po.radSq) return true;
+        }
+      }
+      return false;
+    };
+
+    const positions: number[] = [];
+    const normals: number[] = [];
+    const uvs: number[] = [];
+    const indices: number[] = [];
+    const uScale = 36 / (MAP_HALF_X * 2);
+    const vScale = 3 / 6.2;
+    const topY = 0.12;
+
+    const pushTopQuad = (
+      x0: number,
+      z0: number,
+      x1: number,
+      z1: number,
+      x2: number,
+      z2: number,
+      x3: number,
+      z3: number,
+    ) => {
+      const base = positions.length / 3;
+      const pts: [number, number][] = [
+        [x0, z0],
+        [x1, z1],
+        [x2, z2],
+        [x3, z3],
+      ];
+      for (const [wx, wz] of pts) {
+        positions.push(wx, topY, wz);
+        normals.push(0, 1, 0);
+        uvs.push((wx + MAP_HALF_X) * uScale, (wz - 4.76) * vScale);
+      }
+      const crossY = (z1 - z0) * (x2 - x0) - (x1 - x0) * (z2 - z0);
+      if (crossY >= 0) {
+        indices.push(base, base + 1, base + 2, base, base + 2, base + 3);
+      } else {
+        indices.push(base, base + 2, base + 1, base, base + 3, base + 2);
+      }
+    };
+
+    const pushSkirtQuad = (
+      ax: number,
+      az: number,
+      bx: number,
+      bz: number,
+      insideX: number,
+      insideZ: number,
+    ) => {
+      const len = Math.hypot(bx - ax, bz - az);
+      if (len < 1e-4) return;
+      const mx = (ax + bx) * 0.5;
+      const mz = (az + bz) * 0.5;
+      let p0x = ax;
+      let p0z = az;
+      let p1x = bx;
+      let p1z = bz;
+      const nx = bz - az;
+      const nz = -(bx - ax);
+      if (nx * (insideX - mx) + nz * (insideZ - mz) > 0) {
+        p0x = bx;
+        p0z = bz;
+        p1x = ax;
+        p1z = az;
+      }
+      const unx = (p1z - p0z) / len;
+      const unz = -(p1x - p0x) / len;
+      const base = positions.length / 3;
+      positions.push(
+        p0x, topY, p0z,
+        p1x, topY, p1z,
+        p1x, 0, p1z,
+        p0x, 0, p0z,
+      );
+      for (let k = 0; k < 4; k++) normals.push(unx, 0, unz);
+      uvs.push(0, 0.1, len * uScale, 0.1, len * uScale, 0, 0, 0);
+      indices.push(base, base + 1, base + 2, base, base + 2, base + 3);
+    };
+
+    const MAX_WALKWAY_DIST = 11.0;
+    const STEP = 0.2;
+    const LATERAL_SUBDIVS = 4;
+
+    for (const target of targets) {
+      if (!isBuildingKind(target.kind)) continue;
+      const anchors = getBuildingDoorWorldAnchors(target);
+      for (const anchor of anchors) {
+        const tx = -anchor.nz;
+        const tz = anchor.nx;
+        const halfW = anchor.width * 0.5;
+
+        const startKind = classifySidewalkAtPoint(anchor.wx, anchor.wz, roadEntries, pathSidewalks);
+        if (startKind === 'road') {
+          const checkOut = classifySidewalkAtPoint(
+            anchor.wx + anchor.nx * 0.28,
+            anchor.wz + anchor.nz * 0.28,
+            roadEntries,
+            pathSidewalks,
+          );
+          if (checkOut === 'road') continue;
+        }
+
+        let centerHitDist = -1;
+        let hitKind: 'road' | 'path' | null = null;
+        let obstructed = false;
+
+        for (let d = STEP; d <= MAX_WALKWAY_DIST; d += STEP) {
+          const cx = anchor.wx + anchor.nx * d;
+          const cz = anchor.wz + anchor.nz * d;
+          const swKind = classifySidewalkAtPoint(cx, cz, roadEntries, pathSidewalks);
+          if (swKind) {
+            let lo = Math.max(0, d - STEP);
+            let hi = d;
+            for (let it = 0; it < 7; it++) {
+              const mid = (lo + hi) * 0.5;
+              const mx = anchor.wx + anchor.nx * mid;
+              const mz = anchor.wz + anchor.nz * mid;
+              if (classifySidewalkAtPoint(mx, mz, roadEntries, pathSidewalks)) {
+                hi = mid;
+              } else {
+                lo = mid;
+              }
+            }
+            centerHitDist = hi;
+            hitKind = swKind;
+            break;
+          }
+
+          if (d > 0.3) {
+            if (isBlockedOutsideOwner(cx, cz, target.id, d >= 0.45, true)) {
+              obstructed = true;
+              break;
+            }
+            for (const vOff of [-halfW * 0.65, halfW * 0.65]) {
+              const sx = cx + tx * vOff;
+              const sz = cz + tz * vOff;
+              if (
+                isPointInsideAnyRoadway(sx, sz, roadEntries) ||
+                isPointInsideAnyParkingDriveway(sx, sz, targets)
+              ) {
+                obstructed = true;
+                break;
+              }
+              for (let i = 0; i < pointObstacles.length; i++) {
+                const po = pointObstacles[i];
+                const pdx = sx - po.x;
+                const pdz = sz - po.z;
+                if (pdx * pdx + pdz * pdz < po.radSq) {
+                  obstructed = true;
+                  break;
+                }
+              }
+              if (obstructed) break;
+            }
+            if (obstructed) break;
+          }
+        }
+
+        if (obstructed || hitKind === null || centerHitDist < 0.04) continue;
+
+        const vVals: number[] = [];
+        const dEnds: number[] = [];
+        const dMinSearch = Math.max(0, centerHitDist - 0.85);
+        const dMaxSearch = Math.min(MAX_WALKWAY_DIST, centerHitDist + 0.85);
+
+        for (let j = 0; j <= LATERAL_SUBDIVS; j++) {
+          const v = -halfW + (anchor.width * j) / LATERAL_SUBDIVS;
+          vVals.push(v);
+          const ox = anchor.wx + tx * v;
+          const oz = anchor.wz + tz * v;
+
+          let rayHit = -1;
+          let rayKind: 'road' | 'path' | null = null;
+          for (let s = dMinSearch; s <= dMaxSearch; s += 0.12) {
+            const sk = classifySidewalkAtPoint(
+              ox + anchor.nx * s,
+              oz + anchor.nz * s,
+              roadEntries,
+              pathSidewalks,
+            );
+            if (sk) {
+              let lo = Math.max(0, s - 0.12);
+              let hi = s;
+              for (let it = 0; it < 6; it++) {
+                const mid = (lo + hi) * 0.5;
+                if (
+                  classifySidewalkAtPoint(
+                    ox + anchor.nx * mid,
+                    oz + anchor.nz * mid,
+                    roadEntries,
+                    pathSidewalks,
+                  )
+                ) {
+                  hi = mid;
+                } else {
+                  lo = mid;
+                }
+              }
+              rayHit = hi;
+              rayKind = sk;
+              break;
+            }
+          }
+
+          if (rayHit < 0) {
+            rayHit = centerHitDist;
+            rayKind = hitKind;
+          }
+          dEnds.push(rayKind === 'path' ? rayHit + 0.16 : rayHit + 0.002);
+        }
+
+        const maxDEnd = Math.max(...dEnds);
+        if (maxDEnd < 0.05) continue;
+
+        const endPx = anchor.wx + tx * vVals[0] + anchor.nx * dEnds[0];
+        const endPz = anchor.wz + tz * vVals[0] + anchor.nz * dEnds[0];
+        const endQx = anchor.wx + tx * vVals[LATERAL_SUBDIVS] + anchor.nx * dEnds[LATERAL_SUBDIVS];
+        const endQz = anchor.wz + tz * vVals[LATERAL_SUBDIVS] + anchor.nz * dEnds[LATERAL_SUBDIVS];
+        if (
+          isPointInsideAnyRoadway(endPx, endPz, roadEntries) ||
+          isPointInsideAnyRoadway(endQx, endQz, roadEntries)
+        ) {
+          continue;
+        }
+
+        const nL = Math.max(1, Math.ceil(maxDEnd / 0.75));
+        const gridX: number[][] = [];
+        const gridZ: number[][] = [];
+        for (let i = 0; i <= nL; i++) {
+          const frac = i / nL;
+          const rowX: number[] = [];
+          const rowZ: number[] = [];
+          for (let j = 0; j <= LATERAL_SUBDIVS; j++) {
+            const d = dEnds[j] * frac;
+            rowX.push(anchor.wx + tx * vVals[j] + anchor.nx * d);
+            rowZ.push(anchor.wz + tz * vVals[j] + anchor.nz * d);
+          }
+          gridX.push(rowX);
+          gridZ.push(rowZ);
+        }
+
+        for (let i = 0; i < nL; i++) {
+          for (let j = 0; j < LATERAL_SUBDIVS; j++) {
+            pushTopQuad(
+              gridX[i][j],
+              gridZ[i][j],
+              gridX[i + 1][j],
+              gridZ[i + 1][j],
+              gridX[i + 1][j + 1],
+              gridZ[i + 1][j + 1],
+              gridX[i][j + 1],
+              gridZ[i][j + 1],
+            );
+          }
+          const insideX = anchor.wx + anchor.nx * ((dEnds[0] * (i + 0.5)) / nL);
+          const insideZ = anchor.wz + anchor.nz * ((dEnds[0] * (i + 0.5)) / nL);
+          pushSkirtQuad(
+            gridX[i][0],
+            gridZ[i][0],
+            gridX[i + 1][0],
+            gridZ[i + 1][0],
+            insideX,
+            insideZ,
+          );
+          const insideRX = anchor.wx + anchor.nx * ((dEnds[LATERAL_SUBDIVS] * (i + 0.5)) / nL);
+          const insideRZ = anchor.wz + anchor.nz * ((dEnds[LATERAL_SUBDIVS] * (i + 0.5)) / nL);
+          pushSkirtQuad(
+            gridX[i][LATERAL_SUBDIVS],
+            gridZ[i][LATERAL_SUBDIVS],
+            gridX[i + 1][LATERAL_SUBDIVS],
+            gridZ[i + 1][LATERAL_SUBDIVS],
+            insideRX,
+            insideRZ,
+          );
+        }
+
+        if (hitKind === 'path') {
+          for (let j = 0; j < LATERAL_SUBDIVS; j++) {
+            const insideX = anchor.wx + tx * ((vVals[j] + vVals[j + 1]) * 0.5);
+            const insideZ = anchor.wz + tz * ((vVals[j] + vVals[j + 1]) * 0.5);
+            pushSkirtQuad(
+              gridX[nL][j],
+              gridZ[nL][j],
+              gridX[nL][j + 1],
+              gridZ[nL][j + 1],
+              insideX,
+              insideZ,
+            );
+          }
+        }
+
+        this.doorConnectorBoxes.push({
+          ox: anchor.wx,
+          oz: anchor.wz,
+          nx: anchor.nx,
+          nz: anchor.nz,
+          tx,
+          tz,
+          halfW,
+          len: maxDEnd,
+        });
+      }
+    }
+
+    if (indices.length > 0) {
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+      geo.setAttribute('normal', new THREE.Float32BufferAttribute(normals, 3));
+      geo.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
+      geo.setIndex(indices);
+      geo.computeBoundingSphere();
+
+      const mesh = new THREE.Mesh(geo, this.sidewalkMat);
+      mesh.receiveShadow = true;
+      this.scene.add(mesh);
+      this.doorConnectorMesh = mesh;
+    }
+
+    this.refreshGroundPickMeshes();
   }
 
   private bindEvents(): void {
@@ -2659,7 +3213,7 @@ export class StreetSimulatorScene {
     return Math.round(val * 2) / 2;
   }
 
-  private isPointOnAnySidewalk(x: number, z: number): boolean {
+  private isPointOnAnySidewalk(x: number, z: number, includeDoorConnectors = true): boolean {
     if (isPointInsideAnyRoadway(x, z, this.modularRoadEntries)) return false;
     if (isPointInsideAnyParkingDriveway(x, z, this.currentTargets)) return false;
     for (let i = 0; i < this.modularRoadEntries.length; i++) {
@@ -2681,12 +3235,24 @@ export class StreetSimulatorScene {
         return true;
       }
     }
+    if (includeDoorConnectors) {
+      for (let i = 0; i < this.doorConnectorBoxes.length; i++) {
+        const b = this.doorConnectorBoxes[i];
+        const dx = x - b.ox;
+        const dz = z - b.oz;
+        const along = dx * b.nx + dz * b.nz;
+        if (along < 0 || along > b.len) continue;
+        const across = Math.abs(dx * b.tx + dz * b.tz);
+        if (across <= b.halfW) return true;
+      }
+    }
     return false;
   }
 
   private getGroundPlacementHeight(x: number, z: number, kind?: TargetKind): number {
-    if (kind?.startsWith('road-') || kind === 'parking-lot') return 0;
-    return this.isPointOnAnySidewalk(x, z) ? 0.12 : 0;
+    if (kind?.startsWith('road-') || kind?.startsWith('path-') || kind === 'parking-lot') return 0;
+    const includeDoorConnectors = !kind || !isBuildingKind(kind);
+    return this.isPointOnAnySidewalk(x, z, includeDoorConnectors) ? 0.12 : 0;
   }
 
   private onContextLost = (e: Event) => {
@@ -3304,7 +3870,7 @@ export class StreetSimulatorScene {
     this.prevShowLuxHeatmap = settings.showLuxHeatmap;
     this.prevLuxThreshold = settings.luxThreshold;
 
-    // Rebuild corridor sidewalks & road driveway curb cuts when roads, sidewalks, or parking lots change
+    // Rebuild corridor sidewalks & road driveway curb cuts when roads or parking lots change
     let roadLayoutChanged = false;
     if (targetsChanged) {
       const roadSig = targets
@@ -3318,6 +3884,26 @@ export class StreetSimulatorScene {
         this.lastRoadSignature = roadSig;
         roadLayoutChanged = true;
         this.rebuildSidewalks(targets);
+      }
+
+      const doorLayoutSig = targets
+        .filter(
+          (t) =>
+            t.kind.startsWith('road-') ||
+            t.kind === 'parking-lot' ||
+            t.kind === 'path-sidewalk' ||
+            t.kind === 'tree' ||
+            t.kind === 'traffic-light' ||
+            isBuildingKind(t.kind),
+        )
+        .map(
+          (t) =>
+            `${t.id}:${t.kind}:${t.position.x.toFixed(2)},${t.position.z.toFixed(2)},${t.rotationY.toFixed(3)},${t.width ?? 0},${t.length ?? 0},${(t.hiddenSidewalks ?? []).join(',')}`,
+        )
+        .join('|');
+      if (roadLayoutChanged || doorLayoutSig !== this.lastDoorLayoutSignature) {
+        this.lastDoorLayoutSignature = doorLayoutSig;
+        this.rebuildDoorConnectors(targets);
       }
     }
     for (const mesh of this.sidewalkMeshes) {
@@ -4932,11 +5518,11 @@ export class StreetSimulatorScene {
   private isPointBlockedForPedestrian(px: number, pz: number): boolean {
     if (Math.abs(px) > MAP_HALF_X - 1.0 || Math.abs(pz) > MAP_HALF_Z - 1.0) return true;
     for (const t of this.currentTargets) {
-      if (
-        t.motion ||
-        (isRoadOrPathKind(t.kind) && t.kind !== 'parking-lot') ||
-        t.kind === 'traffic-light'
-      ) {
+      if (t.motion || (isRoadOrPathKind(t.kind) && t.kind !== 'parking-lot')) {
+        continue;
+      }
+      if (t.kind === 'traffic-light') {
+        if (Math.hypot(px - t.position.x, pz - t.position.z) < 0.5) return true;
         continue;
       }
       const bDims =
@@ -4944,8 +5530,8 @@ export class StreetSimulatorScene {
           ? { width: 12.8, length: 9.4 }
           : BUILDING_DEFAULT_DIMENSIONS[t.kind];
       if (bDims) {
-        const hw = (t.width ?? bDims.width) * 0.5 + 0.55;
-        const hl = (t.length ?? bDims.length) * 0.5 + 0.55;
+        const hw = (t.width ?? bDims.width) * 0.5 + 0.42;
+        const hl = (t.length ?? bDims.length) * 0.5 + 0.42;
         const dx = px - t.position.x;
         const dz = pz - t.position.z;
         const cosR = Math.cos(t.rotationY);
@@ -4957,10 +5543,10 @@ export class StreetSimulatorScene {
       }
       const rad =
         t.kind === 'tree'
-          ? 1.5
+          ? 1.45
           : t.kind === 'hedge' || t.kind === 'bench'
-            ? 1.35
-            : 0.9;
+            ? 1.3
+            : 0.85;
       if (Math.hypot(px - t.position.x, pz - t.position.z) < rad) return true;
     }
     return false;
@@ -5015,10 +5601,13 @@ export class StreetSimulatorScene {
           if (this.walkGraph.edges[n.id].length === 0) continue;
           const d = Math.hypot(n.x - actor.x, n.z - actor.z);
           if (d < bestDist) {
-            // Ensure acquiring the starting sidewalk node doesn't step across an unmarked road
+            // Ensure acquiring the starting sidewalk node doesn't step across a road or through a building
             const mx = (actor.x + n.x) * 0.5;
             const mz = (actor.z + n.z) * 0.5;
-            if (!isPointInsideAnyRoadway(mx, mz, this.modularRoadEntries)) {
+            if (
+              !isPointInsideAnyRoadway(mx, mz, this.modularRoadEntries) &&
+              this.countSegmentBuildingHits(actor.x, actor.z, n.x, n.z, 0.28) === 0
+            ) {
               bestDist = d;
               bestId = n.id;
             }
@@ -5213,6 +5802,22 @@ export class StreetSimulatorScene {
       return;
     }
 
+    // Prefer edges whose segment does not clip through a building
+    const currNode = this.walkGraph.nodes[currId];
+    const clearBuildingEdges = outEdges.filter(
+      (e) =>
+        this.countSegmentBuildingHits(
+          currNode.x,
+          currNode.z,
+          this.walkGraph.nodes[e.toNodeId].x,
+          this.walkGraph.nodes[e.toNodeId].z,
+          0.26,
+        ) === 0,
+    );
+    if (clearBuildingEdges.length > 0) {
+      outEdges = clearBuildingEdges;
+    }
+
     // Avoid immediate ping-pong reversals most of the time, while still allowing occasional random turn-backs
     if (outEdges.length > 1 && actor.walkPrevNodeId !== undefined) {
       const nonBack = outEdges.filter((e) => e.toNodeId !== actor.walkPrevNodeId);
@@ -5232,17 +5837,28 @@ export class StreetSimulatorScene {
     const segDx = nextNode.x - prevNode.x;
     const segDz = nextNode.z - prevNode.z;
     const segLen = Math.hypot(segDx, segDz);
+    let goalX = nextNode.x;
+    let goalZ = nextNode.z;
     if (segLen > 2.2) {
       const perpX = -segDz / segLen;
       const perpZ = segDx / segLen;
-      const jitterMag = chosen.isCrosswalk ? 0.38 : 0.55;
-      const offset = (Math.random() - 0.5) * 2 * jitterMag;
-      actor.walkGoalX = nextNode.x + perpX * offset;
-      actor.walkGoalZ = nextNode.z + perpZ * offset;
-    } else {
-      actor.walkGoalX = nextNode.x;
-      actor.walkGoalZ = nextNode.z;
+      const jitterMag = chosen.isCrosswalk ? 0.34 : 0.42;
+      const rawOffset = (Math.random() - 0.5) * 2 * jitterMag;
+      for (const offset of [rawOffset, -rawOffset * 0.65, 0]) {
+        const cx = nextNode.x + perpX * offset;
+        const cz = nextNode.z + perpZ * offset;
+        if (
+          !this.isPointBlockedForPedestrian(cx, cz) &&
+          this.countSegmentBuildingHits(actor.x, actor.z, cx, cz, 0.26) === 0
+        ) {
+          goalX = cx;
+          goalZ = cz;
+          break;
+        }
+      }
     }
+    actor.walkGoalX = goalX;
+    actor.walkGoalZ = goalZ;
   }
 
   private isOnCrosswalkArea(px: number, pz: number): boolean {
@@ -6451,6 +7067,9 @@ export class StreetSimulatorScene {
                 ? curbLookDirZ
                 : dz;
 
+            const prevPedX = actor.x;
+            const prevPedZ = actor.z;
+
             if (!waiting) {
               const step = actor.currentSpeed * stepDelta;
 
@@ -6464,6 +7083,9 @@ export class StreetSimulatorScene {
                   actor.x = goalX;
                   actor.z = goalZ;
                 }
+                actor.walkProgressTimer = 0;
+                actor.walkProgressAnchorX = actor.x;
+                actor.walkProgressAnchorZ = actor.z;
                 if (activeCrossingStep) {
                   if (
                     activeCrossingStep.action === 'pause-at-curb' &&
@@ -6544,7 +7166,7 @@ export class StreetSimulatorScene {
                 // Subtle organic sidewalk meander (no robotic laser-straight marching)
                 if (!onRoadNow && dist > 1.8) {
                   const meander =
-                    Math.sin((actor.walkIdleTime ?? 0) * 0.55 + walkSeed) * 0.09;
+                    Math.sin((actor.walkIdleTime ?? 0) * 0.55 + walkSeed) * 0.08;
                   moveX += rightX * meander;
                   moveZ += rightZ * meander;
                 }
@@ -6578,14 +7200,21 @@ export class StreetSimulatorScene {
                   }
                 }
 
-                // Softly curve around trees, benches, bollards, and oriented buildings on sidewalks
+                // Softly slide around trees, benches, signal poles, and oriented buildings without deadlock
                 if (!onRoadNow) {
                   for (const prop of this.currentTargets) {
-                    if (
-                      prop.motion ||
-                      (isRoadOrPathKind(prop.kind) && prop.kind !== 'parking-lot') ||
-                      prop.kind === 'traffic-light'
-                    ) {
+                    if (prop.motion || (isRoadOrPathKind(prop.kind) && prop.kind !== 'parking-lot')) {
+                      continue;
+                    }
+                    if (prop.kind === 'traffic-light') {
+                      const ox = actor.x - prop.position.x;
+                      const oz = actor.z - prop.position.z;
+                      const od = Math.hypot(ox, oz);
+                      if (od > 0.04 && od < 0.55) {
+                        const push = ((0.55 - od) / 0.55) * 0.75;
+                        moveX += (ox / od) * push;
+                        moveZ += (oz / od) * push;
+                      }
                       continue;
                     }
                     const bDims =
@@ -6593,8 +7222,9 @@ export class StreetSimulatorScene {
                         ? { width: 12.8, length: 9.4 }
                         : BUILDING_DEFAULT_DIMENSIONS[prop.kind];
                     if (bDims) {
-                      const hw = (prop.width ?? bDims.width) * 0.5 + 0.8;
-                      const hl = (prop.length ?? bDims.length) * 0.5 + 0.8;
+                      const steerPad = 0.46;
+                      const hw = (prop.width ?? bDims.width) * 0.5 + steerPad;
+                      const hl = (prop.length ?? bDims.length) * 0.5 + steerPad;
                       const rx = actor.x - prop.position.x;
                       const rz = actor.z - prop.position.z;
                       const cosR = Math.cos(prop.rotationY);
@@ -6608,49 +7238,136 @@ export class StreetSimulatorScene {
                         const gdz = goalZ - prop.position.z;
                         const glx = gdx * cosR - gdz * sinR;
                         const glz = gdx * sinR + gdz * cosR;
-                        let pushLX = 0;
-                        let pushLZ = 0;
+
+                        let nLocalX = 0;
+                        let nLocalZ = 0;
+                        let tLocalX = 0;
+                        let tLocalZ = 0;
+                        let pen = 0;
                         if (penX < penZ) {
-                          pushLX = (lx >= 0 ? 1 : -1) * Math.min(1.4, 0.45 + penX * 1.4);
+                          nLocalX = lx >= 0 ? 1 : -1;
+                          pen = penX;
                           const slideDir =
-                            Math.abs(lz) > 0.25 ? (lz >= 0 ? 1 : -1) : glz >= 0 ? 1 : -1;
-                          pushLZ = slideDir * 0.95;
+                            Math.abs(glz - lz) > 0.2 ? (glz >= lz ? 1 : -1) : lz >= 0 ? 1 : -1;
+                          tLocalZ = slideDir;
                         } else {
-                          pushLZ = (lz >= 0 ? 1 : -1) * Math.min(1.4, 0.45 + penZ * 1.4);
+                          nLocalZ = lz >= 0 ? 1 : -1;
+                          pen = penZ;
                           const slideDir =
-                            Math.abs(lx) > 0.25 ? (lx >= 0 ? 1 : -1) : glx >= 0 ? 1 : -1;
-                          pushLX = slideDir * 0.95;
+                            Math.abs(glx - lx) > 0.2 ? (glx >= lx ? 1 : -1) : lx >= 0 ? 1 : -1;
+                          tLocalX = slideDir;
                         }
-                        moveX += pushLX * cosR + pushLZ * sinR;
-                        moveZ += -pushLX * sinR + pushLZ * cosR;
+
+                        const nx = nLocalX * cosR + nLocalZ * sinR;
+                        const nz = -nLocalX * sinR + nLocalZ * cosR;
+                        const tx = tLocalX * cosR + tLocalZ * sinR;
+                        const tz = -tLocalX * sinR + tLocalZ * cosR;
+
+                        // Cancel any inward component into the wall so force vectors cannot cancel into a stall
+                        const mDotN = moveX * nx + moveZ * nz;
+                        if (mDotN < 0) {
+                          moveX -= nx * mDotN;
+                          moveZ -= nz * mDotN;
+                        }
+                        const outBias = Math.min(0.65, 0.22 + (pen / steerPad) * 0.45);
+                        moveX += nx * outBias;
+                        moveZ += nz * outBias;
+
+                        // Ensure clean tangential slide around corners if facing wall squarely
+                        const mDotT = moveX * tx + moveZ * tz;
+                        if (mDotT < 0.25) {
+                          moveX += tx * (0.45 - mDotT);
+                          moveZ += tz * (0.45 - mDotT);
+                        }
                       }
                       continue;
                     }
                     const minClear =
                       prop.kind === 'tree'
-                        ? 1.55
+                        ? 1.45
                         : prop.kind === 'bench' || prop.kind === 'hedge'
-                          ? 1.4
-                          : 0.95;
+                          ? 1.32
+                          : 0.88;
                     const ox = actor.x - prop.position.x;
                     const oz = actor.z - prop.position.z;
                     const od = Math.hypot(ox, oz);
                     if (od > 0.05 && od < minClear) {
-                      const push = ((minClear - od) / minClear) * 0.85;
+                      const push = ((minClear - od) / minClear) * 0.8;
                       moveX += (ox / od) * push;
                       moveZ += (oz / od) * push;
                     }
                   }
                 }
 
-                const mLen = Math.hypot(moveX, moveZ) || 1;
-                const stepX = moveX / mLen;
-                const stepZ = moveZ / mLen;
-                actor.x += stepX * step;
-                actor.z += stepZ * step;
-                faceDirX = stepX;
-                faceDirZ = stepZ;
+                const mLen = Math.hypot(moveX, moveZ);
+                if (mLen > 1e-4) {
+                  const stepX = moveX / mLen;
+                  const stepZ = moveZ / mLen;
+                  actor.x += stepX * step;
+                  actor.z += stepZ * step;
+                  faceDirX = stepX;
+                  faceDirZ = stepZ;
+                }
+
+                // Hard wall clamp: keep pedestrians cleanly outside solid building footprints (+0.34m)
+                if (!onRoadNow) {
+                  for (const prop of this.currentTargets) {
+                    if (prop.motion || isRoadOrPathKind(prop.kind) || prop.kind === 'traffic-light') {
+                      continue;
+                    }
+                    const bDims = BUILDING_DEFAULT_DIMENSIONS[prop.kind];
+                    if (!bDims) continue;
+                    const hw = (prop.width ?? bDims.width) * 0.5 + 0.34;
+                    const hl = (prop.length ?? bDims.length) * 0.5 + 0.34;
+                    const rx = actor.x - prop.position.x;
+                    const rz = actor.z - prop.position.z;
+                    const cosR = Math.cos(prop.rotationY);
+                    const sinR = Math.sin(prop.rotationY);
+                    const lx = rx * cosR - rz * sinR;
+                    const lz = rx * sinR + rz * cosR;
+                    if (Math.abs(lx) < hw && Math.abs(lz) < hl) {
+                      const penX = hw - Math.abs(lx);
+                      const penZ = hl - Math.abs(lz);
+                      const clampedLX = penX <= penZ ? (lx >= 0 ? hw : -hw) : lx;
+                      const clampedLZ = penX <= penZ ? lz : (lz >= 0 ? hl : -hl);
+                      actor.x = prop.position.x + clampedLX * cosR + clampedLZ * sinR;
+                      actor.z = prop.position.z - clampedLX * sinR + clampedLZ * cosR;
+                    }
+                  }
+                }
+
+                // Stuck watchdog: if net progress over ~1.4s is negligible, re-route to a clear node/target
+                if (actor.walkProgressAnchorX === undefined || actor.walkProgressAnchorZ === undefined) {
+                  actor.walkProgressAnchorX = actor.x;
+                  actor.walkProgressAnchorZ = actor.z;
+                  actor.walkProgressTimer = 0;
+                } else {
+                  actor.walkProgressTimer = (actor.walkProgressTimer ?? 0) + stepDelta;
+                  if (actor.walkProgressTimer >= 1.4) {
+                    const netProgress = Math.hypot(
+                      actor.x - actor.walkProgressAnchorX,
+                      actor.z - actor.walkProgressAnchorZ,
+                    );
+                    actor.walkProgressAnchorX = actor.x;
+                    actor.walkProgressAnchorZ = actor.z;
+                    actor.walkProgressTimer = 0;
+                    if (netProgress < 0.3) {
+                      if (activeCrossingStep) {
+                        this.initPedestrianWalk(actor);
+                      } else if (actor.walkCurrNodeId !== undefined) {
+                        actor.walkPrevNodeId = undefined;
+                        this.pickNextWalkTarget(actor);
+                      } else {
+                        this.pickRandomFreeWalkTarget(actor);
+                      }
+                    }
+                  }
+                }
               }
+            } else {
+              actor.walkProgressTimer = 0;
+              actor.walkProgressAnchorX = actor.x;
+              actor.walkProgressAnchorZ = actor.z;
             }
 
             if (Math.hypot(faceDirX, faceDirZ) > 1e-4) {
@@ -6670,7 +7387,13 @@ export class StreetSimulatorScene {
 
             const pedRefs = group.userData.pedestrianRefs as PedestrianRigRefs | undefined;
             const heightInv = pedRefs ? 1 / pedRefs.heightScale : 1;
-            const normSpeed = clamp(actor.currentSpeed / Math.max(0.5, actor.speed), 0, 1.25);
+            const actualMoved = Math.hypot(actor.x - prevPedX, actor.z - prevPedZ);
+            const effectiveSpeed = waiting
+              ? 0
+              : stepDelta > 1e-4
+                ? Math.min(actor.currentSpeed, actualMoved / stepDelta)
+                : 0;
+            const normSpeed = clamp(effectiveSpeed / Math.max(0.5, actor.speed), 0, 1.25);
 
             actor.strideBlend = THREE.MathUtils.damp(
               actor.strideBlend,
@@ -6678,8 +7401,8 @@ export class StreetSimulatorScene {
               9,
               stepDelta,
             );
-            if (actor.currentSpeed > 0.06) {
-              actor.phase += stepDelta * (3.95 * actor.currentSpeed * heightInv);
+            if (effectiveSpeed > 0.06) {
+              actor.phase += stepDelta * (3.95 * effectiveSpeed * heightInv);
             }
 
             // Natural human head look-around & intersection traffic check
@@ -7320,6 +8043,27 @@ export class StreetSimulatorScene {
               for (const pivot of wheelPivots) {
                 pivot.rotation.z -= spinAngle;
               }
+            }
+
+            const bikeRiderRefs = group.userData.bikeRiderRefs as BikeRiderRefs | undefined;
+            if (bikeRiderRefs) {
+              if (actor.currentSpeed > 0.08) {
+                bikeRiderRefs.pedalPhase += (actor.currentSpeed * stepDelta) / 0.19;
+                poseBikeRiderPedaling(bikeRiderRefs, bikeRiderRefs.pedalPhase);
+              }
+              const speedRatio = clamp(actor.currentSpeed / 4.0, 0, 1);
+              bikeRiderRefs.upperBody.rotation.x =
+                Math.sin(bikeRiderRefs.pedalPhase) * 0.032 * speedRatio;
+              const lookPhase = this.simElapsedSeconds * (actor.isYielding ? 1.3 : 0.65) + (actor.walkSeed ?? 0);
+              bikeRiderRefs.head.rotation.y =
+                Math.sin(lookPhase) * (actor.isYielding ? 0.34 : 0.08);
+            }
+
+            const motoRiderRefs = group.userData.motoRiderRefs as MotoRiderRefs | undefined;
+            if (motoRiderRefs) {
+              const lookPhase = this.simElapsedSeconds * (actor.isYielding ? 1.1 : 0.55) + (actor.walkSeed ?? 0);
+              motoRiderRefs.head.rotation.y =
+                Math.sin(lookPhase) * (actor.isYielding ? 0.28 : 0.06);
             }
           }
         }

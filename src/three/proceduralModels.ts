@@ -1111,6 +1111,87 @@ export interface PedestrianRigRefs {
   heightScale: number;
 }
 
+export interface BikeRiderRefs {
+  crankGroup: THREE.Group;
+  pedalL: THREE.Group;
+  pedalR: THREE.Group;
+  legL: THREE.Group;
+  kneeL: THREE.Group;
+  legR: THREE.Group;
+  kneeR: THREE.Group;
+  upperBody: THREE.Group;
+  head: THREE.Group;
+  pedalPhase: number;
+}
+
+export interface MotoRiderRefs {
+  upperBody: THREE.Group;
+  head: THREE.Group;
+}
+
+const BIKE_HIP_X = -0.25;
+const BIKE_HIP_Y = 0.93;
+const BIKE_CRANK_X = -0.04;
+const BIKE_CRANK_Y = 0.35;
+const BIKE_CRANK_R = 0.13;
+const BIKE_THIGH_LEN = 0.39;
+const BIKE_SHIN_LEN = 0.38;
+
+function solveLegPoseXY(
+  hipX: number,
+  hipY: number,
+  footX: number,
+  footY: number,
+  l1: number,
+  l2: number,
+): { hipZ: number; kneeZ: number } {
+  const dx = footX - hipX;
+  const dy = footY - hipY;
+  const maxD = l1 + l2 - 0.015;
+  const minD = Math.abs(l1 - l2) + 0.02;
+  const d = clamp(Math.hypot(dx, dy), minD, maxD);
+  const baseAngle = Math.atan2(dx, -dy);
+  const cosAlpha = clamp((l1 * l1 + d * d - l2 * l2) / (2 * l1 * d), -1, 1);
+  const cosBeta = clamp((l1 * l1 + l2 * l2 - d * d) / (2 * l1 * l2), -1, 1);
+  return {
+    hipZ: baseAngle + Math.acos(cosAlpha),
+    kneeZ: -(Math.PI - Math.acos(cosBeta)),
+  };
+}
+
+export function poseBikeRiderPedaling(refs: BikeRiderRefs, phase: number): void {
+  refs.crankGroup.rotation.z = -phase;
+  refs.pedalR.rotation.z = phase;
+  refs.pedalL.rotation.z = phase;
+
+  const rFootX = BIKE_CRANK_X + BIKE_CRANK_R * Math.cos(-phase);
+  const rFootY = BIKE_CRANK_Y + BIKE_CRANK_R * Math.sin(-phase) + 0.032;
+  const lFootX = BIKE_CRANK_X - BIKE_CRANK_R * Math.cos(-phase);
+  const lFootY = BIKE_CRANK_Y - BIKE_CRANK_R * Math.sin(-phase) + 0.032;
+
+  const rPose = solveLegPoseXY(
+    BIKE_HIP_X,
+    BIKE_HIP_Y,
+    rFootX,
+    rFootY,
+    BIKE_THIGH_LEN,
+    BIKE_SHIN_LEN,
+  );
+  const lPose = solveLegPoseXY(
+    BIKE_HIP_X,
+    BIKE_HIP_Y,
+    lFootX,
+    lFootY,
+    BIKE_THIGH_LEN,
+    BIKE_SHIN_LEN,
+  );
+
+  refs.legR.rotation.z = rPose.hipZ;
+  refs.kneeR.rotation.z = rPose.kneeZ;
+  refs.legL.rotation.z = lPose.hipZ;
+  refs.kneeL.rotation.z = lPose.kneeZ;
+}
+
 export interface ParkingStallSpec {
   idx: number;
   x: number;
@@ -1230,7 +1311,27 @@ export function createStreetTargetGroup(
   group.add(selectRing);
 
   if (kind === 'bike') {
-    const frameMat = new THREE.MeshStandardMaterial({ color: 0x0ea5e9, metalness: 0.65, roughness: 0.28 });
+    let bHash = 2166136261;
+    for (let i = 0; i < id.length; i++) {
+      bHash ^= id.charCodeAt(i);
+      bHash = Math.imul(bHash, 16777619);
+    }
+    const bRand01 = (salt: number) => {
+      let x = bHash ^ (salt * 0x9e3779b9);
+      x = Math.imul(x ^ (x >>> 16), 0x85ebca6b);
+      x = Math.imul(x ^ (x >>> 13), 0xc2b2ae35);
+      return ((x ^ (x >>> 16)) >>> 0) / 4294967295;
+    };
+
+    const BIKE_FRAME_COLORS = [0x0ea5e9, 0x10b981, 0xe11d48, 0xf59e0b, 0x6366f1, 0x14b8a6];
+    const JERSEY_COLORS = [0x0284c7, 0xd97706, 0x059669, 0xdc2626, 0x7c3aed, 0x334155, 0xdb2777];
+    const HELMET_COLORS = [0xf8fafc, 0x0ea5e9, 0xfacc15, 0xef4444, 0x1e293b, 0x10b981];
+    const SKIN_TONES = [0xf2cbb0, 0xe2b290, 0xd49c79, 0xb87d59, 0x8d583b, 0x613a26];
+
+    const frameColor = customColor
+      ? new THREE.Color(customColor)
+      : new THREE.Color(BIKE_FRAME_COLORS[Math.floor(bRand01(1) * BIKE_FRAME_COLORS.length)]);
+    const frameMat = new THREE.MeshStandardMaterial({ color: frameColor, metalness: 0.65, roughness: 0.28 });
     const tireMat = new THREE.MeshStandardMaterial({ color: 0x16181d, roughness: 0.88, metalness: 0.05 });
     const metalMat = new THREE.MeshStandardMaterial({ color: 0xcbd5e1, roughness: 0.28, metalness: 0.88 });
     const saddleMat = new THREE.MeshStandardMaterial({ color: 0x1e293b, roughness: 0.72, metalness: 0.08 });
@@ -1281,6 +1382,38 @@ export function createStreetTargetGroup(
     saddle.castShadow = true;
     group.add(saddle);
 
+    // Crankset, arms & horizontal pedals
+    const crankGroup = new THREE.Group();
+    crankGroup.position.set(BIKE_CRANK_X, BIKE_CRANK_Y, 0);
+
+    const chainring = new THREE.Mesh(new THREE.CylinderGeometry(0.095, 0.095, 0.016, 16), metalMat);
+    chainring.rotation.x = Math.PI / 2;
+    crankGroup.add(chainring);
+
+    const crankArmGeo = new THREE.BoxGeometry(BIKE_CRANK_R, 0.022, 0.018);
+    const crankArmR = new THREE.Mesh(crankArmGeo, metalMat);
+    crankArmR.position.set(BIKE_CRANK_R * 0.5, 0, 0.07);
+    crankGroup.add(crankArmR);
+
+    const crankArmL = new THREE.Mesh(crankArmGeo, metalMat);
+    crankArmL.position.set(-BIKE_CRANK_R * 0.5, 0, -0.07);
+    crankGroup.add(crankArmL);
+
+    const pedalGeo = new THREE.BoxGeometry(0.095, 0.022, 0.075);
+    const pedalR = new THREE.Group();
+    pedalR.position.set(BIKE_CRANK_R, 0, 0.115);
+    const pedalRMesh = new THREE.Mesh(pedalGeo, saddleMat);
+    pedalR.add(pedalRMesh);
+    crankGroup.add(pedalR);
+
+    const pedalL = new THREE.Group();
+    pedalL.position.set(-BIKE_CRANK_R, 0, -0.115);
+    const pedalLMesh = new THREE.Mesh(pedalGeo, saddleMat);
+    pedalL.add(pedalLMesh);
+    crankGroup.add(pedalL);
+
+    group.add(crankGroup);
+
     // Handlebars
     const stem = new THREE.Mesh(new THREE.CylinderGeometry(0.018, 0.018, 0.12, 8), metalMat);
     stem.position.set(0.31, 0.92, 0);
@@ -1297,9 +1430,183 @@ export function createStreetTargetGroup(
     );
     headLamp.position.set(0.37, 0.92, 0);
     group.add(headLamp);
+
+    // Seated cyclist rider gripping handlebars & pedaling
+    const jerseyMat = new THREE.MeshStandardMaterial({
+      color: JERSEY_COLORS[Math.floor(bRand01(2) * JERSEY_COLORS.length)],
+      roughness: 0.65,
+      metalness: 0.06,
+    });
+    const shortMat = new THREE.MeshStandardMaterial({ color: 0x1e293b, roughness: 0.84, metalness: 0.04 });
+    const shoeMat = new THREE.MeshStandardMaterial({ color: 0x111827, roughness: 0.82, metalness: 0.05 });
+    const skinMat = new THREE.MeshStandardMaterial({
+      color: SKIN_TONES[Math.floor(bRand01(3) * SKIN_TONES.length)],
+      roughness: 0.58,
+      metalness: 0.02,
+    });
+    const helmetMat = new THREE.MeshPhysicalMaterial({
+      color: HELMET_COLORS[Math.floor(bRand01(4) * HELMET_COLORS.length)],
+      roughness: 0.28,
+      metalness: 0.2,
+      clearcoat: 0.7,
+    });
+
+    const pelvis = new THREE.Mesh(new THREE.CapsuleGeometry(0.115, 0.14, 4, 10), shortMat);
+    pelvis.rotation.x = Math.PI / 2;
+    pelvis.scale.set(0.85, 1, 0.76);
+    pelvis.position.set(BIKE_HIP_X, 0.96, 0);
+    pelvis.castShadow = true;
+    group.add(pelvis);
+
+    const makeBikeLeg = (sideZ: number) => {
+      const hip = new THREE.Group();
+      hip.position.set(BIKE_HIP_X, BIKE_HIP_Y, sideZ);
+
+      const thigh = new THREE.Mesh(new THREE.CapsuleGeometry(0.058, 0.27, 4, 10), shortMat);
+      thigh.position.set(0, -BIKE_THIGH_LEN * 0.5, 0);
+      thigh.castShadow = true;
+      hip.add(thigh);
+
+      const knee = new THREE.Group();
+      knee.position.set(0, -BIKE_THIGH_LEN, 0);
+
+      const shin = new THREE.Mesh(new THREE.CapsuleGeometry(0.046, 0.26, 4, 10), skinMat);
+      shin.position.set(0, -BIKE_SHIN_LEN * 0.5, 0);
+      shin.castShadow = true;
+      knee.add(shin);
+
+      const shoe = new THREE.Mesh(new THREE.BoxGeometry(0.2, 0.072, 0.1), shoeMat);
+      shoe.position.set(0.04, -BIKE_SHIN_LEN, 0);
+      shoe.castShadow = true;
+      knee.add(shoe);
+
+      hip.add(knee);
+      group.add(hip);
+      return { hip, knee };
+    };
+
+    const bikeLegL = makeBikeLeg(-0.115);
+    const bikeLegR = makeBikeLeg(0.115);
+
+    const riderUpper = new THREE.Group();
+    riderUpper.position.set(-0.26, 0.96, 0);
+    riderUpper.rotation.z = -0.46;
+    group.add(riderUpper);
+
+    const torso = new THREE.Mesh(new THREE.CapsuleGeometry(0.155, 0.36, 6, 12), jerseyMat);
+    torso.scale.set(0.7, 1, 1.04);
+    torso.position.set(0, 0.26, 0);
+    torso.castShadow = true;
+    torso.receiveShadow = true;
+    riderUpper.add(torso);
+
+    if (bRand01(5) < 0.45) {
+      const pack = new THREE.Mesh(
+        new THREE.BoxGeometry(0.13, 0.3, 0.22),
+        new THREE.MeshStandardMaterial({ color: 0x334155, roughness: 0.78 }),
+      );
+      pack.position.set(-0.145, 0.27, 0);
+      pack.castShadow = true;
+      riderUpper.add(pack);
+    }
+
+    const head = new THREE.Group();
+    head.position.set(0.02, 0.53, 0);
+    head.rotation.z = 0.38;
+
+    const neck = new THREE.Mesh(new THREE.CylinderGeometry(0.044, 0.052, 0.08, 10), skinMat);
+    neck.position.set(0, 0.035, 0);
+    neck.castShadow = true;
+    head.add(neck);
+
+    const skull = new THREE.Mesh(new THREE.SphereGeometry(0.112, 14, 12), skinMat);
+    skull.scale.set(0.98, 1.05, 0.94);
+    skull.position.set(0.01, 0.14, 0);
+    skull.castShadow = true;
+    head.add(skull);
+
+    const helmetShell = new THREE.Mesh(
+      new THREE.SphereGeometry(0.13, 14, 10, 0, Math.PI * 2, 0, Math.PI * 0.56),
+      helmetMat,
+    );
+    helmetShell.scale.set(1.12, 0.96, 0.98);
+    helmetShell.position.set(0.01, 0.148, 0);
+    helmetShell.rotation.z = -0.14;
+    helmetShell.castShadow = true;
+    head.add(helmetShell);
+
+    const helmetVisor = new THREE.Mesh(new THREE.BoxGeometry(0.075, 0.02, 0.16), shortMat);
+    helmetVisor.position.set(0.135, 0.175, 0);
+    helmetVisor.rotation.z = -0.22;
+    head.add(helmetVisor);
+
+    riderUpper.add(head);
+
+    // Connect shoulders smoothly through elbows onto the handlebar grips
+    const addSegmentMesh = (
+      parent: THREE.Object3D,
+      a: THREE.Vector3,
+      b: THREE.Vector3,
+      r: number,
+      mat: THREE.Material,
+    ) => {
+      const dir = new THREE.Vector3().subVectors(b, a);
+      const len = dir.length();
+      const seg = new THREE.Mesh(new THREE.CapsuleGeometry(r, Math.max(0.02, len - r * 1.4), 4, 8), mat);
+      seg.position.copy(a).add(b).multiplyScalar(0.5);
+      seg.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), dir.normalize());
+      seg.castShadow = true;
+      parent.add(seg);
+    };
+
+    for (const side of [-1, 1]) {
+      const shoulder = new THREE.Vector3(-0.07, 1.33, side * 0.17);
+      const elbow = new THREE.Vector3(0.12, 1.13, side * 0.215);
+      const grip = new THREE.Vector3(0.31, 0.975, side * 0.21);
+      addSegmentMesh(group, shoulder, elbow, 0.046, jerseyMat);
+      addSegmentMesh(group, elbow, grip, 0.04, skinMat);
+      const hand = new THREE.Mesh(new THREE.SphereGeometry(0.042, 8, 8), saddleMat);
+      hand.position.copy(grip);
+      hand.castShadow = true;
+      group.add(hand);
+    }
+
+    const initialPhase = bRand01(6) * Math.PI * 2;
+    const bikeRiderRefs: BikeRiderRefs = {
+      crankGroup,
+      pedalL,
+      pedalR,
+      legL: bikeLegL.hip,
+      kneeL: bikeLegL.knee,
+      legR: bikeLegR.hip,
+      kneeR: bikeLegR.knee,
+      upperBody: riderUpper,
+      head,
+      pedalPhase: initialPhase,
+    };
+    poseBikeRiderPedaling(bikeRiderRefs, initialPhase);
+    group.userData.bikeRiderRefs = bikeRiderRefs;
   } else if (kind === 'motorcycle') {
+    let mHash = 2166136261;
+    for (let i = 0; i < id.length; i++) {
+      mHash ^= id.charCodeAt(i);
+      mHash = Math.imul(mHash, 16777619);
+    }
+    const mRand01 = (salt: number) => {
+      let x = mHash ^ (salt * 0x9e3779b9);
+      x = Math.imul(x ^ (x >>> 16), 0x85ebca6b);
+      x = Math.imul(x ^ (x >>> 13), 0xc2b2ae35);
+      return ((x ^ (x >>> 16)) >>> 0) / 4294967295;
+    };
+
+    const MOTO_PAINTS = [0xb91c1c, 0x1d4ed8, 0x0f766e, 0xd97706, 0x475569, 0x7c3aed];
+    const JACKET_TONES = [0x18181b, 0x1e293b, 0x3b1d1d, 0x273449, 0x2f3e34, 0x3f3f46];
+    const HELMET_TONES = [0xf8fafc, 0x111827, 0xdc2626, 0x0284c7, 0xeab308, 0x64748b];
+
     const paintMat = new THREE.MeshPhysicalMaterial({
-      color: 0xb91c1c,
+      color: customColor
+        ? new THREE.Color(customColor)
+        : MOTO_PAINTS[Math.floor(mRand01(1) * MOTO_PAINTS.length)],
       metalness: 0.65,
       roughness: 0.25,
       clearcoat: 0.9,
@@ -1354,6 +1661,14 @@ export function createStreetTargetGroup(
     seat.castShadow = true;
     group.add(seat);
 
+    // Footpegs for rider boots
+    for (const side of [-1, 1]) {
+      const peg = new THREE.Mesh(new THREE.CylinderGeometry(0.018, 0.018, 0.11, 8), metalMat);
+      peg.rotation.x = Math.PI / 2;
+      peg.position.set(-0.16, 0.36, side * 0.22);
+      group.add(peg);
+    }
+
     // Front forks, fairing & handlebars
     const fork = new THREE.Mesh(new THREE.CylinderGeometry(0.04, 0.04, 0.72, 10), metalMat);
     fork.position.set(0.54, 0.64, 0);
@@ -1386,6 +1701,117 @@ export function createStreetTargetGroup(
     );
     taillight.position.set(-0.74, 0.72, 0);
     group.add(taillight);
+
+    // Full-gear motorcyclist rider seated on bike gripping bars
+    const jacketMat = new THREE.MeshStandardMaterial({
+      color: JACKET_TONES[Math.floor(mRand01(2) * JACKET_TONES.length)],
+      roughness: 0.55,
+      metalness: 0.12,
+    });
+    const pantsMat = new THREE.MeshStandardMaterial({ color: 0x1e293b, roughness: 0.84, metalness: 0.06 });
+    const bootMat = new THREE.MeshStandardMaterial({ color: 0x0f172a, roughness: 0.75, metalness: 0.1 });
+    const helmetMat = new THREE.MeshPhysicalMaterial({
+      color: HELMET_TONES[Math.floor(mRand01(3) * HELMET_TONES.length)],
+      roughness: 0.18,
+      metalness: 0.35,
+      clearcoat: 0.95,
+      clearcoatRoughness: 0.08,
+    });
+    const visorMat = new THREE.MeshStandardMaterial({
+      color: 0x090d16,
+      metalness: 0.9,
+      roughness: 0.06,
+    });
+
+    const pelvis = new THREE.Mesh(new THREE.CapsuleGeometry(0.135, 0.16, 4, 10), pantsMat);
+    pelvis.rotation.x = Math.PI / 2;
+    pelvis.scale.set(0.88, 1, 0.78);
+    pelvis.position.set(-0.31, 0.85, 0);
+    pelvis.castShadow = true;
+    group.add(pelvis);
+
+    const addMotoSegment = (a: THREE.Vector3, b: THREE.Vector3, r: number, mat: THREE.Material) => {
+      const dir = new THREE.Vector3().subVectors(b, a);
+      const len = dir.length();
+      const mesh = new THREE.Mesh(new THREE.CapsuleGeometry(r, Math.max(0.02, len - r * 1.4), 4, 8), mat);
+      mesh.position.copy(a).add(b).multiplyScalar(0.5);
+      mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), dir.normalize());
+      mesh.castShadow = true;
+      group.add(mesh);
+    };
+
+    // Legs straddling tank onto footpegs
+    for (const side of [-1, 1]) {
+      const hip = new THREE.Vector3(-0.3, 0.83, side * 0.135);
+      const knee = new THREE.Vector3(0.0, 0.62, side * 0.225);
+      const ankle = new THREE.Vector3(-0.16, 0.4, side * 0.215);
+      addMotoSegment(hip, knee, 0.068, pantsMat);
+      addMotoSegment(knee, ankle, 0.056, pantsMat);
+      const boot = new THREE.Mesh(new THREE.BoxGeometry(0.22, 0.09, 0.11), bootMat);
+      boot.position.set(-0.12, 0.38, side * 0.22);
+      boot.castShadow = true;
+      group.add(boot);
+    }
+
+    const motoUpper = new THREE.Group();
+    motoUpper.position.set(-0.31, 0.85, 0);
+    motoUpper.rotation.z = -0.34;
+    group.add(motoUpper);
+
+    const torso = new THREE.Mesh(new THREE.CapsuleGeometry(0.17, 0.38, 6, 12), jacketMat);
+    torso.scale.set(0.74, 1, 1.08);
+    torso.position.set(0, 0.27, 0);
+    torso.castShadow = true;
+    torso.receiveShadow = true;
+    motoUpper.add(torso);
+
+    const motoHead = new THREE.Group();
+    motoHead.position.set(0.02, 0.54, 0);
+    motoHead.rotation.z = 0.28;
+
+    const neck = new THREE.Mesh(new THREE.CylinderGeometry(0.052, 0.06, 0.07, 10), jacketMat);
+    neck.position.set(0, 0.03, 0);
+    motoHead.add(neck);
+
+    const helmetShell = new THREE.Mesh(new THREE.SphereGeometry(0.145, 16, 14), helmetMat);
+    helmetShell.scale.set(1.12, 1.02, 0.96);
+    helmetShell.position.set(0.015, 0.16, 0);
+    helmetShell.castShadow = true;
+    motoHead.add(helmetShell);
+
+    const chinGuard = new THREE.Mesh(new THREE.BoxGeometry(0.11, 0.085, 0.17), helmetMat);
+    chinGuard.position.set(0.115, 0.105, 0);
+    chinGuard.castShadow = true;
+    motoHead.add(chinGuard);
+
+    const visor = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.148, 0.148, 0.078, 16, 1, false, Math.PI * 0.16, Math.PI * 0.68),
+      visorMat,
+    );
+    visor.scale.set(1.13, 1, 0.98);
+    visor.position.set(0.022, 0.17, 0);
+    motoHead.add(visor);
+
+    motoUpper.add(motoHead);
+
+    // Arms reaching handlebar grips cleanly
+    for (const side of [-1, 1]) {
+      const shoulder = new THREE.Vector3(-0.16, 1.25, side * 0.19);
+      const elbow = new THREE.Vector3(0.09, 1.1, side * 0.265);
+      const grip = new THREE.Vector3(0.38, 1.02, side * 0.295);
+      addMotoSegment(shoulder, elbow, 0.052, jacketMat);
+      addMotoSegment(elbow, grip, 0.044, jacketMat);
+      const glove = new THREE.Mesh(new THREE.SphereGeometry(0.046, 8, 8), bootMat);
+      glove.position.copy(grip);
+      glove.castShadow = true;
+      group.add(glove);
+    }
+
+    const motoRiderRefs: MotoRiderRefs = {
+      upperBody: motoUpper,
+      head: motoHead,
+    };
+    group.userData.motoRiderRefs = motoRiderRefs;
   } else if (kind === 'sedan') {
     const paintMat = new THREE.MeshPhysicalMaterial({
       color: customColor ? new THREE.Color(customColor) : new THREE.Color(0x3b526b),
@@ -1498,7 +1924,7 @@ export function createStreetTargetGroup(
     group.add(tailBar);
   } else if (kind === 'van') {
     const paintMat = new THREE.MeshPhysicalMaterial({
-      color: 0xcbd5e1,
+      color: customColor ? new THREE.Color(customColor) : 0xcbd5e1,
       metalness: 0.35,
       roughness: 0.32,
       clearcoat: 0.7,
@@ -1603,7 +2029,7 @@ export function createStreetTargetGroup(
     }
   } else if (kind === 'truck') {
     const cabMat = new THREE.MeshPhysicalMaterial({
-      color: 0x2b4c7e,
+      color: customColor ? new THREE.Color(customColor) : 0x2b4c7e,
       metalness: 0.52,
       roughness: 0.3,
       clearcoat: 0.75,
@@ -2330,588 +2756,1051 @@ export function createStreetTargetGroup(
     }
 
     group.userData.trafficSignalMaterials = signalMaterials;
-  } else if (kind === 'building-kiosk') {
-    // 1-story modern pavilion / cafe (3.8m x 3.8m x 3.8m)
-    const bodyGroup = new THREE.Group();
-    bodyGroup.name = 'buildingBody';
-    group.userData.buildingBody = bodyGroup;
-    group.add(bodyGroup);
+  } else if (
+    kind === 'building-kiosk' ||
+    kind === 'building-small' ||
+    kind === 'building-tall' ||
+    kind === 'building-highrise' ||
+    kind === 'building-rowhouse' ||
+    kind === 'building-commercial' ||
+    kind === 'building-warehouse' ||
+    kind === 'building-civic' ||
+    kind === 'building-apartments' ||
+    kind === 'building-skyscraper'
+  ) {
+    type DoorStyle = 'wood' | 'glass-metal' | 'steel' | 'civic-bronze' | 'artdeco';
+    const addBuildingDoor = (
+      parent: THREE.Group,
+      opts: {
+        x: number;
+        y: number;
+        z: number;
+        rotY?: number;
+        width: number;
+        height: number;
+        style: DoorStyle;
+        doubleLeaf?: boolean;
+        hasCanopy?: boolean;
+        hasStep?: boolean;
+        leafColorHex?: number;
+      },
+    ) => {
+      const doorGrp = new THREE.Group();
+      doorGrp.position.set(opts.x, opts.y, opts.z);
+      if (opts.rotY) doorGrp.rotation.y = opts.rotY;
 
-    const baseMat = getSharedStdMat('bk:base', { color: 0x28313e, roughness: 0.85, metalness: 0.1 });
-    const facadeMat = getSharedStdMat('bk:facade', { color: 0x475569, roughness: 0.78, metalness: 0.08 });
-    const glassMat = getSharedStdMat('bk:glass', { color: 0x0f172a, roughness: 0.08, metalness: 0.88 });
-    const roofMat = getSharedStdMat('bk:roof', { color: 0x1e293b, roughness: 0.5, metalness: 0.42 });
+      const w = opts.width;
+      const h = opts.height;
+      const fThick = opts.style === 'artdeco' || opts.style === 'civic-bronze' ? 0.11 : 0.08;
+      const fDepth = 0.12;
 
-    const plinth = new THREE.Mesh(getSharedBoxGeo(3.92, 0.35, 3.92), baseMat);
-    plinth.position.y = 0.175;
-    plinth.castShadow = true;
-    plinth.receiveShadow = true;
-    bodyGroup.add(plinth);
+      const frameMat =
+        opts.style === 'civic-bronze' || opts.style === 'artdeco'
+          ? getSharedStdMat('bdoor:frameBronze', { color: 0x4b3d2b, roughness: 0.42, metalness: 0.65 })
+          : opts.style === 'wood'
+            ? getSharedStdMat('bdoor:frameStone', { color: 0x2f343d, roughness: 0.72, metalness: 0.15 })
+            : getSharedStdMat('bdoor:frameDark', { color: 0x161d29, roughness: 0.44, metalness: 0.58 });
 
-    const core = new THREE.Mesh(getSharedBoxGeo(3.64, 2.75, 3.64), facadeMat);
-    core.position.y = 1.725;
-    core.castShadow = true;
-    core.receiveShadow = true;
-    bodyGroup.add(core);
+      const hardwareMat =
+        opts.style === 'wood' || opts.style === 'civic-bronze' || opts.style === 'artdeco'
+          ? getSharedStdMat('bdoor:brass', { color: 0xd4a853, roughness: 0.24, metalness: 0.88 })
+          : getSharedStdMat('bdoor:chrome', { color: 0xcbd5e1, roughness: 0.22, metalness: 0.9 });
 
-    const frontGlass = new THREE.Mesh(getSharedBoxGeo(2.85, 2.0, 0.08), glassMat);
-    frontGlass.position.set(0, 1.5, 1.83);
-    bodyGroup.add(frontGlass);
+      const glassMatDoor = getSharedStdMat(`bdoor:glass:${opts.style}`, {
+        color: 0x0e1a2b,
+        emissive: opts.style === 'steel' ? 0xfef3c7 : 0xfde68a,
+        emissiveIntensity: opts.style === 'steel' ? 0.12 : 0.28,
+        roughness: 0.09,
+        metalness: 0.86,
+      });
 
-    const canopy = new THREE.Mesh(getSharedBoxGeo(4.28, 0.24, 4.42), roofMat);
-    canopy.position.set(0, 3.22, 0.2);
-    canopy.castShadow = true;
-    canopy.receiveShadow = true;
-    bodyGroup.add(canopy);
+      const leafHex =
+        opts.leafColorHex ??
+        (opts.style === 'wood'
+          ? 0x5c3624
+          : opts.style === 'steel'
+            ? 0x3b4859
+            : opts.style === 'civic-bronze'
+              ? 0x5a4632
+              : 0x1e293b);
+      const leafMat = getSharedStdMat(`bdoor:leaf:${opts.style}:${leafHex}`, {
+        color: leafHex,
+        roughness: opts.style === 'wood' ? 0.62 : 0.46,
+        metalness: opts.style === 'wood' ? 0.05 : opts.style === 'glass-metal' ? 0.55 : 0.38,
+      });
 
-    const roofUnit = new THREE.Mesh(getSharedBoxGeo(1.3, 0.44, 1.1), baseMat);
-    roofUnit.position.set(-0.6, 3.56, -0.4);
-    roofUnit.castShadow = true;
-    bodyGroup.add(roofUnit);
-  } else if (kind === 'building-small') {
-    // 2-story storefront / townhouse building (4.4m x 4.4m x 6.3m)
-    const bodyGroup = new THREE.Group();
-    bodyGroup.name = 'buildingBody';
-    group.userData.buildingBody = bodyGroup;
-    group.add(bodyGroup);
+      // Left, right & top frame jambs
+      const jambGeo = getSharedBoxGeo(fThick, h, fDepth);
+      const jambL = new THREE.Mesh(jambGeo, frameMat);
+      jambL.position.set(-w * 0.5 + fThick * 0.5, h * 0.5, fDepth * 0.5 - 0.02);
+      jambL.castShadow = true;
+      doorGrp.add(jambL);
 
-    const plinthMat = getSharedStdMat('bs:plinth', { color: 0x28313e, roughness: 0.88, metalness: 0.08 });
-    const facadeMat = getSharedStdMat('bs:facade', { color: 0x475569, roughness: 0.82, metalness: 0.06 });
-    const trimMat = getSharedStdMat('bs:trim', { color: 0x1e293b, roughness: 0.55, metalness: 0.35 });
-    const glassMat = getSharedStdMat('bs:glass', { color: 0x0f172a, roughness: 0.08, metalness: 0.88 });
-    const awningMat = getSharedStdMat('bs:awning', { color: 0x9a3412, roughness: 0.68, metalness: 0.1 });
+      const jambR = new THREE.Mesh(jambGeo, frameMat);
+      jambR.position.set(w * 0.5 - fThick * 0.5, h * 0.5, fDepth * 0.5 - 0.02);
+      jambR.castShadow = true;
+      doorGrp.add(jambR);
 
-    const plinth = new THREE.Mesh(getSharedBoxGeo(4.56, 0.55, 4.56), plinthMat);
-    plinth.position.y = 0.275;
-    plinth.castShadow = true;
-    plinth.receiveShadow = true;
-    bodyGroup.add(plinth);
+      const header = new THREE.Mesh(getSharedBoxGeo(w + 0.08, fThick * 1.15, fDepth + 0.03), frameMat);
+      header.position.set(0, h - fThick * 0.5, fDepth * 0.5 - 0.01);
+      header.castShadow = true;
+      doorGrp.add(header);
 
-    const body = new THREE.Mesh(getSharedBoxGeo(4.36, 5.4, 4.36), facadeMat);
-    body.position.y = 3.25;
-    body.castShadow = true;
-    body.receiveShadow = true;
-    bodyGroup.add(body);
+      const innerW = Math.max(0.45, w - fThick * 2);
+      const innerH = Math.max(1.2, h - fThick);
 
-    // Ground storefront window bay + awning facing +Z
-    const storeGlass = new THREE.Mesh(getSharedBoxGeo(3.1, 1.85, 0.08), glassMat);
-    storeGlass.position.set(0, 1.5, 2.18);
-    bodyGroup.add(storeGlass);
+      if (opts.style === 'glass-metal' || opts.style === 'artdeco' || opts.style === 'civic-bronze') {
+        const hasTransom = innerH >= 2.25;
+        const transomH = hasTransom ? innerH * 0.22 : 0;
+        const leafH = innerH - transomH;
 
-    const awning = new THREE.Mesh(getSharedBoxGeo(3.5, 0.16, 0.95), awningMat);
-    awning.position.set(0, 2.55, 2.55);
-    awning.rotation.x = 0.22;
-    awning.castShadow = true;
-    bodyGroup.add(awning);
+        if (hasTransom) {
+          const transomGlass = new THREE.Mesh(
+            getSharedBoxGeo(innerW, transomH - 0.04, 0.04),
+            glassMatDoor,
+          );
+          transomGlass.position.set(0, leafH + transomH * 0.5, 0.04);
+          doorGrp.add(transomGlass);
 
-    // Upper floor windows on front & back
-    const upperWinGeo = getSharedBoxGeo(0.76, 1.25, 0.08);
-    for (const wx of [-1.25, 0, 1.25]) {
-      const winF = new THREE.Mesh(upperWinGeo, glassMat);
-      winF.position.set(wx, 4.4, 2.18);
-      bodyGroup.add(winF);
+          const transomBar = new THREE.Mesh(
+            getSharedBoxGeo(innerW + 0.04, 0.06, fDepth),
+            frameMat,
+          );
+          transomBar.position.set(0, leafH, fDepth * 0.5 - 0.02);
+          doorGrp.add(transomBar);
+        }
 
-      const winB = new THREE.Mesh(upperWinGeo, glassMat);
-      winB.position.set(wx, 4.4, -2.18);
-      bodyGroup.add(winB);
-    }
+        // Glazed door leaves with bottom kickplate
+        const glassBackdrop = new THREE.Mesh(
+          getSharedBoxGeo(innerW, leafH, 0.04),
+          glassMatDoor,
+        );
+        glassBackdrop.position.set(0, leafH * 0.5, 0.035);
+        doorGrp.add(glassBackdrop);
 
-    const cornice = new THREE.Mesh(getSharedBoxGeo(4.64, 0.34, 4.64), trimMat);
-    cornice.position.y = 6.12;
-    cornice.castShadow = true;
-    bodyGroup.add(cornice);
-  } else if (kind === 'building-tall') {
-    // 4-story mid-rise architectural tower (5.2m x 5.2m x 11.6m)
-    const bodyGroup = new THREE.Group();
-    bodyGroup.name = 'buildingBody';
-    group.userData.buildingBody = bodyGroup;
-    group.add(bodyGroup);
+        const kickH = Math.min(0.32, leafH * 0.16);
+        const kickPlate = new THREE.Mesh(
+          getSharedBoxGeo(innerW, kickH, 0.065),
+          leafMat,
+        );
+        kickPlate.position.set(0, kickH * 0.5, 0.05);
+        doorGrp.add(kickPlate);
 
-    const baseMat = getSharedStdMat('bt:base', { color: 0x1e293b, roughness: 0.72, metalness: 0.22 });
-    const towerMat = getSharedStdMat('bt:tower', { color: 0x334155, roughness: 0.76, metalness: 0.15 });
-    const glassMat = getSharedStdMat('bt:glass', { color: 0x0c1629, roughness: 0.08, metalness: 0.9 });
-    const capMat = getSharedStdMat('bt:cap', { color: 0x0f172a, roughness: 0.45, metalness: 0.55 });
+        if (opts.doubleLeaf) {
+          const mullion = new THREE.Mesh(
+            getSharedBoxGeo(0.065, leafH, 0.07),
+            frameMat,
+          );
+          mullion.position.set(0, leafH * 0.5, 0.05);
+          doorGrp.add(mullion);
 
-    const lobby = new THREE.Mesh(getSharedBoxGeo(5.36, 2.2, 5.36), baseMat);
-    lobby.position.y = 1.1;
-    lobby.castShadow = true;
-    lobby.receiveShadow = true;
-    bodyGroup.add(lobby);
+          const barGeo = getSharedBoxGeo(0.035, 0.42, 0.04);
+          for (const hx of [-0.14, 0.14]) {
+            const handle = new THREE.Mesh(barGeo, hardwareMat);
+            handle.position.set(hx, Math.min(1.06, leafH * 0.52), 0.095);
+            doorGrp.add(handle);
+          }
+        } else {
+          const pushBar = new THREE.Mesh(
+            getSharedBoxGeo(innerW * 0.72, 0.04, 0.04),
+            hardwareMat,
+          );
+          pushBar.position.set(0, Math.min(1.02, leafH * 0.48), 0.09);
+          doorGrp.add(pushBar);
+        }
+      } else if (opts.style === 'wood') {
+        const panel = new THREE.Mesh(getSharedBoxGeo(innerW, innerH, 0.065), leafMat);
+        panel.position.set(0, innerH * 0.5, 0.04);
+        doorGrp.add(panel);
 
-    const core = new THREE.Mesh(getSharedBoxGeo(5.04, 8.2, 5.04), towerMat);
-    core.position.y = 6.3;
-    core.castShadow = true;
-    core.receiveShadow = true;
-    bodyGroup.add(core);
+        // Recessed upper glass pane in wood door
+        const upperGlass = new THREE.Mesh(
+          getSharedBoxGeo(innerW * 0.62, innerH * 0.34, 0.075),
+          glassMatDoor,
+        );
+        upperGlass.position.set(0, innerH * 0.68, 0.045);
+        doorGrp.add(upperGlass);
 
-    // 3 horizontal curtain glass bands
-    const bandGeo = getSharedBoxGeo(5.12, 1.15, 5.12);
-    for (const wy of [4.0, 6.4, 8.8]) {
-      const glassBand = new THREE.Mesh(bandGeo, glassMat);
-      glassBand.position.y = wy;
-      bodyGroup.add(glassBand);
-    }
+        // Brass doorknob
+        const knob = new THREE.Mesh(getSharedBoxGeo(0.065, 0.065, 0.065), hardwareMat);
+        knob.position.set(innerW * 0.34, Math.min(0.98, innerH * 0.48), 0.09);
+        doorGrp.add(knob);
+      } else {
+        // Steel utility/service door with safety vision pane & panic bar
+        const panel = new THREE.Mesh(getSharedBoxGeo(innerW, innerH, 0.065), leafMat);
+        panel.position.set(0, innerH * 0.5, 0.04);
+        doorGrp.add(panel);
 
-    const parapet = new THREE.Mesh(getSharedBoxGeo(5.3, 0.36, 5.3), capMat);
-    parapet.position.y = 10.58;
-    parapet.castShadow = true;
-    bodyGroup.add(parapet);
+        const vision = new THREE.Mesh(
+          getSharedBoxGeo(innerW * 0.36, innerH * 0.24, 0.075),
+          glassMatDoor,
+        );
+        vision.position.set(0, innerH * 0.72, 0.045);
+        doorGrp.add(vision);
 
-    const penthouse = new THREE.Mesh(getSharedBoxGeo(2.4, 0.85, 2.4), baseMat);
-    penthouse.position.y = 11.18;
-    penthouse.castShadow = true;
-    bodyGroup.add(penthouse);
-  } else if (kind === 'building-highrise') {
-    // 8-story high-rise tower (5.6m x 5.6m x 22.0m)
-    const bodyGroup = new THREE.Group();
-    bodyGroup.name = 'buildingBody';
-    group.userData.buildingBody = bodyGroup;
-    group.add(bodyGroup);
+        const panicBar = new THREE.Mesh(
+          getSharedBoxGeo(innerW * 0.76, 0.05, 0.04),
+          hardwareMat,
+        );
+        panicBar.position.set(0, Math.min(1.02, innerH * 0.48), 0.09);
+        doorGrp.add(panicBar);
+      }
 
-    const podiumMat = getSharedStdMat('bh:podium', { color: 0x1e293b, roughness: 0.7, metalness: 0.25 });
-    const towerMat = getSharedStdMat('bh:tower', { color: 0x2d3b4e, roughness: 0.72, metalness: 0.18 });
-    const glassMat = getSharedStdMat('bh:glass', { color: 0x0b1526, roughness: 0.08, metalness: 0.92 });
-    const capMat = getSharedStdMat('bh:cap', { color: 0x0f172a, roughness: 0.42, metalness: 0.58 });
+      if (opts.hasStep) {
+        const step = new THREE.Mesh(
+          getSharedBoxGeo(w + 0.16, 0.07, 0.2),
+          getSharedStdMat('bdoor:step', { color: 0x334155, roughness: 0.82, metalness: 0.1 }),
+        );
+        step.position.set(0, 0.035, 0.11);
+        step.receiveShadow = true;
+        doorGrp.add(step);
+      }
 
-    const podium = new THREE.Mesh(getSharedBoxGeo(5.9, 3.2, 5.9), podiumMat);
-    podium.position.y = 1.6;
-    podium.castShadow = true;
-    podium.receiveShadow = true;
-    bodyGroup.add(podium);
+      if (opts.hasCanopy) {
+        const canopy = new THREE.Mesh(
+          getSharedBoxGeo(w + 0.38, 0.11, 0.46),
+          frameMat,
+        );
+        canopy.position.set(0, h + 0.08, 0.23);
+        canopy.castShadow = true;
+        doorGrp.add(canopy);
+      }
 
-    const shaft = new THREE.Mesh(getSharedBoxGeo(5.36, 17.2, 5.36), towerMat);
-    shaft.position.y = 11.8;
-    shaft.castShadow = true;
-    shaft.receiveShadow = true;
-    bodyGroup.add(shaft);
+      parent.add(doorGrp);
+    };
 
-    // 6 curtain-wall window tiers
-    const bandGeo = getSharedBoxGeo(5.44, 1.35, 5.44);
-    for (let floor = 0; floor < 6; floor++) {
-      const band = new THREE.Mesh(bandGeo, glassMat);
-      band.position.y = 5.0 + floor * 2.65;
-      bodyGroup.add(band);
-    }
+    if (kind === 'building-kiosk') {
+      // 1-story modern pavilion / cafe (3.8m x 3.8m x 3.8m)
+      const bodyGroup = new THREE.Group();
+      bodyGroup.name = 'buildingBody';
+      group.userData.buildingBody = bodyGroup;
+      group.add(bodyGroup);
 
-    const crown = new THREE.Mesh(getSharedBoxGeo(5.58, 0.5, 5.58), capMat);
-    crown.position.y = 20.65;
-    crown.castShadow = true;
-    bodyGroup.add(crown);
+      const baseMat = getSharedStdMat('bk:base', { color: 0x28313e, roughness: 0.85, metalness: 0.1 });
+      const facadeMat = getSharedStdMat('bk:facade', { color: 0x475569, roughness: 0.78, metalness: 0.08 });
+      const glassMat = getSharedStdMat('bk:glass', { color: 0x0f172a, roughness: 0.08, metalness: 0.88 });
+      const roofMat = getSharedStdMat('bk:roof', { color: 0x1e293b, roughness: 0.5, metalness: 0.42 });
 
-    const mechBox = new THREE.Mesh(getSharedBoxGeo(3.0, 1.1, 3.0), podiumMat);
-    mechBox.position.y = 21.45;
-    mechBox.castShadow = true;
-    bodyGroup.add(mechBox);
-  } else if (kind === 'building-rowhouse') {
-    // 3-bay brick/brownstone rowhouse terrace (9.4m W x 4.6m D x 8.2m H)
-    const bodyGroup = new THREE.Group();
-    bodyGroup.name = 'buildingBody';
-    group.userData.buildingBody = bodyGroup;
-    group.add(bodyGroup);
-
-    let hIdx = 0;
-    for (let i = 0; i < id.length; i++) hIdx = (hIdx * 31 + id.charCodeAt(i)) >>> 0;
-    const bayPalettes = [0x7c3f34, 0x855a44, 0x5c473e, 0x6c4c48, 0x475569];
-    const stoneMat = getSharedStdMat('brh:stone', { color: 0x3b3836, roughness: 0.88, metalness: 0.06 });
-    const trimMat = getSharedStdMat('brh:trim', { color: 0x9ca3af, roughness: 0.72, metalness: 0.08 });
-    const roofMat = getSharedStdMat('brh:roof', { color: 0x1e2430, roughness: 0.68, metalness: 0.2 });
-    const glassMat = getSharedStdMat('brh:glass', {
-      color: 0x17253b,
-      emissive: 0xfbbf24,
-      emissiveIntensity: 0.16,
-      roughness: 0.15,
-      metalness: 0.75,
-    });
-
-    const bayXs = [-3.1, 0, 3.1];
-    const bayHeights = [6.6, 7.1, 6.4];
-    for (let b = 0; b < 3; b++) {
-      const bx = bayXs[b];
-      const bh = bayHeights[b];
-      const cHex = bayPalettes[(hIdx + b) % bayPalettes.length];
-      const wallMat = getSharedStdMat(`brh:wall:${cHex}`, { color: cHex, roughness: 0.84, metalness: 0.04 });
-
-      const plinth = new THREE.Mesh(getSharedBoxGeo(3.06, 0.75, 4.55), stoneMat);
-      plinth.position.set(bx, 0.375, 0);
+      const plinth = new THREE.Mesh(getSharedBoxGeo(3.92, 0.35, 3.92), baseMat);
+      plinth.position.y = 0.175;
       plinth.castShadow = true;
       plinth.receiveShadow = true;
       bodyGroup.add(plinth);
 
-      const bayBody = new THREE.Mesh(getSharedBoxGeo(3.0, bh - 0.75, 4.36), wallMat);
-      bayBody.position.set(bx, 0.75 + (bh - 0.75) * 0.5, 0);
-      bayBody.castShadow = true;
-      bayBody.receiveShadow = true;
-      bodyGroup.add(bayBody);
+      const core = new THREE.Mesh(getSharedBoxGeo(3.64, 2.75, 3.64), facadeMat);
+      core.position.y = 1.725;
+      core.castShadow = true;
+      core.receiveShadow = true;
+      bodyGroup.add(core);
 
-      // Front stoop & doorway
-      const stoop = new THREE.Mesh(getSharedBoxGeo(1.15, 0.55, 0.8), stoneMat);
-      stoop.position.set(bx - 0.65, 0.275, 2.45);
-      stoop.castShadow = true;
-      bodyGroup.add(stoop);
+      const frontGlass = new THREE.Mesh(getSharedBoxGeo(1.72, 1.95, 0.08), glassMat);
+      frontGlass.position.set(-0.68, 1.52, 1.83);
+      bodyGroup.add(frontGlass);
 
-      const cornice = new THREE.Mesh(getSharedBoxGeo(3.14, 0.28, 4.55), trimMat);
-      cornice.position.set(bx, bh + 0.12, 0.04);
+      // Front cafe glazed entry door + rear service door
+      addBuildingDoor(bodyGroup, {
+        x: 0.88,
+        y: 0.35,
+        z: 1.83,
+        width: 0.96,
+        height: 2.15,
+        style: 'glass-metal',
+        hasStep: true,
+      });
+      addBuildingDoor(bodyGroup, {
+        x: 0,
+        y: 0.35,
+        z: -1.83,
+        rotY: Math.PI,
+        width: 0.86,
+        height: 2.05,
+        style: 'steel',
+      });
+
+      const canopy = new THREE.Mesh(getSharedBoxGeo(4.28, 0.24, 4.42), roofMat);
+      canopy.position.set(0, 3.22, 0.2);
+      canopy.castShadow = true;
+      canopy.receiveShadow = true;
+      bodyGroup.add(canopy);
+
+      const roofUnit = new THREE.Mesh(getSharedBoxGeo(1.3, 0.44, 1.1), baseMat);
+      roofUnit.position.set(-0.6, 3.56, -0.4);
+      roofUnit.castShadow = true;
+      bodyGroup.add(roofUnit);
+    } else if (kind === 'building-small') {
+      // 2-story storefront / townhouse building (4.4m x 4.4m x 6.3m)
+      const bodyGroup = new THREE.Group();
+      bodyGroup.name = 'buildingBody';
+      group.userData.buildingBody = bodyGroup;
+      group.add(bodyGroup);
+
+      const plinthMat = getSharedStdMat('bs:plinth', { color: 0x28313e, roughness: 0.88, metalness: 0.08 });
+      const facadeMat = getSharedStdMat('bs:facade', { color: 0x475569, roughness: 0.82, metalness: 0.06 });
+      const trimMat = getSharedStdMat('bs:trim', { color: 0x1e293b, roughness: 0.55, metalness: 0.35 });
+      const glassMat = getSharedStdMat('bs:glass', { color: 0x0f172a, roughness: 0.08, metalness: 0.88 });
+      const awningMat = getSharedStdMat('bs:awning', { color: 0x9a3412, roughness: 0.68, metalness: 0.1 });
+
+      const plinth = new THREE.Mesh(getSharedBoxGeo(4.56, 0.55, 4.56), plinthMat);
+      plinth.position.y = 0.275;
+      plinth.castShadow = true;
+      plinth.receiveShadow = true;
+      bodyGroup.add(plinth);
+
+      const body = new THREE.Mesh(getSharedBoxGeo(4.36, 5.4, 4.36), facadeMat);
+      body.position.y = 3.25;
+      body.castShadow = true;
+      body.receiveShadow = true;
+      bodyGroup.add(body);
+
+      // Ground storefront window bay + shop entry door under awning facing +Z
+      const storeGlass = new THREE.Mesh(getSharedBoxGeo(2.05, 1.85, 0.08), glassMat);
+      storeGlass.position.set(-0.56, 1.5, 2.18);
+      bodyGroup.add(storeGlass);
+
+      addBuildingDoor(bodyGroup, {
+        x: 1.08,
+        y: 0.55,
+        z: 2.19,
+        width: 0.96,
+        height: 1.96,
+        style: 'wood',
+        hasStep: true,
+        leafColorHex: 0x7c2d12,
+      });
+      addBuildingDoor(bodyGroup, {
+        x: 0,
+        y: 0.55,
+        z: -2.19,
+        rotY: Math.PI,
+        width: 0.92,
+        height: 2.05,
+        style: 'wood',
+        hasStep: true,
+      });
+
+      const awning = new THREE.Mesh(getSharedBoxGeo(3.5, 0.16, 0.95), awningMat);
+      awning.position.set(0, 2.55, 2.55);
+      awning.rotation.x = 0.22;
+      awning.castShadow = true;
+      bodyGroup.add(awning);
+
+      // Upper floor windows on front & back
+      const upperWinGeo = getSharedBoxGeo(0.76, 1.25, 0.08);
+      for (const wx of [-1.25, 0, 1.25]) {
+        const winF = new THREE.Mesh(upperWinGeo, glassMat);
+        winF.position.set(wx, 4.4, 2.18);
+        bodyGroup.add(winF);
+
+        const winB = new THREE.Mesh(upperWinGeo, glassMat);
+        winB.position.set(wx, 4.4, -2.18);
+        bodyGroup.add(winB);
+      }
+
+      const cornice = new THREE.Mesh(getSharedBoxGeo(4.64, 0.34, 4.64), trimMat);
+      cornice.position.y = 6.12;
       cornice.castShadow = true;
       bodyGroup.add(cornice);
+    } else if (kind === 'building-tall') {
+      // 4-story mid-rise architectural tower (5.2m x 5.2m x 11.6m)
+      const bodyGroup = new THREE.Group();
+      bodyGroup.name = 'buildingBody';
+      group.userData.buildingBody = bodyGroup;
+      group.add(bodyGroup);
 
-      // Pitched slate mansard/gable crown
-      const roofSlope = new THREE.Mesh(getSharedBoxGeo(2.96, 1.05, 4.18), roofMat);
-      roofSlope.position.set(bx, bh + 0.72, -0.05);
-      roofSlope.castShadow = true;
-      bodyGroup.add(roofSlope);
+      const baseMat = getSharedStdMat('bt:base', { color: 0x1e293b, roughness: 0.72, metalness: 0.22 });
+      const towerMat = getSharedStdMat('bt:tower', { color: 0x334155, roughness: 0.76, metalness: 0.15 });
+      const glassMat = getSharedStdMat('bt:glass', { color: 0x0c1629, roughness: 0.08, metalness: 0.9 });
+      const capMat = getSharedStdMat('bt:cap', { color: 0x0f172a, roughness: 0.45, metalness: 0.55 });
 
-      // Windows on 2 upper tiers + ground parlor
-      for (const wy of [1.85, 3.85, 5.65]) {
-        if (wy > bh - 0.4) continue;
-        for (const wxOff of [-0.68, 0.68]) {
-          const wF = new THREE.Mesh(getSharedBoxGeo(0.68, 1.12, 0.08), glassMat);
-          wF.position.set(bx + wxOff, wy, 2.19);
-          bodyGroup.add(wF);
-          const wB = new THREE.Mesh(getSharedBoxGeo(0.68, 1.12, 0.08), glassMat);
-          wB.position.set(bx + wxOff, wy, -2.19);
-          bodyGroup.add(wB);
+      const lobby = new THREE.Mesh(getSharedBoxGeo(5.36, 2.2, 5.36), baseMat);
+      lobby.position.y = 1.1;
+      lobby.castShadow = true;
+      lobby.receiveShadow = true;
+      bodyGroup.add(lobby);
+
+      // Front & rear glazed double lobby portals
+      addBuildingDoor(bodyGroup, {
+        x: 0,
+        y: 0,
+        z: 2.68,
+        width: 2.05,
+        height: 2.1,
+        style: 'glass-metal',
+        doubleLeaf: true,
+        hasCanopy: true,
+        hasStep: true,
+      });
+      addBuildingDoor(bodyGroup, {
+        x: 0,
+        y: 0,
+        z: -2.68,
+        rotY: Math.PI,
+        width: 1.75,
+        height: 2.05,
+        style: 'glass-metal',
+        doubleLeaf: true,
+        hasStep: true,
+      });
+
+      const core = new THREE.Mesh(getSharedBoxGeo(5.04, 8.2, 5.04), towerMat);
+      core.position.y = 6.3;
+      core.castShadow = true;
+      core.receiveShadow = true;
+      bodyGroup.add(core);
+
+      // 3 horizontal curtain glass bands
+      const bandGeo = getSharedBoxGeo(5.12, 1.15, 5.12);
+      for (const wy of [4.0, 6.4, 8.8]) {
+        const glassBand = new THREE.Mesh(bandGeo, glassMat);
+        glassBand.position.y = wy;
+        bodyGroup.add(glassBand);
+      }
+
+      const parapet = new THREE.Mesh(getSharedBoxGeo(5.3, 0.36, 5.3), capMat);
+      parapet.position.y = 10.58;
+      parapet.castShadow = true;
+      bodyGroup.add(parapet);
+
+      const penthouse = new THREE.Mesh(getSharedBoxGeo(2.4, 0.85, 2.4), baseMat);
+      penthouse.position.y = 11.18;
+      penthouse.castShadow = true;
+      bodyGroup.add(penthouse);
+    } else if (kind === 'building-highrise') {
+      // 8-story high-rise tower (5.6m x 5.6m x 22.0m)
+      const bodyGroup = new THREE.Group();
+      bodyGroup.name = 'buildingBody';
+      group.userData.buildingBody = bodyGroup;
+      group.add(bodyGroup);
+
+      const podiumMat = getSharedStdMat('bh:podium', { color: 0x1e293b, roughness: 0.7, metalness: 0.25 });
+      const towerMat = getSharedStdMat('bh:tower', { color: 0x2d3b4e, roughness: 0.72, metalness: 0.18 });
+      const glassMat = getSharedStdMat('bh:glass', { color: 0x0b1526, roughness: 0.08, metalness: 0.92 });
+      const capMat = getSharedStdMat('bh:cap', { color: 0x0f172a, roughness: 0.42, metalness: 0.58 });
+
+      const podium = new THREE.Mesh(getSharedBoxGeo(5.9, 3.2, 5.9), podiumMat);
+      podium.position.y = 1.6;
+      podium.castShadow = true;
+      podium.receiveShadow = true;
+      bodyGroup.add(podium);
+
+      // Main & rear high-rise glass lobby entrances
+      addBuildingDoor(bodyGroup, {
+        x: 0,
+        y: 0,
+        z: 2.95,
+        width: 2.35,
+        height: 2.65,
+        style: 'glass-metal',
+        doubleLeaf: true,
+        hasCanopy: true,
+        hasStep: true,
+      });
+      addBuildingDoor(bodyGroup, {
+        x: 0,
+        y: 0,
+        z: -2.95,
+        rotY: Math.PI,
+        width: 1.95,
+        height: 2.4,
+        style: 'glass-metal',
+        doubleLeaf: true,
+        hasStep: true,
+      });
+
+      const shaft = new THREE.Mesh(getSharedBoxGeo(5.36, 17.2, 5.36), towerMat);
+      shaft.position.y = 11.8;
+      shaft.castShadow = true;
+      shaft.receiveShadow = true;
+      bodyGroup.add(shaft);
+
+      // 6 curtain-wall window tiers
+      const bandGeo = getSharedBoxGeo(5.44, 1.35, 5.44);
+      for (let floor = 0; floor < 6; floor++) {
+        const band = new THREE.Mesh(bandGeo, glassMat);
+        band.position.y = 5.0 + floor * 2.65;
+        bodyGroup.add(band);
+      }
+
+      const crown = new THREE.Mesh(getSharedBoxGeo(5.58, 0.5, 5.58), capMat);
+      crown.position.y = 20.65;
+      crown.castShadow = true;
+      bodyGroup.add(crown);
+
+      const mechBox = new THREE.Mesh(getSharedBoxGeo(3.0, 1.1, 3.0), podiumMat);
+      mechBox.position.y = 21.45;
+      mechBox.castShadow = true;
+      bodyGroup.add(mechBox);
+    } else if (kind === 'building-rowhouse') {
+      // 3-bay brick/brownstone rowhouse terrace (9.4m W x 4.6m D x 8.2m H)
+      const bodyGroup = new THREE.Group();
+      bodyGroup.name = 'buildingBody';
+      group.userData.buildingBody = bodyGroup;
+      group.add(bodyGroup);
+
+      let hIdx = 0;
+      for (let i = 0; i < id.length; i++) hIdx = (hIdx * 31 + id.charCodeAt(i)) >>> 0;
+      const bayPalettes = [0x7c3f34, 0x855a44, 0x5c473e, 0x6c4c48, 0x475569];
+      const doorPalettes = [0x2a1810, 0x1e3a2f, 0x1e293b, 0x5c231c, 0x3b2f26];
+      const stoneMat = getSharedStdMat('brh:stone', { color: 0x3b3836, roughness: 0.88, metalness: 0.06 });
+      const trimMat = getSharedStdMat('brh:trim', { color: 0x9ca3af, roughness: 0.72, metalness: 0.08 });
+      const roofMat = getSharedStdMat('brh:roof', { color: 0x1e2430, roughness: 0.68, metalness: 0.2 });
+      const glassMat = getSharedStdMat('brh:glass', {
+        color: 0x17253b,
+        emissive: 0xfbbf24,
+        emissiveIntensity: 0.16,
+        roughness: 0.15,
+        metalness: 0.75,
+      });
+
+      const bayXs = [-3.1, 0, 3.1];
+      const bayHeights = [6.6, 7.1, 6.4];
+      for (let b = 0; b < 3; b++) {
+        const bx = bayXs[b];
+        const bh = bayHeights[b];
+        const cHex = bayPalettes[(hIdx + b) % bayPalettes.length];
+        const doorHex = doorPalettes[(hIdx + b) % doorPalettes.length];
+        const wallMat = getSharedStdMat(`brh:wall:${cHex}`, { color: cHex, roughness: 0.84, metalness: 0.04 });
+
+        const plinth = new THREE.Mesh(getSharedBoxGeo(3.06, 0.75, 4.55), stoneMat);
+        plinth.position.set(bx, 0.375, 0);
+        plinth.castShadow = true;
+        plinth.receiveShadow = true;
+        bodyGroup.add(plinth);
+
+        const bayBody = new THREE.Mesh(getSharedBoxGeo(3.0, bh - 0.75, 4.36), wallMat);
+        bayBody.position.set(bx, 0.75 + (bh - 0.75) * 0.5, 0);
+        bayBody.castShadow = true;
+        bayBody.receiveShadow = true;
+        bodyGroup.add(bayBody);
+
+        // Front stoop, entry steps, & brownstone doorway
+        const stoop = new THREE.Mesh(getSharedBoxGeo(1.15, 0.55, 0.8), stoneMat);
+        stoop.position.set(bx - 0.65, 0.275, 2.45);
+        stoop.castShadow = true;
+        bodyGroup.add(stoop);
+
+        addBuildingDoor(bodyGroup, {
+          x: bx - 0.65,
+          y: 0.55,
+          z: 2.19,
+          width: 0.94,
+          height: 2.02,
+          style: 'wood',
+          hasCanopy: true,
+          leafColorHex: doorHex,
+        });
+        addBuildingDoor(bodyGroup, {
+          x: bx - 0.65,
+          y: 0.75,
+          z: -2.19,
+          rotY: Math.PI,
+          width: 0.88,
+          height: 1.96,
+          style: 'wood',
+          leafColorHex: doorHex,
+        });
+
+        const cornice = new THREE.Mesh(getSharedBoxGeo(3.14, 0.28, 4.55), trimMat);
+        cornice.position.set(bx, bh + 0.12, 0.04);
+        cornice.castShadow = true;
+        bodyGroup.add(cornice);
+
+        // Pitched slate mansard/gable crown
+        const roofSlope = new THREE.Mesh(getSharedBoxGeo(2.96, 1.05, 4.18), roofMat);
+        roofSlope.position.set(bx, bh + 0.72, -0.05);
+        roofSlope.castShadow = true;
+        bodyGroup.add(roofSlope);
+
+        // Windows on 2 upper tiers + ground parlor right side
+        for (const wy of [1.85, 3.85, 5.65]) {
+          if (wy > bh - 0.4) continue;
+          for (const wxOff of [-0.68, 0.68]) {
+            if (wy === 1.85 && wxOff < 0) continue;
+            const wF = new THREE.Mesh(getSharedBoxGeo(0.68, 1.12, 0.08), glassMat);
+            wF.position.set(bx + wxOff, wy, 2.19);
+            bodyGroup.add(wF);
+            const wB = new THREE.Mesh(getSharedBoxGeo(0.68, 1.12, 0.08), glassMat);
+            wB.position.set(bx + wxOff, wy, -2.19);
+            bodyGroup.add(wB);
+          }
         }
       }
-    }
-  } else if (kind === 'building-commercial') {
-    // Wide modern retail plaza strip (10.6m W x 4.8m D x 4.8m H)
-    const bodyGroup = new THREE.Group();
-    bodyGroup.name = 'buildingBody';
-    group.userData.buildingBody = bodyGroup;
-    group.add(bodyGroup);
+    } else if (kind === 'building-commercial') {
+      // Wide modern retail plaza strip (10.6m W x 4.8m D x 4.8m H)
+      const bodyGroup = new THREE.Group();
+      bodyGroup.name = 'buildingBody';
+      group.userData.buildingBody = bodyGroup;
+      group.add(bodyGroup);
 
-    const wallMat = getSharedStdMat('bcm:wall', { color: 0x3b4454, roughness: 0.74, metalness: 0.14 });
-    const woodMat = getSharedStdMat('bcm:wood', { color: 0x7c5338, roughness: 0.76, metalness: 0.04 });
-    const steelMat = getSharedStdMat('bcm:steel', { color: 0x1e293b, roughness: 0.42, metalness: 0.65 });
-    const glassMat = getSharedStdMat('bcm:glass', {
-      color: 0x162940,
-      emissive: 0xfde68a,
-      emissiveIntensity: 0.24,
-      roughness: 0.1,
-      metalness: 0.82,
-    });
+      const wallMat = getSharedStdMat('bcm:wall', { color: 0x3b4454, roughness: 0.74, metalness: 0.14 });
+      const woodMat = getSharedStdMat('bcm:wood', { color: 0x7c5338, roughness: 0.76, metalness: 0.04 });
+      const steelMat = getSharedStdMat('bcm:steel', { color: 0x1e293b, roughness: 0.42, metalness: 0.65 });
+      const glassMat = getSharedStdMat('bcm:glass', {
+        color: 0x162940,
+        emissive: 0xfde68a,
+        emissiveIntensity: 0.24,
+        roughness: 0.1,
+        metalness: 0.82,
+      });
 
-    const slab = new THREE.Mesh(getSharedBoxGeo(10.6, 0.3, 4.8), steelMat);
-    slab.position.y = 0.15;
-    slab.castShadow = true;
-    slab.receiveShadow = true;
-    bodyGroup.add(slab);
+      const slab = new THREE.Mesh(getSharedBoxGeo(10.6, 0.3, 4.8), steelMat);
+      slab.position.y = 0.15;
+      slab.castShadow = true;
+      slab.receiveShadow = true;
+      bodyGroup.add(slab);
 
-    const core = new THREE.Mesh(getSharedBoxGeo(10.2, 3.9, 4.3), wallMat);
-    core.position.set(0, 2.25, -0.1);
-    core.castShadow = true;
-    core.receiveShadow = true;
-    bodyGroup.add(core);
+      const core = new THREE.Mesh(getSharedBoxGeo(10.2, 3.9, 4.3), wallMat);
+      core.position.set(0, 2.25, -0.1);
+      core.castShadow = true;
+      core.receiveShadow = true;
+      bodyGroup.add(core);
 
-    // 3 wide retail storefront bays + timber piers
-    for (const sx of [-3.3, 0, 3.3]) {
-      const bayGlass = new THREE.Mesh(getSharedBoxGeo(2.65, 2.55, 0.1), glassMat);
-      bayGlass.position.set(sx, 1.65, 2.06);
-      bodyGroup.add(bayGlass);
+      // 3 wide retail storefront bays + glass entry doors
+      for (const sx of [-3.3, 0, 3.3]) {
+        const bayGlass = new THREE.Mesh(getSharedBoxGeo(1.55, 2.45, 0.1), glassMat);
+        bayGlass.position.set(sx - 0.55, 1.6, 2.06);
+        bodyGroup.add(bayGlass);
 
-      const signPanel = new THREE.Mesh(getSharedBoxGeo(2.5, 0.42, 0.12), woodMat);
-      signPanel.position.set(sx, 3.45, 2.1);
-      bodyGroup.add(signPanel);
-    }
+        addBuildingDoor(bodyGroup, {
+          x: sx + 0.78,
+          y: 0.3,
+          z: 2.07,
+          width: 0.98,
+          height: 2.25,
+          style: 'glass-metal',
+          hasStep: true,
+        });
 
-    // Overhanging cantilevered canopy
-    const canopy = new THREE.Mesh(getSharedBoxGeo(10.6, 0.22, 1.35), woodMat);
-    canopy.position.set(0, 3.12, 2.45);
-    canopy.castShadow = true;
-    bodyGroup.add(canopy);
-
-    const fascia = new THREE.Mesh(getSharedBoxGeo(10.68, 0.42, 4.56), steelMat);
-    fascia.position.set(0, 4.35, -0.05);
-    fascia.castShadow = true;
-    bodyGroup.add(fascia);
-
-    const hvac = new THREE.Mesh(getSharedBoxGeo(2.8, 0.55, 1.8), steelMat);
-    hvac.position.set(-2.2, 4.78, -0.4);
-    hvac.castShadow = true;
-    bodyGroup.add(hvac);
-  } else if (kind === 'building-warehouse') {
-    // Industrial brick & steel hall with sawtooth skylight bays (10.2m W x 6.4m D x 7.4m H)
-    const bodyGroup = new THREE.Group();
-    bodyGroup.name = 'buildingBody';
-    group.userData.buildingBody = bodyGroup;
-    group.add(bodyGroup);
-
-    const brickMat = getSharedStdMat('bwh:brick', { color: 0x6b3a32, roughness: 0.88, metalness: 0.04 });
-    const steelMat = getSharedStdMat('bwh:steel', { color: 0x263242, roughness: 0.52, metalness: 0.55 });
-    const doorMat = getSharedStdMat('bwh:door', { color: 0x475569, roughness: 0.58, metalness: 0.48 });
-    const skyGlassMat = getSharedStdMat('bwh:glass', {
-      color: 0x1e293b,
-      emissive: 0xfef3c7,
-      emissiveIntensity: 0.18,
-      roughness: 0.16,
-      metalness: 0.72,
-    });
-
-    const base = new THREE.Mesh(getSharedBoxGeo(10.3, 0.55, 6.4), steelMat);
-    base.position.y = 0.275;
-    base.castShadow = true;
-    base.receiveShadow = true;
-    bodyGroup.add(base);
-
-    const hall = new THREE.Mesh(getSharedBoxGeo(10.0, 5.2, 6.0), brickMat);
-    hall.position.y = 3.15;
-    hall.castShadow = true;
-    hall.receiveShadow = true;
-    bodyGroup.add(hall);
-
-    // Exterior steel pilasters
-    for (const px of [-4.6, -1.55, 1.55, 4.6]) {
-      const pilaster = new THREE.Mesh(getSharedBoxGeo(0.32, 5.3, 6.22), steelMat);
-      pilaster.position.set(px, 3.18, 0);
-      pilaster.castShadow = true;
-      bodyGroup.add(pilaster);
-    }
-
-    // Loading dock bays on front
-    for (const dx of [-3.1, 0]) {
-      const dock = new THREE.Mesh(getSharedBoxGeo(2.3, 2.8, 0.14), doorMat);
-      dock.position.set(dx, 1.95, 3.02);
-      bodyGroup.add(dock);
-    }
-
-    // Upper clerestory industrial windows
-    for (const wx of [-3.1, 0, 3.1]) {
-      const cWin = new THREE.Mesh(getSharedBoxGeo(2.3, 1.05, 0.1), skyGlassMat);
-      cWin.position.set(wx, 4.55, 3.02);
-      bodyGroup.add(cWin);
-      const cWinB = new THREE.Mesh(getSharedBoxGeo(2.3, 1.05, 0.1), skyGlassMat);
-      cWinB.position.set(wx, 4.55, -3.02);
-      bodyGroup.add(cWinB);
-    }
-
-    // 3-bay sawtooth industrial roof ridges
-    for (const sx of [-3.2, 0, 3.2]) {
-      const ridge = new THREE.Mesh(getSharedBoxGeo(2.9, 1.55, 5.8), steelMat);
-      ridge.position.set(sx, 6.45, 0);
-      ridge.rotation.z = 0.22;
-      ridge.castShadow = true;
-      bodyGroup.add(ridge);
-
-      const skylight = new THREE.Mesh(getSharedBoxGeo(0.14, 1.1, 5.4), skyGlassMat);
-      skylight.position.set(sx + 1.38, 6.45, 0);
-      bodyGroup.add(skylight);
-    }
-  } else if (kind === 'building-civic') {
-    // Neoclassical limestone civic hall with colonnade & cupola (10.4m W x 6.8m D x 10.4m H)
-    const bodyGroup = new THREE.Group();
-    bodyGroup.name = 'buildingBody';
-    group.userData.buildingBody = bodyGroup;
-    group.add(bodyGroup);
-
-    const stoneMat = getSharedStdMat('bcv:stone', { color: 0x8f887d, roughness: 0.8, metalness: 0.06 });
-    const darkStoneMat = getSharedStdMat('bcv:dark', { color: 0x474540, roughness: 0.85, metalness: 0.08 });
-    const roofMat = getSharedStdMat('bcv:roof', { color: 0x283546, roughness: 0.55, metalness: 0.35 });
-    const glassMat = getSharedStdMat('bcv:glass', {
-      color: 0x162436,
-      emissive: 0xfde68a,
-      emissiveIntensity: 0.2,
-      roughness: 0.14,
-      metalness: 0.78,
-    });
-
-    // Grand entrance steps / podium
-    const step1 = new THREE.Mesh(getSharedBoxGeo(10.4, 0.42, 6.8), darkStoneMat);
-    step1.position.y = 0.21;
-    step1.castShadow = true;
-    step1.receiveShadow = true;
-    bodyGroup.add(step1);
-
-    const step2 = new THREE.Mesh(getSharedBoxGeo(9.8, 0.42, 6.1), stoneMat);
-    step2.position.y = 0.63;
-    step2.castShadow = true;
-    step2.receiveShadow = true;
-    bodyGroup.add(step2);
-
-    // Main civic mass
-    const hall = new THREE.Mesh(getSharedBoxGeo(9.4, 6.6, 4.9), stoneMat);
-    hall.position.set(0, 4.14, -0.35);
-    hall.castShadow = true;
-    hall.receiveShadow = true;
-    bodyGroup.add(hall);
-
-    // Front classical colonnade pillars
-    const colGeo = getSharedCylinderGeo(0.24, 0.28, 6.3, 12);
-    for (const cx of [-3.9, -2.35, -0.8, 0.8, 2.35, 3.9]) {
-      const col = new THREE.Mesh(colGeo, stoneMat);
-      col.position.set(cx, 3.99, 2.52);
-      col.castShadow = true;
-      col.receiveShadow = true;
-      bodyGroup.add(col);
-    }
-
-    // Tall recessed civic windows
-    for (const wx of [-3.1, -1.55, 0, 1.55, 3.1]) {
-      const winF = new THREE.Mesh(getSharedBoxGeo(0.85, 3.6, 0.12), glassMat);
-      winF.position.set(wx, 4.2, 2.12);
-      bodyGroup.add(winF);
-      const winB = new THREE.Mesh(getSharedBoxGeo(0.85, 3.6, 0.12), glassMat);
-      winB.position.set(wx, 4.2, -2.82);
-      bodyGroup.add(winB);
-    }
-
-    // Entablature & stepped pediment roof
-    const entablature = new THREE.Mesh(getSharedBoxGeo(10.0, 0.72, 6.0), stoneMat);
-    entablature.position.set(0, 7.6, -0.05);
-    entablature.castShadow = true;
-    bodyGroup.add(entablature);
-
-    const roofTier = new THREE.Mesh(getSharedBoxGeo(8.8, 0.85, 4.8), roofMat);
-    roofTier.position.set(0, 8.38, -0.15);
-    roofTier.castShadow = true;
-    bodyGroup.add(roofTier);
-
-    const cupolaBase = new THREE.Mesh(getSharedCylinderGeo(1.15, 1.28, 1.15, 16), stoneMat);
-    cupolaBase.position.set(0, 9.35, -0.2);
-    cupolaBase.castShadow = true;
-    bodyGroup.add(cupolaBase);
-
-    const cupolaDome = new THREE.Mesh(
-      sharedGeo('civicDome', () => new THREE.SphereGeometry(1.12, 16, 10, 0, Math.PI * 2, 0, Math.PI * 0.55)),
-      roofMat,
-    );
-    cupolaDome.position.set(0, 9.88, -0.2);
-    cupolaDome.castShadow = true;
-    bodyGroup.add(cupolaDome);
-  } else if (kind === 'building-apartments') {
-    // Stepped L-wing mid-rise apartment complex with balconies (9.0m W x 7.0m D x 15.2m H)
-    const bodyGroup = new THREE.Group();
-    bodyGroup.name = 'buildingBody';
-    group.userData.buildingBody = bodyGroup;
-    group.add(bodyGroup);
-
-    const podiumMat = getSharedStdMat('bap:podium', { color: 0x262e3d, roughness: 0.78, metalness: 0.16 });
-    const facadeMat = getSharedStdMat('bap:facade', { color: 0x6a6e75, roughness: 0.76, metalness: 0.08 });
-    const wingMat = getSharedStdMat('bap:wing', { color: 0x4b5563, roughness: 0.74, metalness: 0.12 });
-    const balcMat = getSharedStdMat('bap:balc', { color: 0x1e293b, roughness: 0.55, metalness: 0.4 });
-    const glassMat = getSharedStdMat('bap:glass', {
-      color: 0x111c2d,
-      emissive: 0xfef08a,
-      emissiveIntensity: 0.15,
-      roughness: 0.12,
-      metalness: 0.85,
-    });
-
-    // Ground commercial podium
-    const podium = new THREE.Mesh(getSharedBoxGeo(9.0, 2.5, 6.8), podiumMat);
-    podium.position.y = 1.25;
-    podium.castShadow = true;
-    podium.receiveShadow = true;
-    bodyGroup.add(podium);
-
-    // Tall main L-spine wing (15.2m)
-    const mainWing = new THREE.Mesh(getSharedBoxGeo(8.6, 11.8, 3.6), facadeMat);
-    mainWing.position.set(0, 8.4, -1.4);
-    mainWing.castShadow = true;
-    mainWing.receiveShadow = true;
-    bodyGroup.add(mainWing);
-
-    // Lower forward projecting wing (10.6m)
-    const sideWing = new THREE.Mesh(getSharedBoxGeo(4.0, 8.2, 3.4), wingMat);
-    sideWing.position.set(-2.3, 6.6, 1.5);
-    sideWing.castShadow = true;
-    sideWing.receiveShadow = true;
-    bodyGroup.add(sideWing);
-
-    // Projecting balcony slabs + window bands
-    for (let fl = 0; fl < 4; fl++) {
-      const fy = 4.2 + fl * 2.55;
-      const winBand = new THREE.Mesh(getSharedBoxGeo(8.72, 1.15, 3.72), glassMat);
-      winBand.position.set(0, fy, -1.4);
-      bodyGroup.add(winBand);
-
-      const balc = new THREE.Mesh(getSharedBoxGeo(3.8, 0.2, 0.9), balcMat);
-      balc.position.set(2.1, fy - 0.58, 0.8);
-      balc.castShadow = true;
-      bodyGroup.add(balc);
-
-      if (fl < 3) {
-        const wingGlass = new THREE.Mesh(getSharedBoxGeo(4.12, 1.1, 3.52), glassMat);
-        wingGlass.position.set(-2.3, fy, 1.5);
-        bodyGroup.add(wingGlass);
+        const signPanel = new THREE.Mesh(getSharedBoxGeo(2.5, 0.42, 0.12), woodMat);
+        signPanel.position.set(sx, 3.45, 2.1);
+        bodyGroup.add(signPanel);
       }
+
+      // Rear service exit door
+      addBuildingDoor(bodyGroup, {
+        x: 2.4,
+        y: 0.3,
+        z: -2.26,
+        rotY: Math.PI,
+        width: 0.95,
+        height: 2.15,
+        style: 'steel',
+        hasStep: true,
+      });
+
+      // Overhanging cantilevered canopy
+      const canopy = new THREE.Mesh(getSharedBoxGeo(10.6, 0.22, 1.35), woodMat);
+      canopy.position.set(0, 3.12, 2.45);
+      canopy.castShadow = true;
+      bodyGroup.add(canopy);
+
+      const fascia = new THREE.Mesh(getSharedBoxGeo(10.68, 0.42, 4.56), steelMat);
+      fascia.position.set(0, 4.35, -0.05);
+      fascia.castShadow = true;
+      bodyGroup.add(fascia);
+
+      const hvac = new THREE.Mesh(getSharedBoxGeo(2.8, 0.55, 1.8), steelMat);
+      hvac.position.set(-2.2, 4.78, -0.4);
+      hvac.castShadow = true;
+      bodyGroup.add(hvac);
+    } else if (kind === 'building-warehouse') {
+      // Industrial brick & steel hall with sawtooth skylight bays (10.2m W x 6.4m D x 7.4m H)
+      const bodyGroup = new THREE.Group();
+      bodyGroup.name = 'buildingBody';
+      group.userData.buildingBody = bodyGroup;
+      group.add(bodyGroup);
+
+      const brickMat = getSharedStdMat('bwh:brick', { color: 0x6b3a32, roughness: 0.88, metalness: 0.04 });
+      const steelMat = getSharedStdMat('bwh:steel', { color: 0x263242, roughness: 0.52, metalness: 0.55 });
+      const doorMat = getSharedStdMat('bwh:door', { color: 0x475569, roughness: 0.58, metalness: 0.48 });
+      const skyGlassMat = getSharedStdMat('bwh:glass', {
+        color: 0x1e293b,
+        emissive: 0xfef3c7,
+        emissiveIntensity: 0.18,
+        roughness: 0.16,
+        metalness: 0.72,
+      });
+
+      const base = new THREE.Mesh(getSharedBoxGeo(10.3, 0.55, 6.4), steelMat);
+      base.position.y = 0.275;
+      base.castShadow = true;
+      base.receiveShadow = true;
+      bodyGroup.add(base);
+
+      const hall = new THREE.Mesh(getSharedBoxGeo(10.0, 5.2, 6.0), brickMat);
+      hall.position.y = 3.15;
+      hall.castShadow = true;
+      hall.receiveShadow = true;
+      bodyGroup.add(hall);
+
+      // Exterior steel pilasters
+      for (const px of [-4.6, -1.55, 1.55, 4.6]) {
+        const pilaster = new THREE.Mesh(getSharedBoxGeo(0.32, 5.3, 6.22), steelMat);
+        pilaster.position.set(px, 3.18, 0);
+        pilaster.castShadow = true;
+        bodyGroup.add(pilaster);
+      }
+
+      // Loading dock bays on front + front & rear steel personnel doors
+      for (const dx of [-3.1, 0]) {
+        const dock = new THREE.Mesh(getSharedBoxGeo(2.3, 2.8, 0.14), doorMat);
+        dock.position.set(dx, 1.95, 3.02);
+        bodyGroup.add(dock);
+      }
+      addBuildingDoor(bodyGroup, {
+        x: 3.1,
+        y: 0.55,
+        z: 3.02,
+        width: 1.05,
+        height: 2.2,
+        style: 'steel',
+        hasCanopy: true,
+        hasStep: true,
+      });
+      addBuildingDoor(bodyGroup, {
+        x: -3.1,
+        y: 0.55,
+        z: -3.02,
+        rotY: Math.PI,
+        width: 1.0,
+        height: 2.15,
+        style: 'steel',
+        hasCanopy: true,
+        hasStep: true,
+      });
+
+      // Upper clerestory industrial windows
+      for (const wx of [-3.1, 0, 3.1]) {
+        const cWin = new THREE.Mesh(getSharedBoxGeo(2.3, 1.05, 0.1), skyGlassMat);
+        cWin.position.set(wx, 4.55, 3.02);
+        bodyGroup.add(cWin);
+        const cWinB = new THREE.Mesh(getSharedBoxGeo(2.3, 1.05, 0.1), skyGlassMat);
+        cWinB.position.set(wx, 4.55, -3.02);
+        bodyGroup.add(cWinB);
+      }
+
+      // 3-bay sawtooth industrial roof ridges
+      for (const sx of [-3.2, 0, 3.2]) {
+        const ridge = new THREE.Mesh(getSharedBoxGeo(2.9, 1.55, 5.8), steelMat);
+        ridge.position.set(sx, 6.45, 0);
+        ridge.rotation.z = 0.22;
+        ridge.castShadow = true;
+        bodyGroup.add(ridge);
+
+        const skylight = new THREE.Mesh(getSharedBoxGeo(0.14, 1.1, 5.4), skyGlassMat);
+        skylight.position.set(sx + 1.38, 6.45, 0);
+        bodyGroup.add(skylight);
+      }
+    } else if (kind === 'building-civic') {
+      // Neoclassical limestone civic hall with colonnade & cupola (10.4m W x 6.8m D x 10.4m H)
+      const bodyGroup = new THREE.Group();
+      bodyGroup.name = 'buildingBody';
+      group.userData.buildingBody = bodyGroup;
+      group.add(bodyGroup);
+
+      const stoneMat = getSharedStdMat('bcv:stone', { color: 0x8f887d, roughness: 0.8, metalness: 0.06 });
+      const darkStoneMat = getSharedStdMat('bcv:dark', { color: 0x474540, roughness: 0.85, metalness: 0.08 });
+      const roofMat = getSharedStdMat('bcv:roof', { color: 0x283546, roughness: 0.55, metalness: 0.35 });
+      const glassMat = getSharedStdMat('bcv:glass', {
+        color: 0x162436,
+        emissive: 0xfde68a,
+        emissiveIntensity: 0.2,
+        roughness: 0.14,
+        metalness: 0.78,
+      });
+
+      // Grand entrance steps / podium
+      const step1 = new THREE.Mesh(getSharedBoxGeo(10.4, 0.42, 6.8), darkStoneMat);
+      step1.position.y = 0.21;
+      step1.castShadow = true;
+      step1.receiveShadow = true;
+      bodyGroup.add(step1);
+
+      const step2 = new THREE.Mesh(getSharedBoxGeo(9.8, 0.42, 6.1), stoneMat);
+      step2.position.y = 0.63;
+      step2.castShadow = true;
+      step2.receiveShadow = true;
+      bodyGroup.add(step2);
+
+      // Main civic mass
+      const hall = new THREE.Mesh(getSharedBoxGeo(9.4, 6.6, 4.9), stoneMat);
+      hall.position.set(0, 4.14, -0.35);
+      hall.castShadow = true;
+      hall.receiveShadow = true;
+      bodyGroup.add(hall);
+
+      // Grand front & rear bronze civic double portals
+      addBuildingDoor(bodyGroup, {
+        x: 0,
+        y: 0.84,
+        z: 2.11,
+        width: 1.48,
+        height: 2.6,
+        style: 'civic-bronze',
+        doubleLeaf: true,
+        hasCanopy: true,
+      });
+      addBuildingDoor(bodyGroup, {
+        x: 0,
+        y: 0.84,
+        z: -2.81,
+        rotY: Math.PI,
+        width: 1.35,
+        height: 2.4,
+        style: 'civic-bronze',
+        doubleLeaf: true,
+      });
+
+      // Front classical colonnade pillars
+      const colGeo = getSharedCylinderGeo(0.24, 0.28, 6.3, 12);
+      for (const cx of [-3.9, -2.35, -0.8, 0.8, 2.35, 3.9]) {
+        const col = new THREE.Mesh(colGeo, stoneMat);
+        col.position.set(cx, 3.99, 2.52);
+        col.castShadow = true;
+        col.receiveShadow = true;
+        bodyGroup.add(col);
+      }
+
+      // Tall recessed civic windows (upper clear above center portal)
+      for (const wx of [-3.1, -1.55, 0, 1.55, 3.1]) {
+        const isCenter = wx === 0;
+        const winH = isCenter ? 2.1 : 3.6;
+        const winY = isCenter ? 4.95 : 4.2;
+        const winF = new THREE.Mesh(getSharedBoxGeo(0.85, winH, 0.12), glassMat);
+        winF.position.set(wx, winY, 2.12);
+        bodyGroup.add(winF);
+        const winB = new THREE.Mesh(getSharedBoxGeo(0.85, winH, 0.12), glassMat);
+        winB.position.set(wx, winY, -2.82);
+        bodyGroup.add(winB);
+      }
+
+      // Entablature & stepped pediment roof
+      const entablature = new THREE.Mesh(getSharedBoxGeo(10.0, 0.72, 6.0), stoneMat);
+      entablature.position.set(0, 7.6, -0.05);
+      entablature.castShadow = true;
+      bodyGroup.add(entablature);
+
+      const roofTier = new THREE.Mesh(getSharedBoxGeo(8.8, 0.85, 4.8), roofMat);
+      roofTier.position.set(0, 8.38, -0.15);
+      roofTier.castShadow = true;
+      bodyGroup.add(roofTier);
+
+      const cupolaBase = new THREE.Mesh(getSharedCylinderGeo(1.15, 1.28, 1.15, 16), stoneMat);
+      cupolaBase.position.set(0, 9.35, -0.2);
+      cupolaBase.castShadow = true;
+      bodyGroup.add(cupolaBase);
+
+      const cupolaDome = new THREE.Mesh(
+        sharedGeo('civicDome', () => new THREE.SphereGeometry(1.12, 16, 10, 0, Math.PI * 2, 0, Math.PI * 0.55)),
+        roofMat,
+      );
+      cupolaDome.position.set(0, 9.88, -0.2);
+      cupolaDome.castShadow = true;
+      bodyGroup.add(cupolaDome);
+    } else if (kind === 'building-apartments') {
+      // Stepped L-wing mid-rise apartment complex with balconies (9.0m W x 7.0m D x 15.2m H)
+      const bodyGroup = new THREE.Group();
+      bodyGroup.name = 'buildingBody';
+      group.userData.buildingBody = bodyGroup;
+      group.add(bodyGroup);
+
+      const podiumMat = getSharedStdMat('bap:podium', { color: 0x262e3d, roughness: 0.78, metalness: 0.16 });
+      const facadeMat = getSharedStdMat('bap:facade', { color: 0x6a6e75, roughness: 0.76, metalness: 0.08 });
+      const wingMat = getSharedStdMat('bap:wing', { color: 0x4b5563, roughness: 0.74, metalness: 0.12 });
+      const balcMat = getSharedStdMat('bap:balc', { color: 0x1e293b, roughness: 0.55, metalness: 0.4 });
+      const glassMat = getSharedStdMat('bap:glass', {
+        color: 0x111c2d,
+        emissive: 0xfef08a,
+        emissiveIntensity: 0.15,
+        roughness: 0.12,
+        metalness: 0.85,
+      });
+
+      // Ground commercial podium
+      const podium = new THREE.Mesh(getSharedBoxGeo(9.0, 2.5, 6.8), podiumMat);
+      podium.position.y = 1.25;
+      podium.castShadow = true;
+      podium.receiveShadow = true;
+      bodyGroup.add(podium);
+
+      // Front main apartment lobby double door, side retail door, & rear entrance
+      addBuildingDoor(bodyGroup, {
+        x: 1.9,
+        y: 0,
+        z: 3.41,
+        width: 2.05,
+        height: 2.25,
+        style: 'glass-metal',
+        doubleLeaf: true,
+        hasCanopy: true,
+        hasStep: true,
+      });
+      addBuildingDoor(bodyGroup, {
+        x: -2.3,
+        y: 0,
+        z: 3.41,
+        width: 1.05,
+        height: 2.15,
+        style: 'glass-metal',
+        hasStep: true,
+      });
+      addBuildingDoor(bodyGroup, {
+        x: 0,
+        y: 0,
+        z: -3.41,
+        rotY: Math.PI,
+        width: 1.65,
+        height: 2.18,
+        style: 'glass-metal',
+        doubleLeaf: true,
+        hasStep: true,
+      });
+
+      // Tall main L-spine wing (15.2m)
+      const mainWing = new THREE.Mesh(getSharedBoxGeo(8.6, 11.8, 3.6), facadeMat);
+      mainWing.position.set(0, 8.4, -1.4);
+      mainWing.castShadow = true;
+      mainWing.receiveShadow = true;
+      bodyGroup.add(mainWing);
+
+      // Lower forward projecting wing (10.6m)
+      const sideWing = new THREE.Mesh(getSharedBoxGeo(4.0, 8.2, 3.4), wingMat);
+      sideWing.position.set(-2.3, 6.6, 1.5);
+      sideWing.castShadow = true;
+      sideWing.receiveShadow = true;
+      bodyGroup.add(sideWing);
+
+      // Projecting balcony slabs + window bands
+      for (let fl = 0; fl < 4; fl++) {
+        const fy = 4.2 + fl * 2.55;
+        const winBand = new THREE.Mesh(getSharedBoxGeo(8.72, 1.15, 3.72), glassMat);
+        winBand.position.set(0, fy, -1.4);
+        bodyGroup.add(winBand);
+
+        const balc = new THREE.Mesh(getSharedBoxGeo(3.8, 0.2, 0.9), balcMat);
+        balc.position.set(2.1, fy - 0.58, 0.8);
+        balc.castShadow = true;
+        bodyGroup.add(balc);
+
+        if (fl < 3) {
+          const wingGlass = new THREE.Mesh(getSharedBoxGeo(4.12, 1.1, 3.52), glassMat);
+          wingGlass.position.set(-2.3, fy, 1.5);
+          bodyGroup.add(wingGlass);
+        }
+      }
+
+      // Rooftop crown & penthouse pergola
+      const crown = new THREE.Mesh(getSharedBoxGeo(8.8, 0.35, 3.8), balcMat);
+      crown.position.set(0, 14.48, -1.4);
+      crown.castShadow = true;
+      bodyGroup.add(crown);
+
+      const penthouse = new THREE.Mesh(getSharedBoxGeo(3.6, 0.9, 2.2), podiumMat);
+      penthouse.position.set(-1.5, 14.95, -1.4);
+      penthouse.castShadow = true;
+      bodyGroup.add(penthouse);
+    } else if (kind === 'building-skyscraper') {
+      // Tall setback Art-Deco glass skyscraper with podium & spire (7.8m W x 6.2m D x 30.0m H)
+      const bodyGroup = new THREE.Group();
+      bodyGroup.name = 'buildingBody';
+      group.userData.buildingBody = bodyGroup;
+      group.add(bodyGroup);
+
+      const podiumMat = getSharedStdMat('bsk:podium', { color: 0x1b2230, roughness: 0.68, metalness: 0.25 });
+      const stoneMat = getSharedStdMat('bsk:stone', { color: 0x3b485e, roughness: 0.64, metalness: 0.22 });
+      const glassMat = getSharedStdMat('bsk:glass', {
+        color: 0x0d1b2e,
+        emissive: 0xfde68a,
+        emissiveIntensity: 0.14,
+        roughness: 0.08,
+        metalness: 0.92,
+      });
+      const spireMat = getSharedStdMat('bsk:spire', {
+        color: 0x94a3b8,
+        emissive: 0x38bdf8,
+        emissiveIntensity: 0.22,
+        roughness: 0.3,
+        metalness: 0.85,
+      });
+
+      const podium = new THREE.Mesh(getSharedBoxGeo(7.8, 4.2, 6.2), podiumMat);
+      podium.position.y = 2.1;
+      podium.castShadow = true;
+      podium.receiveShadow = true;
+      bodyGroup.add(podium);
+
+      // Grand front Art-Deco portal + Avenue side & rear entrances
+      addBuildingDoor(bodyGroup, {
+        x: 0,
+        y: 0,
+        z: 3.11,
+        width: 2.55,
+        height: 3.1,
+        style: 'artdeco',
+        doubleLeaf: true,
+        hasCanopy: true,
+        hasStep: true,
+      });
+      addBuildingDoor(bodyGroup, {
+        x: 3.91,
+        y: 0,
+        z: 0,
+        rotY: Math.PI / 2,
+        width: 1.85,
+        height: 2.85,
+        style: 'artdeco',
+        doubleLeaf: true,
+        hasCanopy: true,
+      });
+      addBuildingDoor(bodyGroup, {
+        x: 0,
+        y: 0,
+        z: -3.11,
+        rotY: Math.PI,
+        width: 2.1,
+        height: 2.85,
+        style: 'artdeco',
+        doubleLeaf: true,
+        hasStep: true,
+      });
+
+      // Lower tower shaft
+      const shaft1 = new THREE.Mesh(getSharedBoxGeo(6.8, 13.5, 5.4), glassMat);
+      shaft1.position.y = 10.95;
+      shaft1.castShadow = true;
+      shaft1.receiveShadow = true;
+      bodyGroup.add(shaft1);
+
+      // Vertical stone piers along shaft1
+      for (const px of [-3.25, -1.1, 1.1, 3.25]) {
+        const pier = new THREE.Mesh(getSharedBoxGeo(0.42, 13.8, 5.65), stoneMat);
+        pier.position.set(px, 11.0, 0);
+        pier.castShadow = true;
+        bodyGroup.add(pier);
+      }
+
+      // Mid setback tier
+      const shaft2 = new THREE.Mesh(getSharedBoxGeo(5.2, 6.6, 4.2), stoneMat);
+      shaft2.position.y = 21.0;
+      shaft2.castShadow = true;
+      shaft2.receiveShadow = true;
+      bodyGroup.add(shaft2);
+
+      const band2 = new THREE.Mesh(getSharedBoxGeo(5.35, 4.8, 4.35), glassMat);
+      band2.position.y = 21.0;
+      bodyGroup.add(band2);
+
+      // Upper crown & lantern spire (reaching 30.0m)
+      const crown = new THREE.Mesh(getSharedBoxGeo(3.4, 2.8, 3.0), podiumMat);
+      crown.position.y = 25.7;
+      crown.castShadow = true;
+      bodyGroup.add(crown);
+
+      const spire = new THREE.Mesh(getSharedCylinderGeo(0.06, 0.28, 3.0, 10), spireMat);
+      spire.position.y = 28.5;
+      spire.castShadow = true;
+      bodyGroup.add(spire);
     }
-
-    // Rooftop crown & penthouse pergola
-    const crown = new THREE.Mesh(getSharedBoxGeo(8.8, 0.35, 3.8), balcMat);
-    crown.position.set(0, 14.48, -1.4);
-    crown.castShadow = true;
-    bodyGroup.add(crown);
-
-    const penthouse = new THREE.Mesh(getSharedBoxGeo(3.6, 0.9, 2.2), podiumMat);
-    penthouse.position.set(-1.5, 14.95, -1.4);
-    penthouse.castShadow = true;
-    bodyGroup.add(penthouse);
-  } else if (kind === 'building-skyscraper') {
-    // Tall setback Art-Deco glass skyscraper with podium & spire (7.8m W x 6.2m D x 30.0m H)
-    const bodyGroup = new THREE.Group();
-    bodyGroup.name = 'buildingBody';
-    group.userData.buildingBody = bodyGroup;
-    group.add(bodyGroup);
-
-    const podiumMat = getSharedStdMat('bsk:podium', { color: 0x1b2230, roughness: 0.68, metalness: 0.25 });
-    const stoneMat = getSharedStdMat('bsk:stone', { color: 0x3b485e, roughness: 0.64, metalness: 0.22 });
-    const glassMat = getSharedStdMat('bsk:glass', {
-      color: 0x0d1b2e,
-      emissive: 0xfde68a,
-      emissiveIntensity: 0.14,
-      roughness: 0.08,
-      metalness: 0.92,
-    });
-    const spireMat = getSharedStdMat('bsk:spire', {
-      color: 0x94a3b8,
-      emissive: 0x38bdf8,
-      emissiveIntensity: 0.22,
-      roughness: 0.3,
-      metalness: 0.85,
-    });
-
-    const podium = new THREE.Mesh(getSharedBoxGeo(7.8, 4.2, 6.2), podiumMat);
-    podium.position.y = 2.1;
-    podium.castShadow = true;
-    podium.receiveShadow = true;
-    bodyGroup.add(podium);
-
-    // Lower tower shaft
-    const shaft1 = new THREE.Mesh(getSharedBoxGeo(6.8, 13.5, 5.4), glassMat);
-    shaft1.position.y = 10.95;
-    shaft1.castShadow = true;
-    shaft1.receiveShadow = true;
-    bodyGroup.add(shaft1);
-
-    // Vertical stone piers along shaft1
-    for (const px of [-3.25, -1.1, 1.1, 3.25]) {
-      const pier = new THREE.Mesh(getSharedBoxGeo(0.42, 13.8, 5.65), stoneMat);
-      pier.position.set(px, 11.0, 0);
-      pier.castShadow = true;
-      bodyGroup.add(pier);
-    }
-
-    // Mid setback tier
-    const shaft2 = new THREE.Mesh(getSharedBoxGeo(5.2, 6.6, 4.2), stoneMat);
-    shaft2.position.y = 21.0;
-    shaft2.castShadow = true;
-    shaft2.receiveShadow = true;
-    bodyGroup.add(shaft2);
-
-    const band2 = new THREE.Mesh(getSharedBoxGeo(5.35, 4.8, 4.35), glassMat);
-    band2.position.y = 21.0;
-    bodyGroup.add(band2);
-
-    // Upper crown & lantern spire (reaching 30.0m)
-    const crown = new THREE.Mesh(getSharedBoxGeo(3.4, 2.8, 3.0), podiumMat);
-    crown.position.y = 25.7;
-    crown.castShadow = true;
-    bodyGroup.add(crown);
-
-    const spire = new THREE.Mesh(getSharedCylinderGeo(0.06, 0.28, 3.0, 10), spireMat);
-    spire.position.y = 28.5;
-    spire.castShadow = true;
-    bodyGroup.add(spire);
   } else if (kind === 'tree') {
     const trunkMat = getSharedStdMat('tree:trunk', { color: 0x45352b, roughness: 0.92, metalness: 0.0 });
     const leafMat1 = getSharedStdMat('tree:leaf1', { color: 0x224131, roughness: 0.85, metalness: 0.0 });
@@ -3700,10 +4589,10 @@ export function createStreetTargetGroup(
   } else if (kind === 'bike' || kind === 'motorcycle') {
     const hitGeo =
       kind === 'bike'
-        ? getSharedBoxGeo(1.9, 1.15, 0.7)
-        : getSharedBoxGeo(2.2, 1.25, 0.85);
+        ? getSharedBoxGeo(1.9, 1.72, 0.72)
+        : getSharedBoxGeo(2.2, 1.65, 0.88);
     const hitMesh = new THREE.Mesh(hitGeo, hitboxInvisibleMat);
-    hitMesh.position.y = kind === 'bike' ? 0.58 : 0.62;
+    hitMesh.position.y = kind === 'bike' ? 0.86 : 0.82;
     hitMesh.name = 'targetHitbox';
     group.add(hitMesh);
   }
@@ -3774,9 +4663,9 @@ export function createBuilderGhostGroup(tool: Exclude<BuilderTool, null>): THREE
   } else if (tool === 'building-skyscraper') {
     addBox(7.8, 30.0, 6.2);
   } else if (tool === 'bike') {
-    addBox(1.8, 1.05, 0.55);
+    addBox(1.8, 1.62, 0.55);
   } else if (tool === 'motorcycle') {
-    addBox(2.1, 1.15, 0.7);
+    addBox(2.1, 1.56, 0.72);
   } else if (tool === 'sedan') {
     addBox(4.3, 1.3, 1.75);
   } else if (tool === 'van') {
