@@ -1,4 +1,4 @@
-import { LightFixture, MAP_HALF_X, MAP_HALF_Z, ScenePreset, SHIELD_SECTORS, StreetTarget } from '../types/lighting';
+import { CrossingWaypoint, LightFixture, MAP_HALF_X, MAP_HALF_Z, ScenePreset, SHIELD_SECTORS, StreetTarget } from '../types/lighting';
 
 export interface RgbColor {
   r: number; // 0..1
@@ -644,17 +644,17 @@ const CORRIDOR_SCENERY_TARGETS: StreetTarget[] = [
   { id: 'env-bldg-fw-s', kind: 'building-commercial', label: '1st Ave Corner Market', position: { x: -59.0, z: 12.6 }, rotationY: -Math.PI / 2, width: 9.2, length: 4.6, height: 4.9 },
   { id: 'env-bldg-12', kind: 'building-rowhouse', label: 'West Ave Brick Rowhouses', position: { x: -35.0, z: 14.0 }, rotationY: Math.PI, width: 10.2, length: 4.8, height: 8.4 },
   { id: 'env-bldg-10', kind: 'building-tall', label: 'South Block Mid-Rise', position: { x: -10.8, z: 14.2 }, rotationY: Math.PI, width: 6.8, length: 5.2, height: 13.8 },
-  { id: 'env-bldg-11', kind: 'building-commercial', label: 'South Block Retail Strip', position: { x: 0.4, z: 14.2 }, rotationY: Math.PI, width: 9.6, length: 4.8, height: 4.8 },
-  { id: 'env-bldg-3', kind: 'building-kiosk', label: 'South Block Pavilion', position: { x: 11.4, z: 14.2 }, rotationY: Math.PI, width: 4.4, length: 4.0, height: 3.9 },
+  { id: 'env-bldg-11', kind: 'building-commercial', label: 'South Block Retail Strip', position: { x: -3.2, z: 14.2 }, rotationY: Math.PI, width: 6.8, length: 4.8, height: 4.8 },
+  { id: 'env-parking-main', kind: 'parking-lot', label: 'Main St Public Parking Lot', position: { x: 7.8, z: 12.0 }, rotationY: Math.PI },
   { id: 'env-bldg-8', kind: 'building-warehouse', label: 'East Ave Artisan Depot', position: { x: 35.0, z: 13.8 }, rotationY: Math.PI, width: 9.8, length: 5.8, height: 7.6 },
   { id: 'env-bldg-fe-s', kind: 'building-rowhouse', label: '4th Ave South Rowhouses', position: { x: 59.0, z: 12.6 }, rotationY: -Math.PI / 2, width: 9.0, length: 4.6, height: 8.0 },
 
   // South Outer Edge Blocks (z: +32.2 .. +44.0)
   { id: 'env-bldg-sw', kind: 'building-apartments', label: 'Westgate Outer Residences', position: { x: -59.0, z: 38.0 }, rotationY: Math.PI / 2, width: 9.6, length: 6.2, height: 14.6 },
   { id: 'env-bldg-ws', kind: 'building-commercial', label: 'South Blvd Retail Plaza', position: { x: -35.0, z: 38.0 }, rotationY: 0, width: 10.4, length: 5.0, height: 5.2 },
-  { id: 'env-bldg-9', kind: 'building-rowhouse', label: 'South District Townhomes', position: { x: -9.6, z: 38.0 }, rotationY: 0, width: 10.2, length: 4.8, height: 8.8 },
-  { id: 'env-bldg-cs2', kind: 'building-civic', label: 'South Promenade Courthouse', position: { x: 2.6, z: 38.0 }, rotationY: 0, width: 9.8, length: 6.6, height: 11.0 },
-  { id: 'env-bldg-cs3', kind: 'building-small', label: 'South Promenade Annex', position: { x: 12.4, z: 38.0 }, rotationY: 0, width: 5.0, length: 4.8, height: 6.6 },
+  { id: 'env-bldg-9', kind: 'building-rowhouse', label: 'South District Townhomes', position: { x: -11.4, z: 38.0 }, rotationY: 0, width: 6.0, length: 4.8, height: 8.8 },
+  { id: 'env-bldg-cs2', kind: 'building-civic', label: 'South Promenade Courthouse', position: { x: -3.6, z: 38.0 }, rotationY: 0, width: 7.4, length: 6.6, height: 11.0 },
+  { id: 'env-parking-south', kind: 'parking-lot', label: 'South Promenade Parking Lot', position: { x: 7.8, z: 37.0 }, rotationY: Math.PI },
   { id: 'env-bldg-es', kind: 'building-apartments', label: 'South Blvd East Lofts', position: { x: 35.0, z: 38.0 }, rotationY: 0, width: 9.4, length: 6.6, height: 15.0 },
   { id: 'env-bldg-se', kind: 'building-commercial', label: '4th Ave South Plaza', position: { x: 59.0, z: 38.0 }, rotationY: Math.PI / 2, width: 9.6, length: 4.8, height: 5.0 },
 
@@ -662,8 +662,6 @@ const CORRIDOR_SCENERY_TARGETS: StreetTarget[] = [
   { id: 'env-tree-0', kind: 'tree', label: 'South Boulevard Tree W1', position: { x: -35.0, z: 8.6 }, rotationY: 0.4 },
   { id: 'env-tree-1', kind: 'tree', label: 'Main St Tree West', position: { x: -13.5, z: 8.6 }, rotationY: 0 },
   { id: 'env-tree-2', kind: 'tree', label: 'Main St Tree Mid-W', position: { x: -4.5, z: 8.6 }, rotationY: 0.6 },
-  { id: 'env-tree-3', kind: 'tree', label: 'Main St Tree Mid-E', position: { x: 4.5, z: 8.6 }, rotationY: 1.2 },
-  { id: 'env-tree-4', kind: 'tree', label: 'Main St Tree East', position: { x: 13.5, z: 8.6 }, rotationY: 2.1 },
   { id: 'env-tree-5', kind: 'tree', label: 'South Boulevard Tree E1', position: { x: 35.0, z: 8.6 }, rotationY: 1.5 },
   { id: 'env-tree-6', kind: 'tree', label: 'Promenade Park Tree W', position: { x: -6.5, z: -12.5 }, rotationY: 0.9 },
   { id: 'env-tree-7', kind: 'tree', label: 'Promenade Park Tree E', position: { x: 6.5, z: -12.5 }, rotationY: 2.4 },
@@ -875,3 +873,244 @@ export const SCENE_PRESETS: ScenePreset[] = [
     ]),
   },
 ];
+
+function isPointInsideRoadAsphalt(
+  px: number,
+  pz: number,
+  t: StreetTarget,
+): boolean {
+  const dx = px - t.position.x;
+  const dz = pz - t.position.z;
+  const cos = Math.cos(t.rotationY);
+  const sin = Math.sin(t.rotationY);
+  const lx = dx * cos - dz * sin;
+  const lz = dx * sin + dz * cos;
+
+  switch (t.kind) {
+    case 'road-2lane': {
+      const halfL = t.length && t.length > 0 ? t.length * 0.5 : 4.0;
+      return Math.abs(lx) <= halfL + 0.04 && Math.abs(lz) <= 4.54;
+    }
+    case 'road-intersection':
+    case 'road-t-junction':
+      return Math.abs(lx) <= 4.54 && Math.abs(lz) <= 4.54;
+    case 'road-crosswalk':
+      return Math.abs(lx) <= 3.04 && Math.abs(lz) <= 4.54;
+    case 'road-turn-90': {
+      if (lx < -6.04 || lz > 6.04) return false;
+      const r = Math.hypot(lx + 6, lz - 6);
+      return r >= 1.46 && r <= 10.54;
+    }
+    case 'road-curve-45': {
+      const cx = lx + 4.95;
+      const cz = -(lz - 11.95);
+      const r = Math.hypot(cx, cz);
+      if (r < 9.46 || r > 18.54) return false;
+      const ang = Math.atan2(cz, cx);
+      return ang >= Math.PI / 4 - 0.02 && ang <= Math.PI / 2 + 0.02;
+    }
+    case 'road-roundabout':
+      if (Math.hypot(lx, lz) <= 9.68) return true;
+      return (
+        (Math.abs(lx) <= 10.04 && Math.abs(lz) <= 4.54) ||
+        (Math.abs(lz) <= 10.04 && Math.abs(lx) <= 4.54)
+      );
+    case 'road-culdesac':
+      return Math.hypot(lx, lz) <= 6.06;
+    case 'road-deadend':
+      return (
+        Math.hypot(lx, lz) <= 6.06 ||
+        (lx >= -6.04 && lx <= 0 && Math.abs(lz) <= 4.54)
+      );
+    default:
+      return false;
+  }
+}
+
+export function isPointOnSidewalkSegment(
+  px: number,
+  pz: number,
+  targets: StreetTarget[],
+): boolean {
+  for (const t of targets) {
+    if (t.kind.startsWith('road-') && isPointInsideRoadAsphalt(px, pz, t)) {
+      return false;
+    }
+  }
+
+  for (const t of targets) {
+    const dx = px - t.position.x;
+    const dz = pz - t.position.z;
+    const cos = Math.cos(t.rotationY);
+    const sin = Math.sin(t.rotationY);
+    const lx = dx * cos - dz * sin;
+    const lz = dx * sin + dz * cos;
+    const ax = Math.abs(lx);
+    const az = Math.abs(lz);
+    const hidden = t.hiddenSidewalks;
+
+    if (t.kind === 'path-sidewalk') {
+      if (ax <= 4.35 && az <= 1.85) return true;
+      continue;
+    }
+
+    if (t.kind === 'road-2lane') {
+      const halfL = t.length && t.length > 0 ? t.length * 0.5 : 4.0;
+      if (ax <= halfL + 0.35 && az >= 4.55 && az <= 7.55) {
+        const key = lz < 0 ? 'north' : 'south';
+        if (!hidden?.includes(key)) return true;
+      }
+    } else if (t.kind === 'road-crosswalk') {
+      if (ax <= 3.35 && az >= 4.55 && az <= 7.55) {
+        const key = lz < 0 ? 'north' : 'south';
+        if (!hidden?.includes(key)) return true;
+      }
+    } else if (t.kind === 'road-intersection') {
+      if (ax >= 4.5 && ax <= 7.55 && az >= 4.5 && az <= 7.55 && !(ax < 4.74 && az < 4.74)) {
+        const key = `${lz < 0 ? 'n' : 's'}${lx < 0 ? 'w' : 'e'}`;
+        if (!hidden?.includes(key)) return true;
+      }
+    } else if (t.kind === 'road-t-junction') {
+      if (ax <= 4.74 && lz >= -7.55 && lz <= -4.55 && !hidden?.includes('back')) return true;
+      if (ax >= 4.5 && ax <= 7.55 && lz >= 4.5 && lz <= 7.55 && !(ax < 4.74 && lz < 4.74)) {
+        const key = lx < 0 ? 'sw' : 'se';
+        if (!hidden?.includes(key)) return true;
+      }
+    } else if (t.kind === 'road-turn-90') {
+      if (lx >= -6.2 && lz <= 6.2) {
+        const r = Math.hypot(lx + 6, lz - 6);
+        if (r >= 10.6 && r <= 13.45 && !hidden?.includes('outer')) return true;
+        if (r <= 1.38 && !hidden?.includes('inner')) return true;
+      }
+    } else if (t.kind === 'road-curve-45') {
+      const cx = lx + 4.95;
+      const cz = -(lz - 11.95);
+      const r = Math.hypot(cx, cz);
+      const ang = Math.atan2(cz, cx);
+      if (ang >= Math.PI / 4 - 0.05 && ang <= Math.PI / 2 + 0.05) {
+        if (r >= 6.6 && r <= 9.4 && !hidden?.includes('inner')) return true;
+        if (r >= 18.6 && r <= 21.45 && !hidden?.includes('outer')) return true;
+      }
+    } else if (t.kind === 'road-roundabout') {
+      const r = Math.hypot(lx, lz);
+      if (r >= 9.7 && r <= 12.55) {
+        const key = `${lz < 0 ? 'n' : 's'}${lx < 0 ? 'w' : 'e'}`;
+        if (!hidden?.includes(key)) return true;
+      }
+    } else if (t.kind === 'road-culdesac') {
+      const r = Math.hypot(lx, lz);
+      if (r >= 6.1 && r <= 8.85 && !hidden?.includes('ring')) return true;
+    } else if (t.kind === 'road-deadend') {
+      if (lx >= -6.2 && lx <= -3.96 && az >= 4.55 && az <= 7.55 && !hidden?.includes('ring')) {
+        return true;
+      }
+      const r = Math.hypot(lx, lz);
+      if (lx >= -3.96 && r >= 6.1 && r <= 8.85 && !hidden?.includes('ring')) return true;
+    }
+  }
+
+  return false;
+}
+
+/**
+ * Generates an automatic 'Crossing' waypoint path when a pedestrian is placed
+ * on a sidewalk segment near a `road-crosswalk` road tile:
+ * walk along sidewalk to near curb -> pause at curb -> cross zebra stripes -> opposite sidewalk.
+ */
+export function generatePedestrianCrossingPath(
+  pedPos: { x: number; z: number },
+  targets: StreetTarget[],
+  maxSearchDist = 16.0,
+): CrossingWaypoint[] | null {
+  if (!isPointOnSidewalkSegment(pedPos.x, pedPos.z, targets)) {
+    return null;
+  }
+
+  let bestPath: CrossingWaypoint[] | null = null;
+  let bestScore = Infinity;
+
+  for (const cw of targets) {
+    if (cw.kind !== 'road-crosswalk') continue;
+    const centerDist = Math.hypot(pedPos.x - cw.position.x, pedPos.z - cw.position.z);
+    if (centerDist > maxSearchDist) continue;
+
+    const cos = Math.cos(cw.rotationY);
+    const sin = Math.sin(cw.rotationY);
+    const dx = pedPos.x - cw.position.x;
+    const dz = pedPos.z - cw.position.z;
+    const pedLx = dx * cos - dz * sin;
+    const pedLz = dx * sin + dz * cos;
+
+    // Crosswalk corridor approach spans roughly along the street block (-maxSearchDist..+maxSearchDist)
+    if (Math.abs(pedLz) < 4.55) continue;
+
+    const startSide = pedLz <= 0 ? -1 : 1;
+    const destSide = -startSide;
+    const laneLx = clamp(pedLx, -1.65, 1.65);
+
+    const toWorld = (lx: number, lz: number) => ({
+      x: Math.round((cw.position.x + lx * cos + lz * sin) * 100) / 100,
+      z: Math.round((cw.position.z - lx * sin + lz * cos) * 100) / 100,
+    });
+
+    const curbStartW = toWorld(laneLx, startSide * 4.94);
+    const curbEndW = toWorld(laneLx, destSide * 5.05);
+    const exitWalkW = toWorld(laneLx, destSide * 5.95);
+
+    // Ensure the sidewalk walk-up path to the near curb doesn't cut across an unmarked road
+    let blockedByRoadway = false;
+    for (const u of [0.25, 0.5, 0.75]) {
+      const sx = pedPos.x + (curbStartW.x - pedPos.x) * u;
+      const sz = pedPos.z + (curbStartW.z - pedPos.z) * u;
+      for (const road of targets) {
+        if (!road.kind.startsWith('road-')) continue;
+        if (isPointInsideRoadAsphalt(sx, sz, road)) {
+          blockedByRoadway = true;
+          break;
+        }
+      }
+      if (blockedByRoadway) break;
+    }
+    if (blockedByRoadway) continue;
+
+    const score = Math.hypot(curbStartW.x - pedPos.x, curbStartW.z - pedPos.z);
+    if (score >= bestScore) continue;
+    bestScore = score;
+
+    const waypoints: CrossingWaypoint[] = [];
+    if (Math.abs(pedLx) > 2.35) {
+      const apronApproachW = toWorld(clamp(pedLx, -2.6, 2.6), startSide * 5.95);
+      if (Math.hypot(apronApproachW.x - pedPos.x, apronApproachW.z - pedPos.z) > 1.1) {
+        waypoints.push({
+          x: apronApproachW.x,
+          z: apronApproachW.z,
+          action: 'walk',
+        });
+      }
+    }
+
+    waypoints.push(
+      {
+        x: curbStartW.x,
+        z: curbStartW.z,
+        action: 'pause-at-curb',
+        pauseSec: 1.4,
+      },
+      {
+        x: curbEndW.x,
+        z: curbEndW.z,
+        action: 'cross',
+      },
+      {
+        x: exitWalkW.x,
+        z: exitWalkW.z,
+        action: 'walk',
+      },
+    );
+
+    bestPath = waypoints;
+  }
+
+  return bestPath;
+}
+

@@ -59,7 +59,8 @@ export type TargetKind =
   | 'path-sidewalk'
   | 'path-bike'
   | 'path-cobble'
-  | 'path-gravel';
+  | 'path-gravel'
+  | 'parking-lot';
 
 export type BuilderTool = TargetKind | 'light' | null;
 
@@ -100,7 +101,7 @@ export function isBuildingKind(kind: TargetKind): boolean {
 }
 
 export function isRoadOrPathKind(kind: TargetKind): boolean {
-  return kind.startsWith('road-') || kind.startsWith('path-');
+  return kind.startsWith('road-') || kind.startsWith('path-') || kind === 'parking-lot';
 }
 
 export function isVehicleKind(kind: TargetKind): boolean {
@@ -137,10 +138,18 @@ export function getRoadSidewalkPartKeys(kind: TargetKind): string[] {
 }
 
 export type StreetRouteId =
+  | 'Crossing'
   | 'north-loop'
   | 'roundabout-cw'
   | 'south-shuttle'
   | 'ped-south';
+
+export interface CrossingWaypoint {
+  x: number;
+  z: number;
+  action: 'walk' | 'pause-at-curb' | 'cross';
+  pauseSec?: number;
+}
 
 export interface StreetTarget {
   id: string;
@@ -154,6 +163,7 @@ export interface StreetTarget {
   hiddenSidewalks?: string[]; // Removed attached sidewalk part keys for road targets
   motion?: 'walk' | 'drive';
   routeId?: StreetRouteId;
+  crossingPath?: CrossingWaypoint[];
   color?: string;
 }
 

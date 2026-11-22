@@ -32,7 +32,11 @@ import {
   TargetKind,
   ViewportSettings,
 } from './types/lighting';
-import { clamp, SCENE_PRESETS } from './utils/photometrics';
+import {
+  clamp,
+  generatePedestrianCrossingPath,
+  SCENE_PRESETS,
+} from './utils/photometrics';
 
 const INITIAL_PRESET = SCENE_PRESETS[0];
 
@@ -73,6 +77,7 @@ const TARGET_LABELS: Record<TargetKind, string> = {
   'path-bike': 'Bike Lane',
   'path-cobble': 'Cobble Plaza',
   'path-gravel': 'Park Trail',
+  'parking-lot': 'Parking Lot',
 };
 
 const SEDAN_PAINT_PALETTE = ['#3b526b', '#8a2b32', '#1e40af', '#334155', '#0f4c5c', '#475569'];
@@ -124,6 +129,7 @@ const VALID_DROP_TOOLS: ReadonlySet<string> = new Set([
   'path-bike',
   'path-cobble',
   'path-gravel',
+  'parking-lot',
   'light',
 ]);
 
@@ -235,9 +241,40 @@ export default function App() {
 
   const handleMoveTarget = useCallback(
     (id: string, pos: { x: number; z: number }) => {
-      setTargets((prev) =>
-        prev.map((t) => (t.id === id ? { ...t, position: pos } : t)),
-      );
+      setTargets((prev) => {
+        const nextTargets = prev.map((t) =>
+          t.id === id ? { ...t, position: pos } : t,
+        );
+        const moved = nextTargets.find((t) => t.id === id);
+        if (!moved) return nextTargets;
+        if (moved.kind === 'pedestrian') {
+          const crossingPath = generatePedestrianCrossingPath(pos, nextTargets);
+          return nextTargets.map((t) =>
+            t.id === id
+              ? {
+                  ...t,
+                  routeId: crossingPath ? 'Crossing' : undefined,
+                  crossingPath: crossingPath ?? undefined,
+                }
+              : t,
+          );
+        }
+        if (moved.kind === 'road-crosswalk' || moved.kind === 'path-sidewalk') {
+          return nextTargets.map((t) => {
+            if (t.kind !== 'pedestrian') return t;
+            const crossingPath = generatePedestrianCrossingPath(
+              t.position,
+              nextTargets,
+            );
+            return {
+              ...t,
+              routeId: crossingPath ? 'Crossing' : undefined,
+              crossingPath: crossingPath ?? undefined,
+            };
+          });
+        }
+        return nextTargets;
+      });
     },
     [],
   );
@@ -322,23 +359,43 @@ export default function App() {
               ]
             : undefined;
       const bDims = BUILDING_DEFAULT_DIMENSIONS[tool];
-      const newTarget: StreetTarget = {
-        id: `tgt-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
-        kind: tool,
-        label: TARGET_LABELS[tool],
-        position: {
-          x: clamp(pos.x, -MAP_HALF_X, MAP_HALF_X),
-          z: clamp(pos.z, -MAP_HALF_Z, MAP_HALF_Z),
-        },
-        rotationY,
-        width: bDims?.width,
-        length: bDims?.length,
-        height: BUILDING_DEFAULT_HEIGHTS[tool],
-        motion,
-        color,
+      const newPos = {
+        x: clamp(pos.x, -MAP_HALF_X, MAP_HALF_X),
+        z: clamp(pos.z, -MAP_HALF_Z, MAP_HALF_Z),
       };
-      setTargets((prev) => [...prev, newTarget]);
-      setSelectedTargetId(newTarget.id);
+      const newId = `tgt-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+      setTargets((prev) => {
+        const crossingPath =
+          tool === 'pedestrian'
+            ? generatePedestrianCrossingPath(newPos, prev)
+            : null;
+        const newTarget: StreetTarget = {
+          id: newId,
+          kind: tool,
+          label: TARGET_LABELS[tool],
+          position: newPos,
+          rotationY,
+          width: bDims?.width,
+          length: bDims?.length,
+          height: BUILDING_DEFAULT_HEIGHTS[tool],
+          motion,
+          routeId: crossingPath ? 'Crossing' : undefined,
+          crossingPath: crossingPath ?? undefined,
+          color,
+        };
+        const updated = [...prev, newTarget];
+        if (tool === 'road-crosswalk' || tool === 'path-sidewalk') {
+          return updated.map((t) => {
+            if (t.kind !== 'pedestrian') return t;
+            const cp = generatePedestrianCrossingPath(t.position, updated);
+            return cp
+              ? { ...t, routeId: 'Crossing', crossingPath: cp }
+              : t;
+          });
+        }
+        return updated;
+      });
+      setSelectedTargetId(newId);
       setSelectedSidewalk(null);
     },
     [],
@@ -721,45 +778,55 @@ export default function App() {
             ]
           : undefined;
     const pedXOptions = [-38, -28.45, -16.5, -8.5, 4.0, 16.5, 28.45, 38];
-    const newTarget: StreetTarget = {
-      id: `tgt-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
-      kind,
-      label: TARGET_LABELS[kind],
-      position: {
-        x:
-          kind === 'traffic-light'
-            ? -7.4
-            : kind === 'pedestrian'
-              ? pedXOptions[Math.floor(Math.random() * pedXOptions.length)]
-              : Math.round((Math.random() * 18 - 9) * 2) / 2,
-        z:
-          kind === 'pedestrian'
-            ? (Math.random() < 0.5 ? 5.95 : -5.95)
-            : isVehicle
-              ? isWestbound
-                ? -2.2
-                : 2.2
-              : kind === 'traffic-light'
-                ? 5.1
-                : kind === 'bollard'
-                  ? -4.5
-                  : isSurface
-                    ? 18.0
-                    : isEdgeKind
-                      ? kind === 'bench' || kind === 'hedge'
-                        ? 5.5
-                        : -12.5
-                      : Math.round((Math.random() * 4 - 2) * 2) / 2,
-      },
-      rotationY: isWestbound ? Math.PI : 0,
-      width: BUILDING_DEFAULT_DIMENSIONS[kind]?.width,
-      length: BUILDING_DEFAULT_DIMENSIONS[kind]?.length,
-      height: BUILDING_DEFAULT_HEIGHTS[kind],
-      motion,
-      color,
+    const newPos = {
+      x:
+        kind === 'traffic-light'
+          ? -7.4
+          : kind === 'pedestrian'
+            ? pedXOptions[Math.floor(Math.random() * pedXOptions.length)]
+            : Math.round((Math.random() * 18 - 9) * 2) / 2,
+      z:
+        kind === 'pedestrian'
+          ? (Math.random() < 0.5 ? 5.95 : -5.95)
+          : isVehicle
+            ? isWestbound
+              ? -2.2
+              : 2.2
+            : kind === 'traffic-light'
+              ? 5.1
+              : kind === 'bollard'
+                ? -4.5
+                : isSurface
+                  ? 18.0
+                  : isEdgeKind
+                    ? kind === 'bench' || kind === 'hedge'
+                      ? 5.5
+                      : -12.5
+                    : Math.round((Math.random() * 4 - 2) * 2) / 2,
     };
-    setTargets((prev) => [...prev, newTarget]);
-    setSelectedTargetId(newTarget.id);
+    const newId = `tgt-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+    setTargets((prev) => {
+      const crossingPath =
+        kind === 'pedestrian'
+          ? generatePedestrianCrossingPath(newPos, prev)
+          : null;
+      const newTarget: StreetTarget = {
+        id: newId,
+        kind,
+        label: TARGET_LABELS[kind],
+        position: newPos,
+        rotationY: isWestbound ? Math.PI : 0,
+        width: BUILDING_DEFAULT_DIMENSIONS[kind]?.width,
+        length: BUILDING_DEFAULT_DIMENSIONS[kind]?.length,
+        height: BUILDING_DEFAULT_HEIGHTS[kind],
+        motion,
+        routeId: crossingPath ? 'Crossing' : undefined,
+        crossingPath: crossingPath ?? undefined,
+        color,
+      };
+      return [...prev, newTarget];
+    });
+    setSelectedTargetId(newId);
     setSelectedSidewalk(null);
     setCanvasSelectedFixtureId(null);
   }, []);

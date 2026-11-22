@@ -8,6 +8,7 @@ import {
   BuilderTool,
   CameraControlMode,
   CameraPresetId,
+  CrossingWaypoint,
   DEFAULT_INPUT_CONTROLS,
   FIXTURE_MAX_X,
   FIXTURE_MAX_Z,
@@ -32,6 +33,7 @@ import {
   computePeakCandela,
   computeScenePhotometrics,
   degToRad,
+  generatePedestrianCrossingPath,
   getAimDirection,
   getEffectiveAngleAtDeg,
   getEffectiveHalfAngleRad,
@@ -54,6 +56,8 @@ import {
   createStreetPoleRig,
   createStreetTargetGroup,
   disposeObject3DResources,
+  getParkingLotOpenStalls,
+  ParkingStallSpec,
   PedestrianRigRefs,
   PoleVisualRefs,
   TrafficSignalMaterials,
@@ -66,7 +70,10 @@ import {
   disposeCachedRoadTextures,
   getTrafficCountdownTexture,
 } from './textures';
-import { getShieldTransmittanceAtDeg } from '../utils/photometrics';
+import {
+  getShieldTransmittanceAtDeg,
+  isPointOnSidewalkSegment,
+} from '../utils/photometrics';
 import { SHIELD_SECTORS } from '../types/lighting';
 
 interface LightRigEntry {
@@ -96,6 +103,13 @@ interface TrafficController {
   lastCountdownZ?: number;
 }
 
+type VehicleParkingPhase =
+  | 'approaching-lot'
+  | 'entering-lot'
+  | 'parked'
+  | 'reversing-out'
+  | 'exiting-lot';
+
 interface AnimatedActorState {
   motion: 'walk' | 'drive';
   kind: TargetKind;
@@ -120,6 +134,8 @@ interface AnimatedActorState {
   speedDriftTimer?: number;
   offGraphTurnRate?: number;
   offGraphTimer?: number;
+  seekingRoad?: boolean;
+  seekingSidewalk?: boolean;
   walkCurrNodeId?: number;
   walkPrevNodeId?: number;
   walkGoalX?: number;
@@ -132,6 +148,27 @@ interface AnimatedActorState {
   walkSeed?: number;
   walkLookYaw?: number;
   walkLookPitch?: number;
+  crossingWaypoints?: CrossingWaypoint[];
+  crossingStepIdx?: number;
+  crossingCurbPaused?: boolean;
+  lastCrossingPathRef?: CrossingWaypoint[];
+  parkingPhase?: VehicleParkingPhase;
+  parkingLotId?: string;
+  parkingStallIdx?: number;
+  parkingStallYaw?: number;
+  parkingExitAisleYaw?: number;
+  parkingDwellTimer?: number;
+  parkingPlannedEdges?: RoadGraphEdge[];
+  parkingApproachTrimmedPoints?: Array<{ x: number; z: number }>;
+  parkingOnFinalEdge?: boolean;
+  parkingEntryWaypoints?: Array<{ x: number; z: number }>;
+  parkingReverseWaypoints?: Array<{ x: number; z: number }>;
+  parkingReverseIdx?: number;
+  parkingReverseSegDist?: number;
+  parkingReverseStartYaw?: number;
+  parkingExitRejoinSubIdx?: number;
+  parkingLotPose?: { x: number; z: number; rotationY: number };
+  lastParkedAt?: number;
 }
 
 export interface SceneCallbacks {
@@ -168,6 +205,7 @@ interface WalkGraphNode {
   z: number;
   roadId: string;
   isCorner: boolean;
+  isSidewalkPath?: boolean;
 }
 
 interface WalkGraphEdge {
@@ -219,6 +257,7 @@ function buildRoadLaneGraph(roadEntries: RoadSpatialEntry[]): RoadLaneGraph {
     pz: number;
     outDirX: number;
     outDirZ: number;
+    isStraightRoad: boolean;
     connectedOut: boolean;
     connectedIn: boolean;
   }
@@ -276,6 +315,7 @@ function buildRoadLaneGraph(roadEntries: RoadSpatialEntry[]): RoadLaneGraph {
       lz: number,
       nx: number,
       nz: number,
+      isStraightRoad = false,
     ): PortBinding => {
       const rx = -nz;
       const rz = nx;
@@ -300,6 +340,7 @@ function buildRoadLaneGraph(roadEntries: RoadSpatialEntry[]): RoadLaneGraph {
         pz: wPort.z,
         outDirX: wOutDir.x,
         outDirZ: wOutDir.z,
+        isStraightRoad,
         connectedOut: false,
         connectedIn: false,
       };
@@ -314,8 +355,8 @@ function buildRoadLaneGraph(roadEntries: RoadSpatialEntry[]): RoadLaneGraph {
           : kind === 'road-crosswalk'
             ? 3.0
             : 4.0;
-      const pE = addLocalPort(halfL, 0, 1, 0);
-      const pW = addLocalPort(-halfL, 0, -1, 0);
+      const pE = addLocalPort(halfL, 0, 1, 0, true);
+      const pW = addLocalPort(-halfL, 0, -1, 0, true);
       pushWorldEdge(pW.inId, pE.outId, [{ x: nodes[pE.outId].x, z: nodes[pE.outId].z }]);
       pushWorldEdge(pE.inId, pW.outId, [{ x: nodes[pW.outId].x, z: nodes[pW.outId].z }]);
     } else if (kind === 'road-intersection' || kind === 'road-t-junction') {
@@ -529,36 +570,46 @@ function buildRoadLaneGraph(roadEntries: RoadSpatialEntry[]): RoadLaneGraph {
     }
   }
 
-  // Handle open perimeter ends (wrap across corridor if clear) & internal unconnected ends (safe U-turn)
+  // Pair open straight-road & perimeter ends to teleport vehicles straight to the opposite end of the street
   for (const pA of portsList) {
     if (pA.connectedOut) continue;
     const outNode = nodes[pA.outId];
     const inNode = nodes[pA.inId];
 
-    if (outNode.isPerimeter) {
-      let bestWrap: PortBinding | null = null;
-      let bestAxisDist = Infinity;
-      for (const pB of portsList) {
-        if (pB === pA || pB.connectedIn || !nodes[pB.inId].isPerimeter) continue;
-        // Same travel direction (pB outward points opposite to pA outward)
-        if (pA.outDirX * -pB.outDirX + pA.outDirZ * -pB.outDirZ < 0.85) continue;
-        const dx = pB.px - pA.px;
-        const dz = pB.pz - pA.pz;
-        const fwd = dx * pA.outDirX + dz * pA.outDirZ;
-        if (fwd > -20) continue;
-        const perp = Math.abs(dx * -pA.outDirZ + dz * pA.outDirX);
-        if (perp <= 3.5 && perp < bestAxisDist) {
-          bestAxisDist = perp;
-          bestWrap = pB;
-        }
+    let bestWrap: PortBinding | null = null;
+    let bestPerpDist = Infinity;
+    let bestSpanDist = -Infinity;
+    for (const pB of portsList) {
+      if (pB === pA || pB.connectedIn) continue;
+      const inBNode = nodes[pB.inId];
+      const bothPerimeter = outNode.isPerimeter && inBNode.isPerimeter;
+      const bothStraight = pA.isStraightRoad && pB.isStraightRoad;
+      if (!bothPerimeter && !bothStraight) continue;
+      // Same travel direction (pB outward points opposite to pA outward)
+      if (pA.outDirX * -pB.outDirX + pA.outDirZ * -pB.outDirZ < 0.85) continue;
+      const dx = pB.px - pA.px;
+      const dz = pB.pz - pA.pz;
+      const fwd = dx * pA.outDirX + dz * pA.outDirZ;
+      if (fwd > -14) continue;
+      const perp = Math.abs(dx * -pA.outDirZ + dz * pA.outDirX);
+      const span = -fwd;
+      if (
+        perp <= 3.2 &&
+        (perp + 0.45 < bestPerpDist ||
+          (Math.abs(perp - bestPerpDist) <= 0.45 && span > bestSpanDist))
+      ) {
+        bestPerpDist = perp;
+        bestSpanDist = span;
+        bestWrap = pB;
       }
-      if (bestWrap) {
-        const dest = nodes[bestWrap.inId];
-        pushWorldEdge(outNode.id, dest.id, [{ x: dest.x, z: dest.z }], {
-          isWrap: true,
-          weight: 1.0,
-        });
-      }
+    }
+    if (bestWrap) {
+      const dest = nodes[bestWrap.inId];
+      pushWorldEdge(outNode.id, dest.id, [{ x: dest.x, z: dest.z }], {
+        isWrap: true,
+        weight: 1.0,
+      });
+      continue;
     }
 
     // Smooth in-road turnaround so cars never drive onto grass when a road ends mid-block
@@ -605,13 +656,22 @@ function buildRoadLaneGraph(roadEntries: RoadSpatialEntry[]): RoadLaneGraph {
   return { nodes, edges };
 }
 
-function buildWalkGraph(roadEntries: RoadSpatialEntry[]): WalkGraph {
+function buildWalkGraph(
+  roadEntries: RoadSpatialEntry[],
+  allTargets: StreetTarget[] = [],
+): WalkGraph {
   const nodes: WalkGraphNode[] = [];
   const edges: WalkGraphEdge[][] = [];
 
-  const addNode = (wx: number, wz: number, roadId: string, isCorner = false): number => {
+  const addNode = (
+    wx: number,
+    wz: number,
+    roadId: string,
+    isCorner = false,
+    isSidewalkPath = false,
+  ): number => {
     const id = nodes.length;
-    nodes.push({ id, x: wx, z: wz, roadId, isCorner });
+    nodes.push({ id, x: wx, z: wz, roadId, isCorner, isSidewalkPath });
     edges.push([]);
     return id;
   };
@@ -800,13 +860,33 @@ function buildWalkGraph(roadEntries: RoadSpatialEntry[]): WalkGraph {
     }
   }
 
+  // Include standalone path-sidewalk segments in the pedestrian walk graph
+  for (const target of allTargets) {
+    if (target.kind !== 'path-sidewalk') continue;
+    const cos = Math.cos(target.rotationY);
+    const sin = Math.sin(target.rotationY);
+    const toSW = (lx: number, lz: number) => ({
+      x: target.position.x + lx * cos + lz * sin,
+      z: target.position.z - lx * sin + lz * cos,
+    });
+    const pW = toSW(-3.2, 0);
+    const pM = toSW(0, 0);
+    const pE = toSW(3.2, 0);
+    const idW = addNode(pW.x, pW.z, target.id, false, true);
+    const idM = addNode(pM.x, pM.z, target.id, false, true);
+    const idE = addNode(pE.x, pE.z, target.id, false, true);
+    addEdge(idW, idM, false);
+    addEdge(idM, idE, false);
+  }
+
   // Stitch adjacent sidewalk nodes across distinct road pieces (avoiding roadway crossings)
   for (let i = 0; i < nodes.length; i++) {
     const a = nodes[i];
     for (let j = i + 1; j < nodes.length; j++) {
       const b = nodes[j];
       if (a.roadId === b.roadId) continue;
-      if (Math.hypot(a.x - b.x, a.z - b.z) > 1.05) continue;
+      const stitchDist = a.isSidewalkPath || b.isSidewalkPath ? 1.85 : 1.05;
+      if (Math.hypot(a.x - b.x, a.z - b.z) > stitchDist) continue;
       const mx = (a.x + b.x) * 0.5;
       const mz = (a.z + b.z) * 0.5;
       if (isPointInsideAnyRoadway(mx, mz, roadEntries)) continue;
@@ -862,15 +942,15 @@ function getActorBaseSpeed(kind: TargetKind, rotY: number): number {
     case 'bike':
       return 3.9;
     case 'motorcycle':
-      return 9.1;
+      return 14.5;
     case 'sedan':
-      return Math.cos(rotY) >= 0 ? 7.4 : 8.6;
+      return Math.cos(rotY) >= 0 ? 12.2 : 13.4;
     case 'van':
-      return 6.8;
+      return 11.0;
     case 'truck':
-      return 5.8;
+      return 9.5;
     case 'bus':
-      return 5.4;
+      return 9.0;
     default:
       return 0;
   }
@@ -1043,6 +1123,11 @@ function isPointInsideRoadTargetLocal(
       return Math.abs(lx) <= halfL + 0.04 && Math.abs(lz) <= 4.54;
     }
     case 'road-intersection':
+      return (
+        (Math.abs(lx) <= 4.54 && Math.abs(lz) <= 4.54) ||
+        (Math.abs(lx) <= 4.44 && Math.abs(lz) <= 7.92) ||
+        (Math.abs(lz) <= 4.44 && Math.abs(lx) <= 7.92)
+      );
     case 'road-t-junction':
       return Math.abs(lx) <= 4.54 && Math.abs(lz) <= 4.54;
     case 'road-crosswalk':
@@ -1202,6 +1287,28 @@ function isPointInsideAnyRoadway(
   return false;
 }
 
+function isPointInsideAnyParkingDriveway(
+  wx: number,
+  wz: number,
+  targets: StreetTarget[],
+): boolean {
+  for (let i = 0; i < targets.length; i++) {
+    const t = targets[i];
+    if (t.kind !== 'parking-lot') continue;
+    const dx = wx - t.position.x;
+    const dz = wz - t.position.z;
+    if (dx * dx + dz * dz > 90) continue;
+    const cos = Math.cos(t.rotationY);
+    const sin = Math.sin(t.rotationY);
+    const lx = dx * cos - dz * sin;
+    const lz = dx * sin + dz * cos;
+    if (Math.abs(lx) <= 2.12 && lz >= 4.45 && lz <= 8.0) {
+      return true;
+    }
+  }
+  return false;
+}
+
 function formatCompassSideLabel(dx: number, dz: number, roadLabel: string): string {
   if (Math.hypot(dx, dz) < 0.25) return `Sidewalk · ${roadLabel}`;
   const angle = Math.atan2(dz, dx); // +X=0 (East), +Z=PI/2 (South), -X=PI (West), -Z=-PI/2 (North)
@@ -1261,11 +1368,13 @@ export class StreetSimulatorScene {
     yieldLineR: number;
     approachMaxR: number;
   }> = [];
-  private intersectionEntries: Array<{ x: number; z: number }> = [];
+  private intersectionEntries: Array<{ x: number; z: number; stopBarDist: number }> = [];
   private roadGraph: RoadLaneGraph = { nodes: [], edges: [] };
   private walkGraph: WalkGraph = { nodes: [], edges: [] };
   private trafficControllers: TrafficController[] = [];
   private trafficSignalClock = 0;
+  private simElapsedSeconds = 0;
+  private nextParkingEventTimer = 600 + Math.random() * 300;
   private lastRoadSignature = '__init__';
 
   private raycaster = new THREE.Raycaster();
@@ -1347,6 +1456,7 @@ export class StreetSimulatorScene {
   private freeYaw = 0;
   private freePitch = 0;
   private savedOrbitDistance = 18;
+  private orbitGroundLift = 0;
 
   constructor(container: HTMLElement, callbacks: SceneCallbacks) {
     this.container = container;
@@ -1383,7 +1493,7 @@ export class StreetSimulatorScene {
     this.scene.environmentIntensity = 0.25;
     pmremGenerator.dispose();
 
-    this.camera = new THREE.PerspectiveCamera(46, width / height, 0.1, 320);
+    this.camera = new THREE.PerspectiveCamera(46, width / height, 0.1, 420);
     this.camera.position.set(16.5, 12.5, 21.5);
     this.camera.layers.mask = (1 << 0) | (1 << 2);
 
@@ -1394,21 +1504,22 @@ export class StreetSimulatorScene {
     this.controls.enablePan = true;
     this.controls.screenSpacePanning = false;
     this.controls.panSpeed = 1.35;
-    this.controls.maxPolarAngle = Math.PI * 0.495;
+    this.controls.maxPolarAngle = Math.PI * 0.94;
     this.controls.minDistance = 0.6;
     this.controls.maxDistance = 150.0;
     this.controls.mouseButtons.LEFT = THREE.MOUSE.PAN;
     this.controls.mouseButtons.RIGHT = THREE.MOUSE.ROTATE;
     this.controls.touches.ONE = THREE.TOUCH.ROTATE;
-    this.setCameraControlMode('orbit');
+    this.camera.lookAt(this.controls.target);
     this.applyControlsConfig();
-    this.controls.update();
+    this.setCameraControlMode('pan');
 
     this.controls.addEventListener('start', () => {
       // Cancel scripted camera glide immediately on user drag
       this.cameraTransition.active = false;
     });
     this.controls.addEventListener('change', () => {
+      this.enforceOrbitGroundClearance();
       if (this.lastPointerClient) {
         this.updateCursorProbe(false);
       }
@@ -1546,6 +1657,7 @@ export class StreetSimulatorScene {
     entry: RoadSpatialEntry,
     ownerIdx: number,
     roadEntries: RoadSpatialEntry[],
+    allTargets: StreetTarget[],
     patches: Array<{
       uVals: number[];
       vVals: number[];
@@ -1691,6 +1803,7 @@ export class StreetSimulatorScene {
 
           if (Math.abs(cx) > MAP_HALF_X + 1.5 || Math.abs(cz) > MAP_HALF_Z + 1.5) continue;
           if (isPointInsideAnyRoadway(cx, cz, roadEntries)) continue;
+          if (isPointInsideAnyParkingDriveway(cx, cz, allTargets)) continue;
           if (isClaimedEarlier(cx, cz)) continue;
           active[cIdx] = 1;
           sumX += cx;
@@ -1788,14 +1901,23 @@ export class StreetSimulatorScene {
         this.intersectionEntries.push({
           x: entry.target.position.x,
           z: entry.target.position.z,
+          stopBarDist: entry.target.kind === 'road-t-junction' ? 3.05 : 7.72,
         });
       }
     }
     this.roadGraph = buildRoadLaneGraph(roadEntries);
-    this.walkGraph = buildWalkGraph(roadEntries);
+    this.walkGraph = buildWalkGraph(roadEntries, targets);
     this.pickablesDirty = true;
     for (const actor of this.animatedActors.values()) {
       if (actor.motion === 'drive') {
+        if (
+          actor.parkingPhase === 'entering-lot' ||
+          actor.parkingPhase === 'parked' ||
+          actor.parkingPhase === 'reversing-out'
+        ) {
+          continue;
+        }
+        this.clearActorParkingState(actor);
         actor.graphNodeId = undefined;
         actor.subPath = undefined;
         actor.subPathIdx = 0;
@@ -1840,6 +1962,7 @@ export class StreetSimulatorScene {
         entry,
         ownerIdx,
         roadEntries,
+        targets,
         patches,
       );
       if (!geometry.index || geometry.index.count === 0) {
@@ -2235,7 +2358,12 @@ export class StreetSimulatorScene {
     e.preventDefault();
     this.cameraTransition.active = false;
     this.camera.getWorldDirection(_vec3A);
-    const step = clamp(-e.deltaY * 0.015 * this.controlsConfig.zoomSensitivity, -6, 6);
+    const altScale = 1 + Math.max(0, this.camera.position.y - 4) * 0.045;
+    const step = clamp(
+      -e.deltaY * 0.012 * altScale * this.controlsConfig.zoomSensitivity,
+      -8,
+      8,
+    );
     this.camera.position.addScaledVector(_vec3A, step);
     this.camera.position.x = clamp(this.camera.position.x, -110, 110);
     this.camera.position.y = clamp(this.camera.position.y, 0.45, 75);
@@ -2243,14 +2371,34 @@ export class StreetSimulatorScene {
     this.controls.target
       .copy(this.camera.position)
       .addScaledVector(_vec3A, this.savedOrbitDistance);
+    if (this.lastPointerClient) {
+      this.updateCursorProbe(false);
+    }
     this.requestRender();
   };
+
+  private enforceOrbitGroundClearance(): void {
+    if (this.cameraControlMode !== 'orbit') return;
+    const minCamY = 0.45;
+    if (this.camera.position.y < minCamY) {
+      const lift = minCamY - this.camera.position.y;
+      this.camera.position.y += lift;
+      this.controls.target.y += lift;
+      this.orbitGroundLift += lift;
+    } else if (this.orbitGroundLift > 0 && this.camera.position.y > minCamY) {
+      const relax = Math.min(this.orbitGroundLift, this.camera.position.y - minCamY);
+      this.camera.position.y -= relax;
+      this.controls.target.y -= relax;
+      this.orbitGroundLift -= relax;
+    }
+  }
 
   public setCameraControlMode(mode: CameraControlMode): void {
     if (mode === this.cameraControlMode) return;
     this.cameraControlMode = mode;
     this.isFreeLooking = false;
     this.isFreePanning = false;
+    this.orbitGroundLift = 0;
 
     if (mode === 'pan') {
       // Save current orbit distance and switch to free-look + move mode
@@ -2270,7 +2418,7 @@ export class StreetSimulatorScene {
       this.controls.target
         .copy(this.camera.position)
         .addScaledVector(_vec3A, this.savedOrbitDistance);
-      this.controls.target.y = clamp(this.controls.target.y, 0, 25);
+      this.controls.target.y = clamp(this.controls.target.y, -80, 140);
       this.controls.enabled = true;
       this.applyControlsConfig();
       this.controls.touches.ONE = THREE.TOUCH.ROTATE;
@@ -2327,6 +2475,59 @@ export class StreetSimulatorScene {
     excludeTargetId?: string,
     length?: number,
   ): { x: number; z: number } {
+    if (kind === 'parking-lot') {
+      const outX = Math.sin(rotationY);
+      const outZ = Math.cos(rotationY);
+      let bestDist = Infinity;
+      let bestX = rawX;
+      let bestZ = rawZ;
+
+      for (const target of this.currentTargets) {
+        if (target.id === excludeTargetId) continue;
+        if (target.kind !== 'road-2lane' && target.kind !== 'road-crosswalk') continue;
+        const rCos = Math.cos(target.rotationY);
+        const rSin = Math.sin(target.rotationY);
+        const tx = rCos;
+        const tz = -rSin;
+        const nx = rSin;
+        const nz = rCos;
+        const sideDot = nx * -outX + nz * -outZ;
+        if (Math.abs(sideDot) <= 0.7) continue;
+        const side = sideDot > 0 ? 1 : -1;
+        const dx = rawX - target.position.x;
+        const dz = rawZ - target.position.z;
+        const u = dx * tx + dz * tz;
+        const v = dx * (side * nx) + dz * (side * nz);
+        const halfL =
+          target.kind === 'road-2lane' && target.length && target.length > 0
+            ? target.length * 0.5
+            : target.kind === 'road-crosswalk'
+              ? 3.0
+              : 4.0;
+        if (Math.abs(u) > halfL + 1.5 || Math.abs(v - 12.0) > 3.6) continue;
+        const uSnapped = clamp(Math.round(u * 2) / 2, -halfL, halfL);
+        const cx = target.position.x + uSnapped * tx + 12.0 * side * nx;
+        const cz = target.position.z + uSnapped * tz + 12.0 * side * nz;
+        const d = Math.hypot(cx - rawX, cz - rawZ);
+        if (d < bestDist) {
+          bestDist = d;
+          bestX = cx;
+          bestZ = cz;
+        }
+      }
+
+      if (bestDist < Infinity) {
+        return {
+          x: clamp(Math.round(bestX * 100) / 100, -MAP_HALF_X, MAP_HALF_X),
+          z: clamp(Math.round(bestZ * 100) / 100, -MAP_HALF_Z, MAP_HALF_Z),
+        };
+      }
+      return {
+        x: clamp(this.snapCoordinate(rawX), -MAP_HALF_X, MAP_HALF_X),
+        z: clamp(this.snapCoordinate(rawZ), -MAP_HALF_Z, MAP_HALF_Z),
+      };
+    }
+
     const ports = getSegmentLocalPorts(kind, rotationY, length);
     if (ports.length === 0) {
       return {
@@ -2460,6 +2661,7 @@ export class StreetSimulatorScene {
 
   private isPointOnAnySidewalk(x: number, z: number): boolean {
     if (isPointInsideAnyRoadway(x, z, this.modularRoadEntries)) return false;
+    if (isPointInsideAnyParkingDriveway(x, z, this.currentTargets)) return false;
     for (let i = 0; i < this.modularRoadEntries.length; i++) {
       const entry = this.modularRoadEntries[i];
       const dx = x - entry.target.position.x;
@@ -2483,7 +2685,7 @@ export class StreetSimulatorScene {
   }
 
   private getGroundPlacementHeight(x: number, z: number, kind?: TargetKind): number {
-    if (kind?.startsWith('road-')) return 0;
+    if (kind?.startsWith('road-') || kind === 'parking-lot') return 0;
     return this.isPointOnAnySidewalk(x, z) ? 0.12 : 0;
   }
 
@@ -2572,12 +2774,15 @@ export class StreetSimulatorScene {
       }
     }
 
-    // In Move Camera mode, configured rotate/pan mouse buttons rotate look direction or pan
+    // In Move Camera mode, configured rotate/pan mouse buttons rotate look direction in place or pan
     if (this.cameraControlMode === 'pan') {
       this.cameraTransition.active = false;
       this.lastLookPointer.x = event.clientX;
       this.lastLookPointer.y = event.clientY;
-      if (event.button === this.mouseButtonToIndex(this.controlsConfig.rotateMouseButton)) {
+      if (
+        (event.pointerType === 'touch' && event.isPrimary) ||
+        event.button === this.mouseButtonToIndex(this.controlsConfig.rotateMouseButton)
+      ) {
         _euler.setFromQuaternion(this.camera.quaternion, 'YXZ');
         this.freePitch = _euler.x;
         this.freeYaw = _euler.y;
@@ -2642,13 +2847,11 @@ export class StreetSimulatorScene {
     } else {
       this.lastGroundCursorHit = null;
       this.lastCursorProbePoint = null;
-      _vec3A
-        .copy(this.raycaster.ray.origin)
-        .addScaledVector(this.raycaster.ray.direction, 40);
-      this.cursorProbeMesh.position.copy(_vec3A);
+      this.cursorProbeMesh.visible = false;
       if (computeLux) {
         this.emitStats(null, null);
       }
+      return;
     }
 
     const camDist = this.camera.position.distanceTo(this.cursorProbeMesh.position);
@@ -2710,11 +2913,12 @@ export class StreetSimulatorScene {
       this.lastLookPointer.x = event.clientX;
       this.lastLookPointer.y = event.clientY;
 
-      this.freeYaw -= dx * 0.0045;
+      const lookSens = 0.0042 * this.controlsConfig.rotateSensitivity;
+      this.freeYaw -= dx * lookSens;
       this.freePitch = clamp(
-        this.freePitch - dy * 0.0045,
-        -Math.PI * 0.47,
-        Math.PI * 0.47,
+        this.freePitch - dy * lookSens,
+        -Math.PI * 0.49,
+        Math.PI * 0.49,
       );
       _euler.set(this.freePitch, this.freeYaw, 0, 'YXZ');
       this.camera.quaternion.setFromEuler(_euler);
@@ -2736,11 +2940,15 @@ export class StreetSimulatorScene {
 
       this.camera.getWorldDirection(_vec3A);
       _vec3A.y = 0;
-      if (_vec3A.lengthSq() < 1e-5) _vec3A.set(0, 0, -1);
-      else _vec3A.normalize();
+      if (_vec3A.lengthSq() < 1e-5) {
+        _vec3A.set(-Math.sin(this.freeYaw), 0, -Math.cos(this.freeYaw)).normalize();
+      } else {
+        _vec3A.normalize();
+      }
       _vec3B.crossVectors(_vec3A, this.camera.up).normalize();
 
-      const panScale = 0.03;
+      const panScale =
+        Math.max(4, this.camera.position.y) * 0.0022 * this.controlsConfig.moveSpeed;
       this.camera.position.addScaledVector(_vec3B, -dx * panScale);
       this.camera.position.addScaledVector(_vec3A, dy * panScale);
       this.camera.position.x = clamp(this.camera.position.x, -110, 110);
@@ -2934,6 +3142,7 @@ export class StreetSimulatorScene {
       }
     }
 
+    this.orbitGroundLift = 0;
     this.cameraTransition.active = true;
     this.requestRender();
   }
@@ -3095,10 +3304,11 @@ export class StreetSimulatorScene {
     this.prevShowLuxHeatmap = settings.showLuxHeatmap;
     this.prevLuxThreshold = settings.luxThreshold;
 
-    // Rebuild corridor sidewalks when modular road targets or removed sidewalks change
+    // Rebuild corridor sidewalks & road driveway curb cuts when roads, sidewalks, or parking lots change
+    let roadLayoutChanged = false;
     if (targetsChanged) {
       const roadSig = targets
-        .filter((t) => t.kind.startsWith('road-'))
+        .filter((t) => t.kind.startsWith('road-') || t.kind === 'parking-lot')
         .map(
           (t) =>
             `${t.id}:${t.kind}:${t.position.x.toFixed(2)},${t.position.z.toFixed(2)},${t.rotationY.toFixed(3)},${t.length ?? 0},${(t.hiddenSidewalks ?? []).join(',')}`,
@@ -3106,6 +3316,7 @@ export class StreetSimulatorScene {
         .join('|');
       if (roadSig !== this.lastRoadSignature) {
         this.lastRoadSignature = roadSig;
+        roadLayoutChanged = true;
         this.rebuildSidewalks(targets);
       }
     }
@@ -3388,6 +3599,12 @@ export class StreetSimulatorScene {
               walkSeed: Math.random() * Math.PI * 2,
               walkLookYaw: 0,
               walkLookPitch: 0,
+              crossingWaypoints: t.crossingPath
+                ? t.crossingPath.map((wp) => ({ ...wp }))
+                : undefined,
+              crossingStepIdx: 0,
+              crossingCurbPaused: false,
+              lastCrossingPathRef: t.crossingPath,
             };
             if (actor.motion === 'drive') {
               this.assignInitialGraphRoute(actor);
@@ -3404,18 +3621,39 @@ export class StreetSimulatorScene {
               actor.z = t.position.z;
               actor.lastPropPos.x = t.position.x;
               actor.lastPropPos.z = t.position.z;
+              actor.routeId = t.routeId;
+              actor.crossingWaypoints = t.crossingPath
+                ? t.crossingPath.map((wp) => ({ ...wp }))
+                : undefined;
+              actor.crossingStepIdx = 0;
+              actor.crossingCurbPaused = false;
+              actor.lastCrossingPathRef = t.crossingPath;
               if (actor.motion === 'walk') {
                 this.initPedestrianWalk(actor);
               } else {
+                this.clearActorParkingState(actor);
                 actor.roundaboutSteps = 0;
                 actor.roundaboutTargetSteps = 1 + Math.floor(Math.random() * 8);
                 this.assignInitialGraphRoute(actor);
+              }
+            } else if (
+              t.routeId === 'Crossing' &&
+              t.crossingPath &&
+              t.crossingPath !== actor.lastCrossingPathRef
+            ) {
+              actor.crossingWaypoints = t.crossingPath.map((wp) => ({ ...wp }));
+              actor.crossingStepIdx = 0;
+              actor.crossingCurbPaused = false;
+              actor.lastCrossingPathRef = t.crossingPath;
+              if (actor.motion === 'walk') {
+                this.initPedestrianWalk(actor);
               }
             }
             if (Math.abs(t.rotationY - actor.lastPropRotY) > 1e-4) {
               actor.rotationY = t.rotationY;
               actor.lastPropRotY = t.rotationY;
               if (actor.motion === 'drive') {
+                this.clearActorParkingState(actor);
                 actor.speed =
                   getActorBaseSpeed(actor.kind, actor.rotationY) * (0.82 + Math.random() * 0.36);
                 actor.roundaboutSteps = 0;
@@ -3497,6 +3735,32 @@ export class StreetSimulatorScene {
       this.pedestrianTargets = nextPedestrians;
       this.prevTargetsProp = targets;
       this.prevSelectedTargetId = selectedTargetId;
+
+      for (const actor of this.animatedActors.values()) {
+        if (actor.parkingLotId) {
+          const lot = targets.find(
+            (item) => item.id === actor.parkingLotId && item.kind === 'parking-lot',
+          );
+          const poseChanged =
+            lot &&
+            actor.parkingLotPose &&
+            (Math.hypot(
+              lot.position.x - actor.parkingLotPose.x,
+              lot.position.z - actor.parkingLotPose.z,
+            ) > 0.05 ||
+              Math.abs(lot.rotationY - actor.parkingLotPose.rotationY) > 0.02);
+          if (!lot || poseChanged) {
+            this.clearActorParkingState(actor);
+            if (actor.motion === 'drive') {
+              this.assignInitialGraphRoute(actor);
+            }
+          }
+        }
+      }
+
+      if (roadLayoutChanged) {
+        this.updateRoadDrivewayCurbs(targets);
+      }
 
       this.rebuildTrafficControllers(targets);
       this.updateTrafficLightVisuals();
@@ -3657,7 +3921,11 @@ export class StreetSimulatorScene {
         axisZZ: cos,
         axisXX: cos,
         axisXZ: -sin,
-        stopBarDist: bestInt ? 7.8 : 3.2,
+        stopBarDist: bestInt
+          ? bestInt.kind === 'road-t-junction'
+            ? 3.05
+            : 7.72
+          : 3.2,
         cycleOffset: offset,
       });
     }
@@ -3673,19 +3941,19 @@ export class StreetSimulatorScene {
   } {
     const cycle = 24.0;
     const t = (((this.trafficSignalClock + ctrl.cycleOffset) % cycle) + cycle) % cycle;
-    if (t < 8.0) {
+    if (t < 7.5) {
       return {
         axisX: 'green',
         axisZ: 'red',
-        remX: Math.max(1, Math.ceil(8.0 - t)),
+        remX: Math.max(1, Math.ceil(7.5 - t)),
         remZ: Math.max(1, Math.ceil(12.0 - t)),
       };
     }
-    if (t < 10.0) {
+    if (t < 9.5) {
       return {
         axisX: 'yellow',
         axisZ: 'red',
-        remX: Math.max(1, Math.ceil(10.0 - t)),
+        remX: Math.max(1, Math.ceil(9.5 - t)),
         remZ: Math.max(1, Math.ceil(12.0 - t)),
       };
     }
@@ -3697,20 +3965,20 @@ export class StreetSimulatorScene {
         remZ: Math.max(1, Math.ceil(12.0 - t)),
       };
     }
-    if (t < 20.0) {
+    if (t < 19.5) {
       return {
         axisX: 'red',
         axisZ: 'green',
         remX: Math.max(1, Math.ceil(24.0 - t)),
-        remZ: Math.max(1, Math.ceil(20.0 - t)),
+        remZ: Math.max(1, Math.ceil(19.5 - t)),
       };
     }
-    if (t < 22.0) {
+    if (t < 21.5) {
       return {
         axisX: 'red',
         axisZ: 'yellow',
         remX: Math.max(1, Math.ceil(24.0 - t)),
-        remZ: Math.max(1, Math.ceil(22.0 - t)),
+        remZ: Math.max(1, Math.ceil(21.5 - t)),
       };
     }
     return {
@@ -3825,17 +4093,184 @@ export class StreetSimulatorScene {
     this.frameId = window.setTimeout(poll, 5);
   }
 
+  private countSegmentBuildingHits(
+    x1: number,
+    z1: number,
+    x2: number,
+    z2: number,
+    padding = 0.75,
+    excludeTargetId?: string,
+  ): number {
+    let hits = 0;
+    for (const t of this.currentTargets) {
+      if (excludeTargetId && t.id === excludeTargetId) continue;
+      if (t.motion || (isRoadOrPathKind(t.kind) && t.kind !== 'parking-lot') || t.kind === 'traffic-light') continue;
+      const bDims =
+        t.kind === 'parking-lot'
+          ? { width: 12.8, length: 9.4 }
+          : BUILDING_DEFAULT_DIMENSIONS[t.kind];
+      if (!bDims) continue;
+      const hw = (t.width ?? bDims.width) * 0.5 + padding;
+      const hl = (t.length ?? bDims.length) * 0.5 + padding;
+      const cosR = Math.cos(t.rotationY);
+      const sinR = Math.sin(t.rotationY);
+      const dx1 = x1 - t.position.x;
+      const dz1 = z1 - t.position.z;
+      const lx1 = dx1 * cosR - dz1 * sinR;
+      const lz1 = dx1 * sinR + dz1 * cosR;
+      const dx2 = x2 - t.position.x;
+      const dz2 = z2 - t.position.z;
+      const lx2 = dx2 * cosR - dz2 * sinR;
+      const lz2 = dx2 * sinR + dz2 * cosR;
+
+      let tMin = 0;
+      let tMax = 1;
+      const dlx = lx2 - lx1;
+      const dlz = lz2 - lz1;
+      if (Math.abs(dlx) < 1e-6) {
+        if (lx1 < -hw || lx1 > hw) continue;
+      } else {
+        const inv = 1 / dlx;
+        let t1 = (-hw - lx1) * inv;
+        let t2 = (hw - lx1) * inv;
+        if (t1 > t2) {
+          const tmp = t1;
+          t1 = t2;
+          t2 = tmp;
+        }
+        tMin = Math.max(tMin, t1);
+        tMax = Math.min(tMax, t2);
+        if (tMin > tMax) continue;
+      }
+      if (Math.abs(dlz) < 1e-6) {
+        if (lz1 < -hl || lz1 > hl) continue;
+      } else {
+        const inv = 1 / dlz;
+        let t1 = (-hl - lz1) * inv;
+        let t2 = (hl - lz1) * inv;
+        if (t1 > t2) {
+          const tmp = t1;
+          t1 = t2;
+          t2 = tmp;
+        }
+        tMin = Math.max(tMin, t1);
+        tMax = Math.min(tMax, t2);
+        if (tMin > tMax) continue;
+      }
+      hits++;
+    }
+    return hits;
+  }
+
+  private getOffRoadSteerDirection(
+    actor: AnimatedActorState,
+    goalX: number,
+    goalZ: number,
+  ): { dirX: number; dirZ: number } {
+    const dx = goalX - actor.x;
+    const dz = goalZ - actor.z;
+    const dist = Math.hypot(dx, dz) || 1;
+    let moveX = dx / dist;
+    let moveZ = dz / dist;
+    const myHalfW = getActorHalfWidth(actor.kind);
+    const probeX = actor.x + moveX * Math.min(dist, 2.2);
+    const probeZ = actor.z + moveZ * Math.min(dist, 2.2);
+
+    for (const prop of this.currentTargets) {
+      if (
+        prop.motion ||
+        (isRoadOrPathKind(prop.kind) && prop.kind !== 'parking-lot') ||
+        prop.kind === 'traffic-light'
+      ) {
+        continue;
+      }
+      const bDims =
+        prop.kind === 'parking-lot'
+          ? { width: 12.8, length: 9.4 }
+          : BUILDING_DEFAULT_DIMENSIONS[prop.kind];
+      if (bDims) {
+        const hw = (prop.width ?? bDims.width) * 0.5 + myHalfW + 1.05;
+        const hl = (prop.length ?? bDims.length) * 0.5 + myHalfW + 1.05;
+        const cosR = Math.cos(prop.rotationY);
+        const sinR = Math.sin(prop.rotationY);
+
+        const rx = actor.x - prop.position.x;
+        const rz = actor.z - prop.position.z;
+        const lx = rx * cosR - rz * sinR;
+        const lz = rx * sinR + rz * cosR;
+
+        const prx = probeX - prop.position.x;
+        const prz = probeZ - prop.position.z;
+        const plx = prx * cosR - prz * sinR;
+        const plz = prx * sinR + prz * cosR;
+
+        const insideNow = Math.abs(lx) < hw && Math.abs(lz) < hl;
+        const insideProbe = Math.abs(plx) < hw && Math.abs(plz) < hl;
+        if (insideNow || insideProbe) {
+          const refLx = insideNow ? lx : plx;
+          const refLz = insideNow ? lz : plz;
+          const penX = hw - Math.abs(refLx);
+          const penZ = hl - Math.abs(refLz);
+          const gdx = goalX - prop.position.x;
+          const gdz = goalZ - prop.position.z;
+          const glx = gdx * cosR - gdz * sinR;
+          const glz = gdx * sinR + gdz * cosR;
+          let pushLX = 0;
+          let pushLZ = 0;
+          if (penX < penZ) {
+            pushLX = (refLx >= 0 ? 1 : -1) * (insideNow ? Math.min(1.5, 0.5 + penX * 1.4) : 0.7);
+            const slideDir = Math.abs(refLz) > 0.35 ? (refLz >= 0 ? 1 : -1) : glz >= 0 ? 1 : -1;
+            pushLZ = slideDir * 1.15;
+          } else {
+            pushLZ = (refLz >= 0 ? 1 : -1) * (insideNow ? Math.min(1.5, 0.5 + penZ * 1.4) : 0.7);
+            const slideDir = Math.abs(refLx) > 0.35 ? (refLx >= 0 ? 1 : -1) : glx >= 0 ? 1 : -1;
+            pushLX = slideDir * 1.15;
+          }
+          moveX += pushLX * cosR + pushLZ * sinR;
+          moveZ += -pushLX * sinR + pushLZ * cosR;
+        }
+        continue;
+      }
+
+      if (prop.kind === 'tree') {
+        const minClear = 1.65 + myHalfW;
+        const ox = actor.x - prop.position.x;
+        const oz = actor.z - prop.position.z;
+        const od = Math.hypot(ox, oz);
+        if (od > 0.05 && od < minClear) {
+          const push = ((minClear - od) / minClear) * 1.1;
+          moveX += (ox / od) * push;
+          moveZ += (oz / od) * push;
+        }
+      }
+    }
+
+    const mLen = Math.hypot(moveX, moveZ) || 1;
+    return { dirX: moveX / mLen, dirZ: moveZ / mLen };
+  }
+
   private assignInitialGraphRoute(actor: AnimatedActorState): void {
     actor.graphNodeId = undefined;
     actor.subPath = undefined;
     actor.subPathIdx = 0;
+    actor.seekingRoad = false;
     const { nodes, edges } = this.roadGraph;
     if (nodes.length === 0) return;
 
     const fx = Math.cos(actor.rotationY);
     const fz = -Math.sin(actor.rotationY);
+    const onRoad = isPointInsideAnyRoadway(actor.x, actor.z, this.modularRoadEntries);
     const candidates: Array<{ edge: RoadGraphEdge; subIdx: number; score: number }> = [];
     let bestScore = Infinity;
+
+    let bestSeek: {
+      edge: RoadGraphEdge;
+      subIdx: number;
+      projX: number;
+      projZ: number;
+      score: number;
+    } | null = null;
+    const myHalfW = getActorHalfWidth(actor.kind);
 
     for (let uId = 0; uId < nodes.length; uId++) {
       const startNode = nodes[uId];
@@ -3859,12 +4294,20 @@ export class StreetSimulatorScene {
             const projX = prevX + abX * t;
             const projZ = prevZ + abZ * t;
             const dist = Math.hypot(actor.x - projX, actor.z - projZ);
-            if (dist <= 6.5) {
-              const align = (abX / len) * fx + (abZ / len) * fz;
-              if (align >= 0.25) {
-                const score = dist + (1 - align) * 3.5;
-                if (score < bestScore) bestScore = score;
-                candidates.push({ edge, subIdx: pIdx, score });
+            const align = (abX / len) * fx + (abZ / len) * fz;
+
+            if (dist <= (onRoad ? 6.5 : 3.0) && align >= 0.35) {
+              const score = dist + (1 - align) * 3.5;
+              if (score < bestScore) bestScore = score;
+              candidates.push({ edge, subIdx: pIdx, score });
+            }
+
+            if (!onRoad || candidates.length === 0) {
+              const buildingPenalty =
+                this.countSegmentBuildingHits(actor.x, actor.z, projX, projZ, myHalfW + 0.55) * 28.0;
+              const seekScore = dist + buildingPenalty + (1 - align) * 0.75;
+              if (!bestSeek || seekScore < bestSeek.score) {
+                bestSeek = { edge, subIdx: pIdx, projX, projZ, score: seekScore };
               }
             }
           }
@@ -3874,46 +4317,588 @@ export class StreetSimulatorScene {
       }
     }
 
-    if (candidates.length > 0) {
+    if (candidates.length > 0 && (onRoad || bestScore <= 3.0)) {
       const nearBest = candidates.filter((c) => c.score <= bestScore + 1.25);
       const chosen = nearBest[Math.floor(Math.random() * nearBest.length)];
       actor.graphNodeId = chosen.edge.toNodeId;
       actor.subPath = chosen.edge.points;
       actor.subPathIdx = chosen.subIdx;
+      actor.seekingRoad = false;
+      return;
     }
+
+    if (bestSeek) {
+      const remaining = bestSeek.edge.points.slice(bestSeek.subIdx);
+      const firstRem = remaining[0];
+      const needEntryPt =
+        !firstRem ||
+        Math.hypot(firstRem.x - bestSeek.projX, firstRem.z - bestSeek.projZ) > 0.65;
+      actor.graphNodeId = bestSeek.edge.toNodeId;
+      actor.subPath = needEntryPt
+        ? [{ x: bestSeek.projX, z: bestSeek.projZ }, ...remaining]
+        : remaining;
+      actor.subPathIdx = 0;
+      actor.seekingRoad = true;
+    }
+  }
+
+  private clearActorParkingState(actor: AnimatedActorState): void {
+    actor.parkingPhase = undefined;
+    actor.parkingLotId = undefined;
+    actor.parkingStallIdx = undefined;
+    actor.parkingStallYaw = undefined;
+    actor.parkingExitAisleYaw = undefined;
+    actor.parkingDwellTimer = undefined;
+    actor.parkingPlannedEdges = undefined;
+    actor.parkingApproachTrimmedPoints = undefined;
+    actor.parkingOnFinalEdge = undefined;
+    actor.parkingEntryWaypoints = undefined;
+    actor.parkingReverseWaypoints = undefined;
+    actor.parkingReverseIdx = undefined;
+    actor.parkingReverseSegDist = undefined;
+    actor.parkingReverseStartYaw = undefined;
+    actor.parkingExitRejoinSubIdx = undefined;
+    actor.parkingLotPose = undefined;
+  }
+
+  private updateRoadDrivewayCurbs(targets: StreetTarget[]): void {
+    const lots = targets.filter((t) => t.kind === 'parking-lot');
+    for (const road of targets) {
+      if (road.kind !== 'road-2lane') continue;
+      const roadGroup = this.targetGroups.get(road.id);
+      if (!roadGroup) continue;
+
+      const prevCutGroup = roadGroup.userData.curbCutGroup as THREE.Group | undefined;
+      if (prevCutGroup) {
+        roadGroup.remove(prevCutGroup);
+        prevCutGroup.traverse((child) => {
+          if (child instanceof THREE.Mesh && child.geometry) {
+            child.geometry.dispose();
+          }
+        });
+        roadGroup.userData.curbCutGroup = undefined;
+      }
+
+      const rCos = Math.cos(road.rotationY);
+      const rSin = Math.sin(road.rotationY);
+      const halfL = road.length && road.length > 0 ? road.length * 0.5 : 4.0;
+
+      const curbMeshes: THREE.Mesh[] = [];
+      for (const child of roadGroup.children) {
+        if (child instanceof THREE.Mesh && child.userData.roadCurbSide !== undefined) {
+          curbMeshes.push(child);
+        }
+      }
+      if (curbMeshes.length === 0) continue;
+
+      let newCutGroup: THREE.Group | undefined;
+
+      for (const curb of curbMeshes) {
+        const side = curb.userData.roadCurbSide as number;
+        const curbLz = side * 4.62;
+        const cuts: Array<[number, number]> = [];
+
+        for (const lot of lots) {
+          const corners: Array<[number, number]> = [
+            [-2.06, 4.5],
+            [2.06, 4.5],
+            [-2.06, 7.7],
+            [2.06, 7.7],
+          ];
+          let minLx = Infinity;
+          let maxLx = -Infinity;
+          let minLz = Infinity;
+          let maxLz = -Infinity;
+          for (const [cx, cz] of corners) {
+            const w = this.toLotWorld(lot, cx, cz);
+            const dx = w.x - road.position.x;
+            const dz = w.z - road.position.z;
+            const rlx = dx * rCos - dz * rSin;
+            const rlz = dx * rSin + dz * rCos;
+            if (rlx < minLx) minLx = rlx;
+            if (rlx > maxLx) maxLx = rlx;
+            if (rlz < minLz) minLz = rlz;
+            if (rlz > maxLz) maxLz = rlz;
+          }
+          if (minLz <= curbLz + 0.35 && maxLz >= curbLz - 0.35) {
+            const c0 = Math.max(-halfL, minLx);
+            const c1 = Math.min(halfL, maxLx);
+            if (c1 - c0 > 0.05) {
+              cuts.push([c0, c1]);
+            }
+          }
+        }
+
+        if (cuts.length === 0) {
+          curb.visible = true;
+          continue;
+        }
+
+        curb.visible = false;
+        cuts.sort((a, b) => a[0] - b[0]);
+        const merged: Array<[number, number]> = [];
+        for (const interval of cuts) {
+          const last = merged[merged.length - 1];
+          if (last && interval[0] <= last[1] + 0.02) {
+            last[1] = Math.max(last[1], interval[1]);
+          } else {
+            merged.push([interval[0], interval[1]]);
+          }
+        }
+
+        if (!newCutGroup) {
+          newCutGroup = new THREE.Group();
+          roadGroup.add(newCutGroup);
+          roadGroup.userData.curbCutGroup = newCutGroup;
+        }
+
+        let cursor = -halfL;
+        for (const [c0, c1] of merged) {
+          if (c0 - cursor > 0.05) {
+            const segW = c0 - cursor;
+            const mesh = new THREE.Mesh(new THREE.BoxGeometry(segW, 0.135, 0.24), curb.material);
+            mesh.position.set(cursor + segW * 0.5, 0.0675, curbLz);
+            mesh.receiveShadow = true;
+            newCutGroup.add(mesh);
+          }
+          cursor = Math.max(cursor, c1);
+        }
+        if (halfL - cursor > 0.05) {
+          const segW = halfL - cursor;
+          const mesh = new THREE.Mesh(new THREE.BoxGeometry(segW, 0.135, 0.24), curb.material);
+          mesh.position.set(cursor + segW * 0.5, 0.0675, curbLz);
+          mesh.receiveShadow = true;
+          newCutGroup.add(mesh);
+        }
+      }
+    }
+  }
+
+  private toLotWorld(
+    lot: StreetTarget,
+    lx: number,
+    lz: number,
+  ): { x: number; z: number } {
+    const cosL = Math.cos(lot.rotationY);
+    const sinL = Math.sin(lot.rotationY);
+    return {
+      x: lot.position.x + lx * cosL + lz * sinL,
+      z: lot.position.z - lx * sinL + lz * cosL,
+    };
+  }
+
+  private findNearestRoadConnectionForLot(
+    lot: StreetTarget,
+    myHalfW: number,
+    forwardBiasSign: -1 | 1,
+  ): {
+    fromNodeId: number;
+    edge: RoadGraphEdge;
+    pIdx: number;
+    point: { x: number; z: number };
+    distMouth: number;
+  } | null {
+    const { nodes, edges } = this.roadGraph;
+    if (nodes.length === 0) return null;
+
+    const mouth = this.toLotWorld(lot, 0, 5.1);
+    const apronApproach = this.toLotWorld(lot, 0, 6.8);
+    let best: {
+      fromNodeId: number;
+      edge: RoadGraphEdge;
+      pIdx: number;
+      point: { x: number; z: number };
+      distMouth: number;
+      score: number;
+    } | null = null;
+
+    for (let uId = 0; uId < nodes.length; uId++) {
+      const startNode = nodes[uId];
+      const outEdges = edges[uId];
+      for (const edge of outEdges) {
+        if (edge.isWrap || edge.isUTurn || edge.points.length === 0) continue;
+        let prevX = startNode.x;
+        let prevZ = startNode.z;
+        for (let pIdx = 0; pIdx < edge.points.length; pIdx++) {
+          const pt = edge.points[pIdx];
+          const abX = pt.x - prevX;
+          const abZ = pt.z - prevZ;
+          const lenSq = abX * abX + abZ * abZ;
+          if (lenSq > 1e-4) {
+            const len = Math.sqrt(lenSq);
+            const rawT = clamp(
+              ((mouth.x - prevX) * abX + (mouth.z - prevZ) * abZ) / lenSq,
+              0,
+              1,
+            );
+            const projX = prevX + abX * rawT;
+            const projZ = prevZ + abZ * rawT;
+            const distMouth = Math.hypot(projX - mouth.x, projZ - mouth.z);
+            if (distMouth <= 15.0) {
+              const biasedT = clamp(rawT + (forwardBiasSign * 1.2) / len, 0.04, 0.96);
+              const px = prevX + abX * biasedT;
+              const pz = prevZ + abZ * biasedT;
+
+              let insideIntersection = false;
+              for (const inter of this.intersectionEntries) {
+                if (Math.hypot(px - inter.x, pz - inter.z) < 5.5) {
+                  insideIntersection = true;
+                  break;
+                }
+              }
+              if (
+                !insideIntersection &&
+                this.countSegmentBuildingHits(
+                  px,
+                  pz,
+                  apronApproach.x,
+                  apronApproach.z,
+                  myHalfW + 0.35,
+                  lot.id,
+                ) === 0
+              ) {
+                const score = distMouth;
+                if (!best || score < best.score) {
+                  best = {
+                    fromNodeId: uId,
+                    edge,
+                    pIdx,
+                    point: { x: px, z: pz },
+                    distMouth,
+                    score,
+                  };
+                }
+              }
+            }
+          }
+          prevX = pt.x;
+          prevZ = pt.z;
+        }
+      }
+    }
+
+    return best;
+  }
+
+  private tryAssignParkingTrip(actorId: string, actor: AnimatedActorState): boolean {
+    if (
+      actor.motion !== 'drive' ||
+      (actor.kind !== 'sedan' && actor.kind !== 'van') ||
+      actor.seekingRoad ||
+      actor.parkingPhase !== undefined ||
+      actor.graphNodeId === undefined
+    ) {
+      return false;
+    }
+
+    const { nodes, edges } = this.roadGraph;
+    const nNodes = nodes.length;
+    if (nNodes === 0 || actor.graphNodeId >= nNodes) return false;
+
+    const lots = this.currentTargets.filter((t) => t.kind === 'parking-lot');
+    if (lots.length === 0) return false;
+
+    const reservedStalls = new Set<string>();
+    for (const [otherId, other] of this.animatedActors.entries()) {
+      if (otherId === actorId) continue;
+      if (other.parkingPhase && other.parkingLotId && other.parkingStallIdx !== undefined) {
+        reservedStalls.add(`${other.parkingLotId}::${other.parkingStallIdx}`);
+      }
+    }
+
+    // Dijkstra shortest paths on roadGraph starting from actor.graphNodeId
+    const dist = new Float64Array(nNodes).fill(Infinity);
+    const parentNode = new Int32Array(nNodes).fill(-1);
+    const parentEdge: Array<RoadGraphEdge | null> = new Array(nNodes).fill(null);
+    const visited = new Uint8Array(nNodes);
+    dist[actor.graphNodeId] = 0;
+
+    for (let iter = 0; iter < nNodes; iter++) {
+      let u = -1;
+      let bestD = Infinity;
+      for (let i = 0; i < nNodes; i++) {
+        if (!visited[i] && dist[i] < bestD) {
+          bestD = dist[i];
+          u = i;
+        }
+      }
+      if (u < 0 || bestD === Infinity) break;
+      visited[u] = 1;
+
+      const uNode = nodes[u];
+      for (const edge of edges[u]) {
+        let edgeCost = 0;
+        if (edge.isWrap) {
+          edgeCost = 5.0;
+        } else {
+          let px = uNode.x;
+          let pz = uNode.z;
+          for (const pt of edge.points) {
+            edgeCost += Math.hypot(pt.x - px, pt.z - pz);
+            px = pt.x;
+            pz = pt.z;
+          }
+          if (edge.isUTurn) edgeCost += 500;
+        }
+        const cand = bestD + edgeCost;
+        if (cand < dist[edge.toNodeId]) {
+          dist[edge.toNodeId] = cand;
+          parentNode[edge.toNodeId] = u;
+          parentEdge[edge.toNodeId] = edge;
+        }
+      }
+    }
+
+    const myHalfW = getActorHalfWidth(actor.kind);
+    const candidates: Array<{
+      lot: StreetTarget;
+      stall: ParkingStallSpec;
+      conn: NonNullable<ReturnType<StreetSimulatorScene['findNearestRoadConnectionForLot']>>;
+      score: number;
+    }> = [];
+
+    for (const lot of lots) {
+      const openStalls = getParkingLotOpenStalls(lot.id).filter(
+        (s) => !reservedStalls.has(`${lot.id}::${s.idx}`),
+      );
+      if (openStalls.length === 0) continue;
+
+      const conn = this.findNearestRoadConnectionForLot(lot, myHalfW, -1);
+      if (!conn || dist[conn.fromNodeId] === Infinity) continue;
+
+      // Prefer stalls sorted closer to front/middle if multiple stalls are open
+      const chosenStall =
+        openStalls.find((s) => s.z >= -0.5) ??
+        openStalls[Math.floor(Math.random() * openStalls.length)];
+
+      candidates.push({
+        lot,
+        stall: chosenStall,
+        conn,
+        score: dist[conn.fromNodeId] + conn.distMouth * 4.0 + Math.random() * 12.0,
+      });
+    }
+
+    if (candidates.length === 0) return false;
+    candidates.sort((a, b) => a.score - b.score);
+    const picked = candidates[0];
+
+    const plannedEdges: RoadGraphEdge[] = [];
+    let cur = picked.conn.fromNodeId;
+    let guard = 0;
+    while (cur !== actor.graphNodeId && guard < nNodes + 2) {
+      const pe = parentEdge[cur];
+      const pn = parentNode[cur];
+      if (!pe || pn < 0) {
+        return false;
+      }
+      plannedEdges.push(pe);
+      cur = pn;
+      guard++;
+    }
+    plannedEdges.reverse();
+    plannedEdges.push(picked.conn.edge);
+
+    const { lot, stall, conn } = picked;
+    const signX = stall.x >= 0 ? 1 : -1;
+    const stallDepth = actor.kind === 'van' ? 3.55 : 3.85;
+    const entryWaypoints: Array<{ x: number; z: number }> = [
+      this.toLotWorld(lot, 0, 6.8),
+      this.toLotWorld(lot, 0, 4.6),
+    ];
+    if (stall.z < 1.5) {
+      entryWaypoints.push(this.toLotWorld(lot, 0, stall.z + 2.1));
+    }
+    entryWaypoints.push(
+      this.toLotWorld(lot, -0.28 * signX, stall.z + 0.95),
+      this.toLotWorld(lot, 1.45 * signX, stall.z + 0.12),
+      this.toLotWorld(lot, stallDepth * signX, stall.z),
+    );
+
+    const trimmedPoints = [...conn.edge.points.slice(0, conn.pIdx), conn.point];
+
+    actor.parkingPhase = 'approaching-lot';
+    actor.parkingLotId = lot.id;
+    actor.parkingStallIdx = stall.idx;
+    actor.parkingStallYaw = stall.inwardYaw + lot.rotationY;
+    actor.parkingExitAisleYaw = Math.atan2(-Math.cos(lot.rotationY), Math.sin(lot.rotationY));
+    actor.parkingLotPose = {
+      x: lot.position.x,
+      z: lot.position.z,
+      rotationY: lot.rotationY,
+    };
+    actor.parkingPlannedEdges = plannedEdges;
+    actor.parkingApproachTrimmedPoints = trimmedPoints;
+    actor.parkingOnFinalEdge = false;
+    actor.parkingEntryWaypoints = entryWaypoints;
+    actor.roundaboutTargetSteps = 1;
+    return true;
+  }
+
+  private getWrapEdgeForNode(nodeId: number | undefined): RoadGraphEdge | null {
+    if (nodeId === undefined) return null;
+    const outEdges = this.roadGraph.edges[nodeId];
+    if (!outEdges || outEdges.length === 0) return null;
+    const wrapEdge = outEdges.find((e) => e.isWrap);
+    if (!wrapEdge) return null;
+    const hasRegularExit = outEdges.some((e) => !e.isWrap && !e.isUTurn);
+    return hasRegularExit ? null : wrapEdge;
+  }
+
+  private resolveWrapPlacement(
+    actorId: string,
+    actor: AnimatedActorState,
+    destNodeId: number,
+  ): { clear: boolean; x: number; z: number } {
+    const { nodes, edges } = this.roadGraph;
+    const dest = nodes[destNodeId];
+    if (!dest) return { clear: false, x: actor.x, z: actor.z };
+
+    const myHalfW = getActorHalfWidth(actor.kind);
+    let maxOutSegLen = 8.0;
+    const destOutEdges = edges[destNodeId];
+    if (destOutEdges && destOutEdges.length > 0 && destOutEdges[0].points.length > 0) {
+      let px = dest.x;
+      let pz = dest.z;
+      let len = 0;
+      for (const pt of destOutEdges[0].points) {
+        len += Math.hypot(pt.x - px, pt.z - pz);
+        px = pt.x;
+        pz = pt.z;
+      }
+      if (len > 0.1) maxOutSegLen = len;
+    }
+
+    let maxStopInset = Infinity;
+    for (const ctrl of this.trafficControllers) {
+      const relX = ctrl.cx - dest.x;
+      const relZ = ctrl.cz - dest.z;
+      const fwdToInt = relX * dest.dirX + relZ * dest.dirZ;
+      if (fwdToInt <= 0 || fwdToInt >= 26.0) continue;
+      const latToInt = Math.abs(relX * -dest.dirZ + relZ * dest.dirX);
+      if (latToInt > 4.25) continue;
+      const roomBeforeBar = fwdToInt - ctrl.stopBarDist - actor.halfLen - 0.35;
+      if (roomBeforeBar < maxStopInset) maxStopInset = roomBeforeBar;
+    }
+
+    const idealInset = clamp(
+      Math.min(actor.halfLen, maxOutSegLen - 0.65, maxStopInset),
+      0,
+      actor.halfLen,
+    );
+    const candidateInsets: number[] = [];
+    if (idealInset > 0.25) candidateInsets.push(idealInset);
+    if (idealInset > 1.2) candidateInsets.push(idealInset * 0.5);
+    candidateInsets.push(0);
+
+    const isSpawnClearAt = (sx: number, sz: number): boolean => {
+      for (const t of this.vehicleTargets) {
+        if (t.id === actorId) continue;
+        const other = this.animatedActors.get(t.id);
+        if (other?.parkingPhase === 'parked') continue;
+        const ox = other ? other.x : t.position.x;
+        const oz = other ? other.z : t.position.z;
+        const oRotY = other ? other.rotationY : t.rotationY;
+        const ofx = Math.cos(oRotY);
+        const ofz = -Math.sin(oRotY);
+        const otherHalfLen = other ? other.halfLen : getActorHalfLength(t.kind);
+        const otherHalfW = getActorHalfWidth(t.kind);
+
+        const dx = ox - sx;
+        const dz = oz - sz;
+        const relFwd = dx * dest.dirX + dz * dest.dirZ;
+        const lat = Math.abs(dx * -dest.dirZ + dz * dest.dirX);
+
+        const dotH = dest.dirX * ofx + dest.dirZ * ofz;
+        const sinH = Math.sqrt(Math.max(0, 1 - dotH * dotH));
+        const oProjL = otherHalfLen * Math.abs(dotH) + otherHalfW * sinH;
+        const oProjW = otherHalfLen * sinH + otherHalfW * Math.abs(dotH);
+
+        if (lat < myHalfW + oProjW + 0.45) {
+          const minClearFront = actor.halfLen + oProjL + 0.85;
+          const minClearRear = actor.halfLen + oProjL + 0.6;
+          if (relFwd > -minClearRear && relFwd < minClearFront) {
+            return false;
+          }
+        }
+      }
+      return true;
+    };
+
+    for (const inset of candidateInsets) {
+      const sx = dest.x + dest.dirX * inset;
+      const sz = dest.z + dest.dirZ * inset;
+      if (isSpawnClearAt(sx, sz)) {
+        return { clear: true, x: sx, z: sz };
+      }
+    }
+    return { clear: false, x: dest.x, z: dest.z };
   }
 
   private pickNextGraphEdge(
     actorId: string,
     actor: AnimatedActorState,
     nodeId: number,
-  ): RoadGraphEdge | null {
-    const { nodes, edges } = this.roadGraph;
+  ): { edge: RoadGraphEdge | null; waitForWrap: boolean; wrapPos?: { x: number; z: number } } {
+    const { edges } = this.roadGraph;
     const outEdges = edges[nodeId];
-    if (!outEdges || outEdges.length === 0) return null;
+    if (!outEdges || outEdges.length === 0) {
+      return { edge: null, waitForWrap: false };
+    }
 
-    const isWrapDestinationClear = (destId: number): boolean => {
-      const dest = nodes[destId];
-      for (const t of this.vehicleTargets) {
-        if (t.id === actorId) continue;
-        const other = this.animatedActors.get(t.id);
-        const ox = other ? other.x : t.position.x;
-        const oz = other ? other.z : t.position.z;
-        if (Math.hypot(ox - dest.x, oz - dest.z) < 10.5) return false;
+    const wrapPlacements = new Map<number, { clear: boolean; x: number; z: number }>();
+    const getPlacement = (destId: number) => {
+      let res = wrapPlacements.get(destId);
+      if (!res) {
+        res = this.resolveWrapPlacement(actorId, actor, destId);
+        wrapPlacements.set(destId, res);
       }
-      return true;
+      return res;
     };
 
     const usable = outEdges.filter(
-      (e) => !e.isWrap || isWrapDestinationClear(e.toNodeId),
+      (e) => !e.isWrap || getPlacement(e.toNodeId).clear,
     );
+
+    if (
+      actor.parkingPhase === 'approaching-lot' &&
+      actor.parkingPlannedEdges &&
+      actor.parkingPlannedEdges.length > 0
+    ) {
+      const nextPlanned = actor.parkingPlannedEdges[0];
+      if (outEdges.includes(nextPlanned)) {
+        if (nextPlanned.isWrap) {
+          const placement = getPlacement(nextPlanned.toNodeId);
+          if (!placement.clear) {
+            return { edge: null, waitForWrap: true };
+          }
+          actor.parkingPlannedEdges.shift();
+          return {
+            edge: nextPlanned,
+            waitForWrap: false,
+            wrapPos: { x: placement.x, z: placement.z },
+          };
+        }
+        actor.parkingPlannedEdges.shift();
+        if (actor.parkingPlannedEdges.length === 0 && actor.parkingApproachTrimmedPoints) {
+          actor.parkingOnFinalEdge = true;
+          return {
+            edge: {
+              ...nextPlanned,
+              points: actor.parkingApproachTrimmedPoints,
+            },
+            waitForWrap: false,
+          };
+        }
+        return { edge: nextPlanned, waitForWrap: false };
+      }
+      this.clearActorParkingState(actor);
+    }
+
     const nonUTurn = usable.filter((e) => !e.isUTurn);
     let pool = nonUTurn.length > 0 ? nonUTurn : usable;
-    if (pool.length === 0) return null;
-
-    // Include occasional U-turns at open perimeter exits so traffic loops back unpredictably
-    if (usable.length > nonUTurn.length && Math.random() < 0.25) {
-      pool = usable;
+    if (pool.length === 0) {
+      return { edge: null, waitForWrap: outEdges.some((e) => e.isWrap) };
     }
 
     const maxLoopSteps = actor.roundaboutTargetSteps ?? 3;
@@ -3925,18 +4910,39 @@ export class StreetSimulatorScene {
     let totalWeight = 0;
     for (const e of pool) totalWeight += e.weight;
     let r = Math.random() * totalWeight;
+    let picked = pool[pool.length - 1];
     for (const e of pool) {
       r -= e.weight;
-      if (r <= 0) return e;
+      if (r <= 0) {
+        picked = e;
+        break;
+      }
     }
-    return pool[pool.length - 1];
+    if (picked.isWrap) {
+      const placement = getPlacement(picked.toNodeId);
+      return {
+        edge: picked,
+        waitForWrap: false,
+        wrapPos: { x: placement.x, z: placement.z },
+      };
+    }
+    return { edge: picked, waitForWrap: false };
   }
 
   private isPointBlockedForPedestrian(px: number, pz: number): boolean {
     if (Math.abs(px) > MAP_HALF_X - 1.0 || Math.abs(pz) > MAP_HALF_Z - 1.0) return true;
     for (const t of this.currentTargets) {
-      if (t.motion || isRoadOrPathKind(t.kind) || t.kind === 'traffic-light') continue;
-      const bDims = BUILDING_DEFAULT_DIMENSIONS[t.kind];
+      if (
+        t.motion ||
+        (isRoadOrPathKind(t.kind) && t.kind !== 'parking-lot') ||
+        t.kind === 'traffic-light'
+      ) {
+        continue;
+      }
+      const bDims =
+        t.kind === 'parking-lot'
+          ? { width: 12.8, length: 9.4 }
+          : BUILDING_DEFAULT_DIMENSIONS[t.kind];
       if (bDims) {
         const hw = (t.width ?? bDims.width) * 0.5 + 0.55;
         const hl = (t.length ?? bDims.length) * 0.5 + 0.55;
@@ -3966,32 +4972,196 @@ export class StreetSimulatorScene {
     actor.walkGoalX = undefined;
     actor.walkGoalZ = undefined;
     actor.walkIsCrosswalk = false;
+    actor.crossingCurbPaused = false;
+    actor.seekingSidewalk = false;
+
+    const onSidewalk = isPointOnSidewalkSegment(actor.x, actor.z, this.currentTargets);
+    const onRoadNow = this.isOnCrosswalkArea(actor.x, actor.z);
+
+    // Automatically generate or activate a 'Crossing' animation path when placed on a
+    // sidewalk segment near a road-crosswalk tile (approach -> pause at curb -> cross).
+    if (onSidewalk && !onRoadNow) {
+      const hasValidWaypoints =
+        actor.routeId === 'Crossing' &&
+        actor.crossingWaypoints &&
+        actor.crossingWaypoints.length > 0 &&
+        (actor.crossingStepIdx ?? 0) < actor.crossingWaypoints.length;
+      const crossingPlan = hasValidWaypoints
+        ? actor.crossingWaypoints
+        : generatePedestrianCrossingPath(
+            { x: actor.x, z: actor.z },
+            this.currentTargets,
+          );
+      if (crossingPlan && crossingPlan.length > 0) {
+        actor.crossingWaypoints = crossingPlan.map((wp) => ({ ...wp }));
+        actor.crossingStepIdx = 0;
+        actor.crossingCurbPaused = false;
+        actor.walkPauseTimer = 0;
+        actor.walkGoalX = actor.crossingWaypoints[0].x;
+        actor.walkGoalZ = actor.crossingWaypoints[0].z;
+        actor.walkIsCrosswalk = actor.crossingWaypoints[0].action === 'cross';
+        return;
+      }
+    }
+    actor.crossingWaypoints = undefined;
+    actor.crossingStepIdx = 0;
 
     const nodes = this.walkGraph.nodes;
     if (nodes.length > 0) {
-      let bestId = -1;
-      let bestDist = 4.5;
-      for (const n of nodes) {
-        if (this.walkGraph.edges[n.id].length === 0) continue;
-        const d = Math.hypot(n.x - actor.x, n.z - actor.z);
-        if (d < bestDist) {
-          // Ensure acquiring the starting sidewalk node doesn't step across an unmarked road
-          const mx = (actor.x + n.x) * 0.5;
-          const mz = (actor.z + n.z) * 0.5;
-          if (!isPointInsideAnyRoadway(mx, mz, this.modularRoadEntries)) {
-            bestDist = d;
-            bestId = n.id;
+      if (onSidewalk && !onRoadNow) {
+        let bestId = -1;
+        let bestDist = 4.5;
+        for (const n of nodes) {
+          if (this.walkGraph.edges[n.id].length === 0) continue;
+          const d = Math.hypot(n.x - actor.x, n.z - actor.z);
+          if (d < bestDist) {
+            // Ensure acquiring the starting sidewalk node doesn't step across an unmarked road
+            const mx = (actor.x + n.x) * 0.5;
+            const mz = (actor.z + n.z) * 0.5;
+            if (!isPointInsideAnyRoadway(mx, mz, this.modularRoadEntries)) {
+              bestDist = d;
+              bestId = n.id;
+            }
+          }
+        }
+        if (bestId >= 0) {
+          actor.walkCurrNodeId = bestId;
+          this.pickNextWalkTarget(actor);
+          return;
+        }
+      }
+
+      // Not on a sidewalk (or on a long sidewalk segment >4.5m from a node):
+      // seek the nearest point along any sidewalk edge in the walk graph.
+      let bestSeek: {
+        px: number;
+        pz: number;
+        nodeA: number;
+        nodeB: number;
+        t: number;
+        score: number;
+      } | null = null;
+
+      for (let i = 0; i < nodes.length; i++) {
+        const a = nodes[i];
+        const out = this.walkGraph.edges[i];
+        for (const e of out) {
+          if (e.isCrosswalk || e.toNodeId < i) continue;
+          const b = nodes[e.toNodeId];
+          const abX = b.x - a.x;
+          const abZ = b.z - a.z;
+          const lenSq = abX * abX + abZ * abZ;
+          const t =
+            lenSq > 1e-4
+              ? clamp(((actor.x - a.x) * abX + (actor.z - a.z) * abZ) / lenSq, 0, 1)
+              : 0;
+          const px = a.x + abX * t;
+          const pz = a.z + abZ * t;
+          const dist = Math.hypot(px - actor.x, pz - actor.z);
+
+          let roadPenalty = 0;
+          if (!onRoadNow) {
+            for (const u of [0.25, 0.5, 0.75]) {
+              const sx = actor.x + (px - actor.x) * u;
+              const sz = actor.z + (pz - actor.z) * u;
+              if (isPointInsideAnyRoadway(sx, sz, this.modularRoadEntries)) {
+                roadPenalty = 24.0;
+                break;
+              }
+            }
+          }
+          const buildingPenalty =
+            this.countSegmentBuildingHits(actor.x, actor.z, px, pz, 0.55) * 8.5;
+          const score = dist + roadPenalty + buildingPenalty;
+          if (!bestSeek || score < bestSeek.score) {
+            bestSeek = { px, pz, nodeA: a.id, nodeB: b.id, t, score };
           }
         }
       }
-      if (bestId >= 0) {
-        actor.walkCurrNodeId = bestId;
-        this.pickNextWalkTarget(actor);
+
+      if (!bestSeek) {
+        for (const n of nodes) {
+          const dist = Math.hypot(n.x - actor.x, n.z - actor.z);
+          let roadPenalty = 0;
+          if (!onRoadNow) {
+            const mx = (actor.x + n.x) * 0.5;
+            const mz = (actor.z + n.z) * 0.5;
+            if (isPointInsideAnyRoadway(mx, mz, this.modularRoadEntries)) {
+              roadPenalty = 24.0;
+            }
+          }
+          const buildingPenalty =
+            this.countSegmentBuildingHits(actor.x, actor.z, n.x, n.z, 0.55) * 8.5;
+          const score = dist + roadPenalty + buildingPenalty;
+          if (!bestSeek || score < bestSeek.score) {
+            bestSeek = { px: n.x, pz: n.z, nodeA: n.id, nodeB: n.id, t: 0, score };
+          }
+        }
+      }
+
+      if (bestSeek) {
+        const targetNode = bestSeek.t <= 0.5 ? bestSeek.nodeB : bestSeek.nodeA;
+        const prevNode = bestSeek.t <= 0.5 ? bestSeek.nodeA : bestSeek.nodeB;
+        if (onSidewalk && !onRoadNow) {
+          actor.walkCurrNodeId = targetNode;
+          actor.walkPrevNodeId = prevNode;
+          actor.walkGoalX = nodes[targetNode].x;
+          actor.walkGoalZ = nodes[targetNode].z;
+          actor.walkIsCrosswalk = false;
+          actor.seekingSidewalk = false;
+        } else {
+          actor.walkCurrNodeId = targetNode;
+          actor.walkPrevNodeId = prevNode;
+          actor.walkGoalX = bestSeek.px;
+          actor.walkGoalZ = bestSeek.pz;
+          actor.walkIsCrosswalk = false;
+          actor.walkPauseTimer = 0;
+          actor.seekingSidewalk = true;
+        }
         return;
       }
     }
 
     this.pickRandomFreeWalkTarget(actor);
+  }
+
+  private transitionAfterCrossingPath(actor: AnimatedActorState): void {
+    actor.crossingWaypoints = undefined;
+    actor.crossingStepIdx = 0;
+    actor.crossingCurbPaused = false;
+    actor.walkIsCrosswalk = false;
+
+    const nodes = this.walkGraph.nodes;
+    let bestId = -1;
+    let bestDist = 2.6;
+    for (const n of nodes) {
+      const outEdges = this.walkGraph.edges[n.id];
+      const hasSidewalkContinuation = outEdges.some((e) => !e.isCrosswalk);
+      if (!hasSidewalkContinuation) continue;
+      const d = Math.hypot(n.x - actor.x, n.z - actor.z);
+      if (d < bestDist) {
+        const mx = (actor.x + n.x) * 0.5;
+        const mz = (actor.z + n.z) * 0.5;
+        if (!isPointInsideAnyRoadway(mx, mz, this.modularRoadEntries)) {
+          bestDist = d;
+          bestId = n.id;
+        }
+      }
+    }
+
+    if (bestId >= 0) {
+      actor.walkCurrNodeId = bestId;
+      actor.walkPrevNodeId = undefined;
+      this.pickNextWalkTarget(actor);
+      actor.walkPauseTimer = 0.5 + Math.random() * 1.1;
+      return;
+    }
+
+    // Isolated crosswalk + sidewalk segment: pause briefly on the far sidewalk before crossing back
+    actor.walkCurrNodeId = undefined;
+    actor.walkGoalX = actor.x;
+    actor.walkGoalZ = actor.z;
+    actor.walkPauseTimer = 0.9 + Math.random() * 0.9;
   }
 
   private pickRandomFreeWalkTarget(actor: AnimatedActorState): void {
@@ -4097,11 +5267,13 @@ export class StreetSimulatorScene {
     }
 
     // Strictly wait behind the curb at roads with traffic lights unless the crossing light is GREEN
-    if (this.trafficControllers.length > 0) {
-      const aheadNearX = actor.x + dirX * 1.35;
-      const aheadNearZ = actor.z + dirZ * 1.35;
-      const aheadFarX = actor.x + dirX * 2.15;
-      const aheadFarZ = actor.z + dirZ * 2.15;
+    if (this.trafficControllers.length > 0 && (actor.walkIsCrosswalk || stepLen > 1.0)) {
+      const dNear = Math.min(stepLen, 1.35);
+      const dFar = Math.min(stepLen, 2.15);
+      const aheadNearX = actor.x + dirX * dNear;
+      const aheadNearZ = actor.z + dirZ * dNear;
+      const aheadFarX = actor.x + dirX * dFar;
+      const aheadFarZ = actor.z + dirZ * dFar;
       const approachingRoad =
         this.isOnCrosswalkArea(aheadNearX, aheadNearZ) ||
         this.isOnCrosswalkArea(aheadFarX, aheadFarZ) ||
@@ -4124,8 +5296,9 @@ export class StreetSimulatorScene {
     }
 
     // Only check oncoming car yield when about to enter the roadway at the curb
-    const curbProbeX = actor.x + dirX * 1.8;
-    const curbProbeZ = actor.z + dirZ * 1.8;
+    const curbProbeDist = Math.min(stepLen, 1.8);
+    const curbProbeX = actor.x + dirX * curbProbeDist;
+    const curbProbeZ = actor.z + dirZ * curbProbeDist;
     if (!this.isOnCrosswalkArea(curbProbeX, curbProbeZ)) {
       return false;
     }
@@ -4270,10 +5443,80 @@ export class StreetSimulatorScene {
     return minHitFwd;
   }
 
+  private wouldCollideWithVehicleAhead(
+    id: string,
+    actor: AnimatedActorState,
+    nx: number,
+    nz: number,
+    nRotY: number,
+  ): boolean {
+    const fx = Math.cos(nRotY);
+    const fz = -Math.sin(nRotY);
+    const rx = -fz;
+    const rz = fx;
+    const myHalfW = getActorHalfWidth(actor.kind);
+
+    for (const t of this.vehicleTargets) {
+      if (t.id === id) continue;
+      const otherAnim = this.animatedActors.get(t.id);
+      if (
+        otherAnim?.parkingPhase === 'parked' &&
+        (actor.parkingPhase === 'entering-lot' ||
+          actor.parkingPhase === 'reversing-out' ||
+          actor.parkingPhase === 'exiting-lot') &&
+        otherAnim.parkingLotId === actor.parkingLotId &&
+        otherAnim.parkingStallIdx !== actor.parkingStallIdx
+      ) {
+        continue;
+      }
+      const ox = otherAnim ? otherAnim.x : t.position.x;
+      const oz = otherAnim ? otherAnim.z : t.position.z;
+      const oRotY = otherAnim ? otherAnim.rotationY : t.rotationY;
+      const ofx = Math.cos(oRotY);
+      const ofz = -Math.sin(oRotY);
+      const oHalfL = otherAnim ? otherAnim.halfLen : getActorHalfLength(t.kind);
+      const oHalfW = getActorHalfWidth(t.kind);
+
+      const dx = ox - nx;
+      const dz = oz - nz;
+      const maxR = actor.halfLen + oHalfL + myHalfW + oHalfW + 1.2;
+      if (dx * dx + dz * dz > maxR * maxR) continue;
+
+      const dotH = fx * ofx + fz * ofz;
+      const sinH = Math.sqrt(Math.max(0, 1 - dotH * dotH));
+      const oProjL = oHalfL * Math.abs(dotH) + oHalfW * sinH;
+      const oProjW = oHalfL * sinH + oHalfW * Math.abs(dotH);
+
+      const fwd = dx * fx + dz * fz;
+      const lat = Math.abs(dx * rx + dz * rz);
+
+      if (
+        fwd > -actor.halfLen * 0.25 &&
+        fwd < actor.halfLen + oProjL + 0.85 &&
+        lat < myHalfW + oProjW + 0.24
+      ) {
+        const curDx = ox - actor.x;
+        const curDz = oz - actor.z;
+        const curFwd = curDx * fx + curDz * fz;
+        const curDistSq = curDx * curDx + curDz * curDz;
+        const newDistSq = dx * dx + dz * dz;
+        if (fwd < curFwd - 1e-4 || newDistSq < curDistSq - 1e-4) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
   private getVehicleTrafficScale(
     id: string,
     actor: AnimatedActorState,
-  ): { scale: number; yieldingToPed: boolean; hardStop: boolean } {
+  ): {
+    scale: number;
+    yieldingToPed: boolean;
+    hardStop: boolean;
+    maxAdvanceDist: number;
+  } {
     const fx = Math.cos(actor.rotationY);
     const fz = -Math.sin(actor.rotationY);
     const rx = -fz;
@@ -4282,77 +5525,118 @@ export class StreetSimulatorScene {
     let minScale = 1;
     let yieldingToPed = false;
     let hardStop = false;
+    let maxAdvanceDist = Infinity;
 
-    // Determine if actor is already inside any intersection clearing box
+    const inParkingManeuver =
+      actor.parkingPhase === 'entering-lot' ||
+      actor.parkingPhase === 'reversing-out' ||
+      (actor.parkingPhase === 'exiting-lot' && (actor.subPathIdx ?? 0) <= 1);
+
+    // Determine if actor is already inside any intersection clearing box or already past the horizontal white stop bar
     let actorInsideAnyIntersection = false;
-    for (const inter of this.intersectionEntries) {
-      if (
-        this.isVehicleInIntersectionBox(
-          actor.x,
-          actor.z,
-          fx,
-          fz,
-          actor.halfLen,
-          myHalfW,
-          inter.x,
-          inter.z,
-        )
-      ) {
-        actorInsideAnyIntersection = true;
-        break;
+    if (!inParkingManeuver) {
+      for (const inter of this.intersectionEntries) {
+        if (
+          this.isVehicleInIntersectionBox(
+            actor.x,
+            actor.z,
+            fx,
+            fz,
+            actor.halfLen,
+            myHalfW,
+            inter.x,
+            inter.z,
+          )
+        ) {
+          actorInsideAnyIntersection = true;
+          break;
+        }
+        const relX = inter.x - actor.x;
+        const relZ = inter.z - actor.z;
+        const fwdToInt = relX * fx + relZ * fz;
+        const latToInt = Math.abs(relX * rx + relZ * rz);
+        if (
+          fwdToInt > 0 &&
+          latToInt <= 4.25 &&
+          fwdToInt - actor.halfLen < inter.stopBarDist - 0.12
+        ) {
+          actorInsideAnyIntersection = true;
+          break;
+        }
       }
     }
 
-    // 0. Obey intersection traffic signals (stop behind stop bar on Red / early Yellow)
-    for (const ctrl of this.trafficControllers) {
-      const relX = ctrl.cx - actor.x;
-      const relZ = ctrl.cz - actor.z;
-      const fwdToInt = relX * fx + relZ * fz;
-      if (fwdToInt <= 0 || fwdToInt >= 23.0) continue;
-      const latToInt = Math.abs(relX * rx + relZ * rz);
-      if (latToInt > 4.25) continue;
+    // 0. Obey intersection traffic signals:
+    // Cars MUST NOT enter or cross past the horizontal white line during a red light,
+    // and ONLY keep moving during red if their front is already past the horizontal white line.
+    if (!inParkingManeuver) {
+      for (const ctrl of this.trafficControllers) {
+        const relX = ctrl.cx - actor.x;
+        const relZ = ctrl.cz - actor.z;
+        const fwdToInt = relX * fx + relZ * fz;
+        if (fwdToInt <= 0 || fwdToInt >= 28.0) continue;
+        const latToInt = Math.abs(relX * rx + relZ * rz);
+        if (latToInt > 4.25) continue;
 
-      const aspects = this.getTrafficSignalAspects(ctrl);
-      const dotZ = Math.abs(fx * ctrl.axisZX + fz * ctrl.axisZZ);
-      const dotX = Math.abs(fx * ctrl.axisXX + fz * ctrl.axisXZ);
-      const aspect = dotZ >= dotX ? aspects.axisZ : aspects.axisX;
+        const aspects = this.getTrafficSignalAspects(ctrl);
+        const dotZ = Math.abs(fx * ctrl.axisZX + fz * ctrl.axisZZ);
+        const dotX = Math.abs(fx * ctrl.axisXX + fz * ctrl.axisXZ);
+        const aspect = dotZ >= dotX ? aspects.axisZ : aspects.axisX;
 
-      if (aspect === 'green') continue;
+        if (aspect === 'green') continue;
 
-      const distToStopBar = fwdToInt - actor.halfLen - ctrl.stopBarDist;
-      if (aspect === 'red') {
-        if (distToStopBar >= -0.35 && distToStopBar <= 16.5) {
-          const s = distToStopBar <= 0.15 ? 0 : clamp(distToStopBar / 8.5, 0, 1);
-          if (s < minScale) minScale = s;
-          if (distToStopBar <= 0.22) hardStop = true;
-        }
-      } else if (aspect === 'yellow') {
-        if (distToStopBar >= 0.8 && distToStopBar <= 16.5) {
-          const s = distToStopBar <= 0.95 ? 0 : clamp((distToStopBar - 0.9) / 8.0, 0, 1);
-          if (s < minScale) minScale = s;
-          if (distToStopBar <= 0.95) hardStop = true;
+        const distToStopBar = fwdToInt - actor.halfLen - ctrl.stopBarDist;
+        // Already in front of (past) the horizontal white line -> do not stop on red/yellow; clear the intersection
+        if (distToStopBar < -0.12) continue;
+
+        if (aspect === 'red') {
+          if (distToStopBar <= 22.0) {
+            const stopGap = distToStopBar - 0.14;
+            const s =
+              stopGap <= 0.04 ? 0 : clamp(Math.sqrt(stopGap / 20.0) * 0.95, 0, 1);
+            if (s < minScale) minScale = s;
+            if (stopGap <= 0.18) hardStop = true;
+            maxAdvanceDist = Math.min(maxAdvanceDist, Math.max(0, stopGap));
+          }
+        } else if (aspect === 'yellow') {
+          const minStopDist = Math.max(
+            2.2,
+            (actor.currentSpeed * actor.currentSpeed) / 16.0,
+          );
+          if (
+            distToStopBar <= 22.0 &&
+            (distToStopBar >= minStopDist || actor.currentSpeed <= 3.5)
+          ) {
+            const stopGap = distToStopBar - 0.14;
+            const s =
+              stopGap <= 0.04 ? 0 : clamp(Math.sqrt(stopGap / 20.0) * 0.95, 0, 1);
+            if (s < minScale) minScale = s;
+            if (stopGap <= 0.18) hardStop = true;
+            maxAdvanceDist = Math.min(maxAdvanceDist, Math.max(0, stopGap));
+          }
         }
       }
     }
 
     // 0b. Intersection occupancy & entry reservation guard:
     // Never enter an intersection past the stop bar while another vehicle is inside or already entering from a conflicting/opposing approach
-    if (!actorInsideAnyIntersection) {
+    if (!inParkingManeuver && !actorInsideAnyIntersection) {
       for (const inter of this.intersectionEntries) {
         const relX = inter.x - actor.x;
         const relZ = inter.z - actor.z;
         const fwdToInt = relX * fx + relZ * fz;
-        if (fwdToInt <= 0 || fwdToInt >= 23.0) continue;
+        if (fwdToInt <= 0 || fwdToInt >= 26.0) continue;
         const latToInt = Math.abs(relX * rx + relZ * rz);
         if (latToInt > 4.25) continue;
 
-        const distToStopBar = fwdToInt - actor.halfLen - 7.8;
-        if (distToStopBar < -0.35 || distToStopBar > 16.5) continue;
+        const distToStopBar = fwdToInt - actor.halfLen - inter.stopBarDist;
+        if (distToStopBar < -0.12 || distToStopBar > 19.0) continue;
 
         let occupiedByConflicting = false;
         for (const t of this.vehicleTargets) {
           if (t.id === id) continue;
           const otherAnim = this.animatedActors.get(t.id);
+          if (otherAnim?.parkingPhase === 'parked') continue;
           const ox = otherAnim ? otherAnim.x : t.position.x;
           const oz = otherAnim ? otherAnim.z : t.position.z;
           const oRotY = otherAnim ? otherAnim.rotationY : t.rotationY;
@@ -4371,7 +5655,7 @@ export class StreetSimulatorScene {
             oHalfW,
             inter.x,
             inter.z,
-            6.2,
+            7.6,
           );
 
           // Also detect an opposing or cross-street moving vehicle actively entering past its stop bar
@@ -4379,7 +5663,7 @@ export class StreetSimulatorScene {
           const oRelZ = inter.z - oz;
           const oFwdToInt = oRelX * ofx + oRelZ * ofz;
           const oLatToInt = Math.abs(oRelX * -ofz + oRelZ * ofx);
-          const oDistToStopBar = oFwdToInt - oHalfL - 7.8;
+          const oDistToStopBar = oFwdToInt - oHalfL - inter.stopBarDist;
           const otherEnteringAhead =
             oSpeed > 0.65 &&
             oFwdToInt > 0 &&
@@ -4388,41 +5672,57 @@ export class StreetSimulatorScene {
             (oDistToStopBar + 0.35 < distToStopBar ||
               (Math.abs(oDistToStopBar - distToStopBar) <= 0.35 && id > t.id));
 
-          if (!otherInBox && !otherEnteringAhead) {
+          // Don't Block the Box: avoid entering if a slow/stopped same-direction vehicle blocks our exit lane clearance
+          const dotH = fx * ofx + fz * ofz;
+          const oRelExitFwd = (ox - inter.x) * fx + (oz - inter.z) * fz;
+          const oRelExitLat = Math.abs((ox - inter.x) * rx + (oz - inter.z) * rz);
+          const oRearFromCenter = oRelExitFwd - oHalfL;
+          const sameLaneExitBlocked =
+            dotH > 0.78 &&
+            oRelExitLat < 2.1 &&
+            oRearFromCenter >= 4.0 &&
+            oRearFromCenter < actor.halfLen * 2 + 5.8 &&
+            oSpeed < 1.2;
+
+          if (!otherInBox && !otherEnteringAhead && !sameLaneExitBlocked) {
             continue;
           }
 
-          // Allow following once a vehicle traveling in the exact same lane direction has cleared past center
-          const dotH = fx * ofx + fz * ofz;
-          const otherPastCenter = (ox - inter.x) * fx + (oz - inter.z) * fz > 1.5;
-          if (dotH > 0.78 && otherPastCenter) continue;
+          // Allow following only when a same-direction vehicle's rear bumper has cleared past the box and exit isn't stalled
+          const otherRearPastCenter = oRearFromCenter > 4.6;
+          if (!sameLaneExitBlocked && dotH > 0.78 && otherRearPastCenter) continue;
 
           occupiedByConflicting = true;
           break;
         }
 
         if (occupiedByConflicting) {
-          const s = distToStopBar <= 0.25 ? 0 : clamp(distToStopBar / 8.5, 0, 1);
+          const stopGap = distToStopBar - 0.14;
+          const s = stopGap <= 0.1 ? 0 : clamp(stopGap / 8.5, 0, 1);
           if (s < minScale) minScale = s;
-          if (distToStopBar <= 0.35) hardStop = true;
+          if (stopGap <= 0.2) hardStop = true;
+          maxAdvanceDist = Math.min(maxAdvanceDist, Math.max(0, stopGap));
         }
       }
     }
 
-    // 1. Yield to pedestrians currently on any crosswalk / roadway ahead
+    // 1. Yield to pedestrians currently on any crosswalk / roadway ahead (or sidewalk apron when entering/exiting a parking lot)
+    const checkingApronPed =
+      actor.parkingPhase === 'entering-lot' || actor.parkingPhase === 'exiting-lot';
     for (const t of this.pedestrianTargets) {
       const animPed = this.animatedActors.get(t.id);
       const px = animPed ? animPed.x : t.position.x;
       const pz = animPed ? animPed.z : t.position.z;
       const pedRotY = animPed ? animPed.rotationY : t.rotationY;
 
-      if (!this.isOnCrosswalkArea(px, pz)) continue;
+      if (!checkingApronPed && !this.isOnCrosswalkArea(px, pz)) continue;
 
       const relX = px - actor.x;
       const relZ = pz - actor.z;
       const fwdDist = relX * fx + relZ * fz;
       const bumperDist = fwdDist - actor.halfLen;
-      if (bumperDist <= 0.35 || bumperDist >= 11.5) continue;
+      if (bumperDist <= 0.35 || bumperDist >= 14.5) continue;
+      if (actorInsideAnyIntersection && fwdDist < actor.halfLen + 0.8) continue;
 
       const signedLat = relX * rx + relZ * rz;
       const latDist = Math.abs(signedLat);
@@ -4430,13 +5730,17 @@ export class StreetSimulatorScene {
       const pedFz = Math.cos(pedRotY);
       const latApproach = -(pedFx * rx + pedFz * rz) * Math.sign(signedLat || 1);
 
+      const lateralBand = actorInsideAnyIntersection ? myHalfW + 1.2 : myHalfW + 1.35;
       const shouldYield =
-        latDist < 2.4 ||
-        (latDist < 5.6 && latApproach > 0.15) ||
-        (!animPed && latDist < 4.2);
+        latDist < lateralBand ||
+        (!actorInsideAnyIntersection &&
+          latDist < 4.2 &&
+          latApproach > 0.25 &&
+          bumperDist > 1.2) ||
+        (!animPed && latDist < 3.5);
 
       if (shouldYield) {
-        const s = clamp((bumperDist - 2.6) / 8.0, 0, 1);
+        const s = clamp((bumperDist - 2.6) / 11.0, 0, 1);
         if (s < minScale) minScale = s;
         if (bumperDist < 10.6) yieldingToPed = true;
       }
@@ -4460,7 +5764,7 @@ export class StreetSimulatorScene {
     }
 
     // 2. Roundabout right-of-way: entering traffic MUST wait for vehicles already inside the roundabout
-    if (actorRoundaboutIdx < 0) {
+    if (!inParkingManeuver && actorRoundaboutIdx < 0) {
       for (const rbInfo of this.roundaboutEntries) {
         const rb = rbInfo.entry;
         const { isMini, ringZoneR, yieldLineR, approachMaxR } = rbInfo;
@@ -4509,6 +5813,7 @@ export class StreetSimulatorScene {
     for (const t of this.vehicleTargets) {
       if (t.id === id) continue;
       const otherAnim = this.animatedActors.get(t.id);
+      if (otherAnim?.parkingPhase === 'parked') continue;
       const ox = otherAnim ? otherAnim.x : t.position.x;
       const oz = otherAnim ? otherAnim.z : t.position.z;
       const oRotY = otherAnim ? otherAnim.rotationY : t.rotationY;
@@ -4557,21 +5862,22 @@ export class StreetSimulatorScene {
       const sinHeading = Math.sqrt(Math.max(0, 1 - dotHeading * dotHeading));
       const otherProjHalfL = otherHalfLen * Math.abs(dotHeading) + otherHalfW * sinHeading;
       const otherProjHalfW = otherHalfLen * sinHeading + otherHalfW * Math.abs(dotHeading);
-      const safeGap = actor.halfLen + otherProjHalfL + 2.4;
+      const safeGap = actor.halfLen + otherProjHalfL + 2.6;
+      const followRamp = Math.max(11.0, actor.speed * 1.1);
 
       // A. Same-lane following / parked obstacle / direct-lane head-on guard
       const isSameDirection = dotHeading > 0.35;
-      const isParkedAhead = otherSpeed < 0.25 && fwdDist > 0.2;
+      const isParkedAhead = otherSpeed < 0.25 && fwdDist > 0;
       const isDirectLaneHeadOn =
         dotHeading < -0.35 && latDist < myHalfW + otherProjHalfW + 0.3;
 
       if (isSameDirection || isParkedAhead || isDirectLaneHeadOn) {
         const laneHalfBand =
           myHalfW + otherProjHalfW + (isSameDirection && dotHeading < 0.92 ? 0.85 : 0.45);
-        if (fwdDist > 0.2 && latDist < laneHalfBand && fwdDist < safeGap + 8.0) {
-          const s = fwdDist <= safeGap ? 0 : clamp((fwdDist - safeGap) / 8.0, 0, 1);
+        if (fwdDist > 0 && latDist < laneHalfBand && fwdDist < safeGap + followRamp) {
+          const s = fwdDist <= safeGap ? 0 : clamp((fwdDist - safeGap) / followRamp, 0, 1);
           if (s < minScale) minScale = s;
-          if (fwdDist <= safeGap + 0.4) hardStop = true;
+          if (fwdDist <= safeGap + 0.5) hardStop = true;
           if (otherAnim?.isYielding && fwdDist < safeGap + 3.5) yieldingToPed = true;
         }
       }
@@ -4661,7 +5967,7 @@ export class StreetSimulatorScene {
         fz,
         rx,
         rz,
-        myHalfW + 0.32,
+        myHalfW + 0.42,
         ox,
         oz,
         ofx,
@@ -4669,7 +5975,7 @@ export class StreetSimulatorScene {
         otherHalfLen,
         otherHalfW,
       );
-      if (hitFwd < Infinity && hitFwd >= -actor.halfLen * 0.35) {
+      if (hitFwd < Infinity && hitFwd >= -actor.halfLen * 0.85) {
         let ignoreStationarySideTurn = false;
         if (
           otherSpeed < 0.35 &&
@@ -4725,19 +6031,56 @@ export class StreetSimulatorScene {
         }
 
         const bumperGap = Math.max(0, hitFwd) - actor.halfLen;
-        if (!ignoreStationarySideTurn || bumperGap <= 1.2) {
-          if (bumperGap <= 1.5) {
+        const corridorRamp = Math.max(9.5, actor.speed * 1.0);
+        if (!ignoreStationarySideTurn || bumperGap <= 2.4) {
+          if (bumperGap <= 1.75) {
             minScale = 0;
             hardStop = true;
-          } else if (bumperGap < 7.5) {
-            const s = clamp((bumperGap - 1.5) / 6.0, 0, 1);
+          } else if (bumperGap < 1.75 + corridorRamp) {
+            const s = clamp((bumperGap - 1.75) / corridorRamp, 0, 1);
             if (s < minScale) minScale = s;
           }
         }
       }
     }
 
-    return { scale: minScale, yieldingToPed, hardStop };
+    // 4. Hold cleanly inside the asphalt edge if a perimeter wrap destination is physically occupied
+    if (
+      !inParkingManeuver &&
+      !actor.seekingRoad &&
+      actor.graphNodeId !== undefined &&
+      actor.subPath &&
+      actor.subPath.length > 0 &&
+      (actor.subPathIdx ?? 0) === actor.subPath.length - 1
+    ) {
+      const wrapEdge = this.getWrapEdgeForNode(actor.graphNodeId);
+      if (wrapEdge) {
+        const wp = actor.subPath[actor.subPathIdx ?? 0];
+        const outNode = this.roadGraph.nodes[actor.graphNodeId];
+        const alignOut = outNode ? fx * outNode.dirX + fz * outNode.dirZ : 1;
+        if (wp && alignOut >= 0.85) {
+          const distToEnd = Math.hypot(wp.x - actor.x, wp.z - actor.z);
+          const wrapHoldInset = Math.min(actor.halfLen, 4.65);
+          if (distToEnd <= wrapHoldInset + 16.0) {
+            const placement = this.resolveWrapPlacement(id, actor, wrapEdge.toNodeId);
+            if (!placement.clear) {
+              const stopGap = distToEnd - wrapHoldInset - 0.1;
+              if (stopGap <= 0.12) {
+                minScale = 0;
+                hardStop = true;
+                maxAdvanceDist = Math.min(maxAdvanceDist, 0);
+              } else {
+                const s = clamp(Math.sqrt(stopGap / 14.0) * 0.9, 0, 1);
+                if (s < minScale) minScale = s;
+                maxAdvanceDist = Math.min(maxAdvanceDist, Math.max(0, stopGap));
+              }
+            }
+          }
+        }
+      }
+    }
+
+    return { scale: minScale, yieldingToPed, hardStop, maxAdvanceDist };
   }
 
   public requestRender(): void {
@@ -4876,10 +6219,13 @@ export class StreetSimulatorScene {
         const actualDy = nextCamY - this.camera.position.y;
         const actualDz = nextCamZ - this.camera.position.z;
 
+        if (actualDy > 0 && this.orbitGroundLift > 0) {
+          this.orbitGroundLift = Math.max(0, this.orbitGroundLift - actualDy);
+        }
         this.camera.position.set(nextCamX, nextCamY, nextCamZ);
         this.controls.target.set(
           clamp(this.controls.target.x + actualDx, -110, 110),
-          clamp(this.controls.target.y + actualDy, 0, 40),
+          clamp(this.controls.target.y + actualDy, -80, 140),
           clamp(this.controls.target.z + actualDz, -110, 110),
         );
         keepAnimating = true;
@@ -4887,6 +6233,7 @@ export class StreetSimulatorScene {
 
       if (this.cameraControlMode === 'orbit') {
         const dampingMoved = this.controls.update();
+        this.enforceOrbitGroundClearance();
         if (dampingMoved && !this.isSoftwareGl) {
           keepAnimating = true;
         }
@@ -4902,6 +6249,43 @@ export class StreetSimulatorScene {
       // 4. Advance walking pedestrian & driving cars
       if (this.animatedActors.size > 0 && delta > 0) {
         const stepDelta = Math.min(delta, 0.08);
+        this.simElapsedSeconds += stepDelta;
+
+        // Periodically schedule a car to park in a parking lot (once every 10-15 minutes)
+        if (this.roadGraph.nodes.length > 0 && this.vehicleTargets.length > 0) {
+          const hasLots = this.currentTargets.some((t) => t.kind === 'parking-lot');
+          if (hasLots) {
+            this.nextParkingEventTimer -= stepDelta;
+            if (this.nextParkingEventTimer <= 0) {
+              const eligibleCars: Array<{ id: string; actor: AnimatedActorState }> = [];
+              for (const [cid, cActor] of this.animatedActors.entries()) {
+                if (
+                  cActor.motion === 'drive' &&
+                  (cActor.kind === 'sedan' || cActor.kind === 'van') &&
+                  !cActor.seekingRoad &&
+                  cActor.parkingPhase === undefined &&
+                  cActor.graphNodeId !== undefined
+                ) {
+                  eligibleCars.push({ id: cid, actor: cActor });
+                }
+              }
+              eligibleCars.sort(
+                (a, b) =>
+                  (a.actor.lastParkedAt ?? -Infinity) - (b.actor.lastParkedAt ?? -Infinity) +
+                  (Math.random() - 0.5) * 30,
+              );
+              let scheduled = false;
+              for (const cand of eligibleCars) {
+                if (this.tryAssignParkingTrip(cand.id, cand.actor)) {
+                  scheduled = true;
+                  break;
+                }
+              }
+              this.nextParkingEventTimer = scheduled ? 600 + Math.random() * 300 : 15;
+            }
+          }
+        }
+
         for (const [id, actor] of this.animatedActors.entries()) {
           const group = this.targetGroups.get(id);
           if (!group) continue;
@@ -4928,14 +6312,71 @@ export class StreetSimulatorScene {
                 getActorBaseSpeed(actor.kind, actor.rotationY) * (0.76 + Math.random() * 0.48);
             }
 
-            // Handle random corner/stroll pauses
+            let activeCrossingSteps = actor.crossingWaypoints;
+            let cIdx = actor.crossingStepIdx ?? 0;
+            let activeCrossingStep =
+              activeCrossingSteps && cIdx < activeCrossingSteps.length
+                ? activeCrossingSteps[cIdx]
+                : undefined;
+
+            if (activeCrossingStep) {
+              actor.walkGoalX = activeCrossingStep.x;
+              actor.walkGoalZ = activeCrossingStep.z;
+              actor.walkIsCrosswalk = activeCrossingStep.action === 'cross';
+            }
+
+            // Handle curb pauses & random stroll pauses
             if ((actor.walkPauseTimer ?? 0) > 0) {
               actor.walkPauseTimer = Math.max(0, (actor.walkPauseTimer ?? 0) - stepDelta);
-              if (actor.walkPauseTimer === 0) {
+              if (actor.walkPauseTimer === 0 && !activeCrossingStep) {
                 if (actor.walkCurrNodeId !== undefined) {
                   this.pickNextWalkTarget(actor);
+                } else if (actor.routeId === 'Crossing') {
+                  this.initPedestrianWalk(actor);
+                  activeCrossingSteps = actor.crossingWaypoints;
+                  cIdx = actor.crossingStepIdx ?? 0;
+                  activeCrossingStep =
+                    activeCrossingSteps && cIdx < activeCrossingSteps.length
+                      ? activeCrossingSteps[cIdx]
+                      : undefined;
                 } else {
                   this.pickRandomFreeWalkTarget(actor);
+                }
+              }
+            }
+
+            let curbWaitYielding = false;
+            let curbLookDirX = 0;
+            let curbLookDirZ = 0;
+
+            if (activeCrossingStep?.action === 'pause-at-curb' && actor.crossingCurbPaused) {
+              const nextCross = activeCrossingSteps?.[cIdx + 1];
+              if (nextCross) {
+                curbLookDirX = nextCross.x - actor.x;
+                curbLookDirZ = nextCross.z - actor.z;
+              }
+              if ((actor.walkPauseTimer ?? 0) <= 0) {
+                const trafficBlocked = nextCross
+                  ? this.shouldPedestrianYield(actor, curbLookDirX, curbLookDirZ)
+                  : false;
+                if (trafficBlocked) {
+                  curbWaitYielding = true;
+                } else {
+                  actor.crossingCurbPaused = false;
+                  const nextIdx = cIdx + 1;
+                  if (activeCrossingSteps && nextIdx < activeCrossingSteps.length) {
+                    actor.crossingStepIdx = nextIdx;
+                    cIdx = nextIdx;
+                    activeCrossingStep = activeCrossingSteps[nextIdx];
+                    actor.walkGoalX = activeCrossingStep.x;
+                    actor.walkGoalZ = activeCrossingStep.z;
+                    actor.walkIsCrosswalk = activeCrossingStep.action === 'cross';
+                  } else {
+                    this.transitionAfterCrossingPath(actor);
+                    activeCrossingSteps = actor.crossingWaypoints;
+                    cIdx = actor.crossingStepIdx ?? 0;
+                    activeCrossingStep = undefined;
+                  }
                 }
               }
             }
@@ -4950,7 +6391,8 @@ export class StreetSimulatorScene {
               actor.walkPauseTimer = 0;
             }
             const paused = !onRoadNow && (actor.walkPauseTimer ?? 0) > 0;
-            const curbYielding = !paused && this.shouldPedestrianYield(actor, dx, dz);
+            const curbYielding =
+              curbWaitYielding || (!paused && this.shouldPedestrianYield(actor, dx, dz));
 
             // Realistic staggered human reaction delay when light turns green or traffic clears (never mid-road!)
             if (onRoadNow) {
@@ -4969,7 +6411,7 @@ export class StreetSimulatorScene {
             const reacting = !onRoadNow && !curbYielding && (actor.walkReactionTimer ?? 0) > 0;
             const waiting = paused || curbYielding || reacting;
 
-            // Hustle briskly across crosswalks—even faster (1.42x) if still crossing when light isn't green
+            // Hustle briskly across crosswalks—even faster (1.48x) if still crossing when light isn't green
             let paceBoost = 1.0;
             if (onRoadNow) {
               paceBoost = 1.24;
@@ -5000,16 +6442,69 @@ export class StreetSimulatorScene {
               actor.currentSpeed = 0;
             }
 
-            let faceDirX = dx;
-            let faceDirZ = dz;
+            let faceDirX =
+              actor.crossingCurbPaused && Math.hypot(curbLookDirX, curbLookDirZ) > 1e-4
+                ? curbLookDirX
+                : dx;
+            let faceDirZ =
+              actor.crossingCurbPaused && Math.hypot(curbLookDirX, curbLookDirZ) > 1e-4
+                ? curbLookDirZ
+                : dz;
 
             if (!waiting) {
               const step = actor.currentSpeed * stepDelta;
 
-              if (dist <= step + 0.08) {
-                actor.x = goalX;
-                actor.z = goalZ;
-                if (actor.walkCurrNodeId !== undefined) {
+              if (
+                dist <= step + 0.08 ||
+                (actor.seekingSidewalk &&
+                  dist < 1.35 &&
+                  isPointOnSidewalkSegment(actor.x, actor.z, this.currentTargets))
+              ) {
+                if (!actor.seekingSidewalk) {
+                  actor.x = goalX;
+                  actor.z = goalZ;
+                }
+                if (activeCrossingStep) {
+                  if (
+                    activeCrossingStep.action === 'pause-at-curb' &&
+                    !actor.crossingCurbPaused
+                  ) {
+                    actor.crossingCurbPaused = true;
+                    actor.walkPauseTimer =
+                      (activeCrossingStep.pauseSec ?? 1.4) * (0.85 + Math.random() * 0.3);
+                    actor.currentSpeed = 0;
+                  } else {
+                    const nextIdx = cIdx + 1;
+                    if (activeCrossingSteps && nextIdx < activeCrossingSteps.length) {
+                      actor.crossingStepIdx = nextIdx;
+                      actor.crossingCurbPaused = false;
+                      actor.walkGoalX = activeCrossingSteps[nextIdx].x;
+                      actor.walkGoalZ = activeCrossingSteps[nextIdx].z;
+                      actor.walkIsCrosswalk = activeCrossingSteps[nextIdx].action === 'cross';
+                    } else {
+                      this.transitionAfterCrossingPath(actor);
+                    }
+                  }
+                } else if (actor.seekingSidewalk) {
+                  actor.seekingSidewalk = false;
+                  if (actor.routeId === 'Crossing') {
+                    this.initPedestrianWalk(actor);
+                  } else {
+                    let hops = 0;
+                    while (hops < 4) {
+                      hops++;
+                      this.pickNextWalkTarget(actor);
+                      if (
+                        Math.hypot(
+                          (actor.walkGoalX ?? actor.x) - actor.x,
+                          (actor.walkGoalZ ?? actor.z) - actor.z,
+                        ) > 0.2
+                      ) {
+                        break;
+                      }
+                    }
+                  }
+                } else if (actor.walkCurrNodeId !== undefined) {
                   // Never pause while still on a roadway; only pause briefly once safely on a sidewalk
                   if (
                     !this.isOnCrosswalkArea(actor.x, actor.z) &&
@@ -5088,15 +6583,18 @@ export class StreetSimulatorScene {
                   for (const prop of this.currentTargets) {
                     if (
                       prop.motion ||
-                      isRoadOrPathKind(prop.kind) ||
+                      (isRoadOrPathKind(prop.kind) && prop.kind !== 'parking-lot') ||
                       prop.kind === 'traffic-light'
                     ) {
                       continue;
                     }
-                    const bDims = BUILDING_DEFAULT_DIMENSIONS[prop.kind];
+                    const bDims =
+                      prop.kind === 'parking-lot'
+                        ? { width: 12.8, length: 9.4 }
+                        : BUILDING_DEFAULT_DIMENSIONS[prop.kind];
                     if (bDims) {
-                      const hw = (prop.width ?? bDims.width) * 0.5 + 0.75;
-                      const hl = (prop.length ?? bDims.length) * 0.5 + 0.75;
+                      const hw = (prop.width ?? bDims.width) * 0.5 + 0.8;
+                      const hl = (prop.length ?? bDims.length) * 0.5 + 0.8;
                       const rx = actor.x - prop.position.x;
                       const rz = actor.z - prop.position.z;
                       const cosR = Math.cos(prop.rotationY);
@@ -5106,12 +6604,22 @@ export class StreetSimulatorScene {
                       if (Math.abs(lx) < hw && Math.abs(lz) < hl) {
                         const penX = hw - Math.abs(lx);
                         const penZ = hl - Math.abs(lz);
+                        const gdx = goalX - prop.position.x;
+                        const gdz = goalZ - prop.position.z;
+                        const glx = gdx * cosR - gdz * sinR;
+                        const glz = gdx * sinR + gdz * cosR;
                         let pushLX = 0;
                         let pushLZ = 0;
                         if (penX < penZ) {
-                          pushLX = (lx >= 0 ? 1 : -1) * Math.min(1, penX * 1.2);
+                          pushLX = (lx >= 0 ? 1 : -1) * Math.min(1.4, 0.45 + penX * 1.4);
+                          const slideDir =
+                            Math.abs(lz) > 0.25 ? (lz >= 0 ? 1 : -1) : glz >= 0 ? 1 : -1;
+                          pushLZ = slideDir * 0.95;
                         } else {
-                          pushLZ = (lz >= 0 ? 1 : -1) * Math.min(1, penZ * 1.2);
+                          pushLZ = (lz >= 0 ? 1 : -1) * Math.min(1.4, 0.45 + penZ * 1.4);
+                          const slideDir =
+                            Math.abs(lx) > 0.25 ? (lx >= 0 ? 1 : -1) : glx >= 0 ? 1 : -1;
+                          pushLX = slideDir * 0.95;
                         }
                         moveX += pushLX * cosR + pushLZ * sinR;
                         moveZ += -pushLX * sinR + pushLZ * cosR;
@@ -5179,7 +6687,7 @@ export class StreetSimulatorScene {
             let desiredLookYaw = Math.sin(tIdle * 0.48 + walkSeed) * 0.1;
             let desiredLookPitch = 0;
 
-            if (curbYielding || reacting) {
+            if (curbYielding || reacting || actor.crossingCurbPaused) {
               // Actively glance left & right to check oncoming traffic at the curb
               const scanWave = Math.sin(tIdle * 1.45 + walkSeed * 2.1);
               desiredLookYaw = Math.tanh(scanWave * 1.8) * 0.56;
@@ -5263,6 +6771,208 @@ export class StreetSimulatorScene {
               pedRefs.head.rotation.z = Math.sin(tIdle * 0.75 + walkSeed) * 0.03 * idleMix;
             }
           } else if (actor.motion === 'drive') {
+            if (actor.parkingPhase === 'parked') {
+              actor.currentSpeed = 0;
+              actor.isYielding = false;
+              if (actor.parkingStallYaw !== undefined) {
+                let yawErr = actor.parkingStallYaw - actor.rotationY;
+                while (yawErr > Math.PI) yawErr -= Math.PI * 2;
+                while (yawErr < -Math.PI) yawErr += Math.PI * 2;
+                actor.rotationY += yawErr * Math.min(1, 10 * stepDelta);
+              }
+              actor.parkingDwellTimer = (actor.parkingDwellTimer ?? 600) - stepDelta;
+              if (actor.parkingDwellTimer <= 0) {
+                // Wait briefly if another car is actively entering/exiting the same lot's aisle
+                let aisleBusy = false;
+                for (const [otherId, other] of this.animatedActors.entries()) {
+                  if (otherId === id) continue;
+                  if (
+                    other.parkingLotId === actor.parkingLotId &&
+                    (other.parkingPhase === 'entering-lot' ||
+                      other.parkingPhase === 'reversing-out' ||
+                      other.parkingPhase === 'exiting-lot')
+                  ) {
+                    aisleBusy = true;
+                    break;
+                  }
+                }
+                const lot = actor.parkingLotId
+                  ? this.currentTargets.find(
+                      (t) => t.id === actor.parkingLotId && t.kind === 'parking-lot',
+                    )
+                  : undefined;
+                if (!lot) {
+                  this.clearActorParkingState(actor);
+                  this.assignInitialGraphRoute(actor);
+                } else if (!aisleBusy) {
+                  const stall =
+                    getParkingLotOpenStalls(lot.id).find(
+                      (s) => s.idx === actor.parkingStallIdx,
+                    ) ?? getParkingLotOpenStalls(lot.id)[0];
+                  const signX = stall ? (stall.x >= 0 ? 1 : -1) : 1;
+                  const stallZ = stall ? stall.z : 0;
+                  const exitAisleZ =
+                    stallZ < -1.5
+                      ? actor.kind === 'van'
+                        ? -1.85
+                        : -2.1
+                      : stallZ < 1.5
+                        ? -0.95
+                        : 1.75;
+                  const wp0 = this.toLotWorld(lot, 1.55 * signX, stallZ);
+                  const wp1 = this.toLotWorld(lot, 0, exitAisleZ);
+                  actor.parkingPhase = 'reversing-out';
+                  actor.parkingReverseWaypoints = [wp0, wp1];
+                  actor.parkingReverseIdx = 0;
+                  actor.parkingReverseSegDist = Math.max(
+                    0.5,
+                    Math.hypot(wp0.x - actor.x, wp0.z - actor.z),
+                  );
+                  actor.parkingReverseStartYaw = actor.rotationY;
+                }
+              }
+              group.position.x = actor.x;
+              group.position.z = actor.z;
+              group.position.y = THREE.MathUtils.damp(group.position.y, 0.015, 14, stepDelta);
+              group.rotation.y = actor.rotationY;
+              continue;
+            }
+
+            if (
+              actor.parkingPhase === 'reversing-out' &&
+              actor.parkingReverseWaypoints &&
+              actor.parkingReverseWaypoints.length > 0
+            ) {
+              const revIdx = actor.parkingReverseIdx ?? 0;
+              const wp = actor.parkingReverseWaypoints[revIdx];
+              if (wp) {
+                const dx = wp.x - actor.x;
+                const dz = wp.z - actor.z;
+                const dist = Math.hypot(dx, dz);
+                const revDirX = dist > 1e-4 ? dx / dist : 0;
+                const revDirZ = dist > 1e-4 ? dz / dist : 0;
+
+                // Safety yield if a moving vehicle or pedestrian is directly in our backing corridor
+                let rearBlocked = false;
+                for (const t of this.vehicleTargets) {
+                  if (t.id === id) continue;
+                  const other = this.animatedActors.get(t.id);
+                  if (other?.parkingPhase === 'parked') continue;
+                  const ox = other ? other.x : t.position.x;
+                  const oz = other ? other.z : t.position.z;
+                  if (Math.hypot(ox - (actor.x + revDirX * 1.4), oz - (actor.z + revDirZ * 1.4)) < actor.halfLen + 1.8) {
+                    rearBlocked = true;
+                    break;
+                  }
+                }
+                if (!rearBlocked) {
+                  for (const t of this.pedestrianTargets) {
+                    const animPed = this.animatedActors.get(t.id);
+                    const px = animPed ? animPed.x : t.position.x;
+                    const pz = animPed ? animPed.z : t.position.z;
+                    if (Math.hypot(px - (actor.x + revDirX * 1.4), pz - (actor.z + revDirZ * 1.4)) < 2.4) {
+                      rearBlocked = true;
+                      break;
+                    }
+                  }
+                }
+
+                const targetRevSpeed = rearBlocked ? 0 : 2.4;
+                actor.currentSpeed = THREE.MathUtils.damp(
+                  actor.currentSpeed,
+                  targetRevSpeed,
+                  rearBlocked ? 14 : 6,
+                  stepDelta,
+                );
+                if (rearBlocked && actor.currentSpeed < 0.08) actor.currentSpeed = 0;
+                actor.isYielding = rearBlocked;
+
+                const step = actor.currentSpeed * stepDelta;
+                const segLen = Math.max(0.5, actor.parkingReverseSegDist ?? 1.5);
+                const segProg = clamp(1 - dist / segLen, 0, 1);
+                const startYaw = actor.parkingReverseStartYaw ?? actor.rotationY;
+                const endYaw = actor.parkingExitAisleYaw ?? actor.rotationY;
+                const overallFrac =
+                  revIdx === 0 ? segProg * 0.25 : 0.25 + segProg * 0.75;
+                let yawDelta = endYaw - startYaw;
+                while (yawDelta > Math.PI) yawDelta -= Math.PI * 2;
+                while (yawDelta < -Math.PI) yawDelta += Math.PI * 2;
+                actor.rotationY = startYaw + yawDelta * overallFrac;
+
+                if (!rearBlocked && dist <= step + 0.18) {
+                  actor.x = wp.x;
+                  actor.z = wp.z;
+                  const nextRevIdx = revIdx + 1;
+                  if (nextRevIdx < actor.parkingReverseWaypoints.length) {
+                    actor.parkingReverseIdx = nextRevIdx;
+                    const nextWp = actor.parkingReverseWaypoints[nextRevIdx];
+                    actor.parkingReverseSegDist = Math.max(
+                      0.5,
+                      Math.hypot(nextWp.x - actor.x, nextWp.z - actor.z),
+                    );
+                  } else {
+                    actor.rotationY = endYaw;
+                    const lot = actor.parkingLotId
+                      ? this.currentTargets.find(
+                          (t) => t.id === actor.parkingLotId && t.kind === 'parking-lot',
+                        )
+                      : undefined;
+                    if (!lot) {
+                      this.clearActorParkingState(actor);
+                      this.assignInitialGraphRoute(actor);
+                    } else {
+                      const mouthPt = this.toLotWorld(lot, 0, 4.6);
+                      const apronPt = this.toLotWorld(lot, 0, 6.8);
+                      const exitConn = this.findNearestRoadConnectionForLot(
+                        lot,
+                        getActorHalfWidth(actor.kind),
+                        1,
+                      );
+                      actor.parkingPhase = 'exiting-lot';
+                      if (exitConn) {
+                        const remPts = exitConn.edge.points.slice(exitConn.pIdx);
+                        const firstRem = remPts[0];
+                        const skipFirst =
+                          firstRem &&
+                          Math.hypot(firstRem.x - exitConn.point.x, firstRem.z - exitConn.point.z) < 0.7;
+                        actor.subPath = [
+                          mouthPt,
+                          apronPt,
+                          exitConn.point,
+                          ...(skipFirst ? remPts.slice(1) : remPts),
+                        ];
+                        actor.subPathIdx = 0;
+                        actor.graphNodeId = exitConn.edge.toNodeId;
+                        actor.parkingExitRejoinSubIdx = 3;
+                      } else {
+                        actor.subPath = [mouthPt, apronPt];
+                        actor.subPathIdx = 0;
+                        actor.graphNodeId = undefined;
+                        actor.parkingExitRejoinSubIdx = 2;
+                      }
+                    }
+                  }
+                } else if (!rearBlocked && dist > 1e-4) {
+                  actor.x += revDirX * step;
+                  actor.z += revDirZ * step;
+                }
+
+                const wheelPivots = group.userData.wheelPivots as THREE.Group[] | undefined;
+                if (wheelPivots && actor.currentSpeed > 0) {
+                  const wheelR = (group.userData.wheelRadius as number | undefined) ?? 0.32;
+                  const spinAngle = (actor.currentSpeed * stepDelta) / wheelR;
+                  for (const pivot of wheelPivots) {
+                    pivot.rotation.z += spinAngle;
+                  }
+                }
+              }
+              group.position.x = actor.x;
+              group.position.z = actor.z;
+              group.position.y = THREE.MathUtils.damp(group.position.y, 0.015, 14, stepDelta);
+              group.rotation.y = actor.rotationY;
+              continue;
+            }
+
             actor.speedDriftTimer = (actor.speedDriftTimer ?? 4.0) - stepDelta;
             if (actor.speedDriftTimer <= 0) {
               actor.speedDriftTimer = 3.5 + Math.random() * 5.0;
@@ -5270,24 +6980,46 @@ export class StreetSimulatorScene {
                 getActorBaseSpeed(actor.kind, actor.rotationY) * (0.82 + Math.random() * 0.36);
             }
 
-            if (actor.subPath === undefined && this.roadGraph.nodes.length > 0) {
+            if (
+              actor.subPath === undefined &&
+              actor.parkingPhase === undefined &&
+              this.roadGraph.nodes.length > 0
+            ) {
               this.assignInitialGraphRoute(actor);
+            }
+
+            const onRoadNow = isPointInsideAnyRoadway(actor.x, actor.z, this.modularRoadEntries);
+            if (actor.seekingRoad && onRoadNow && (actor.subPathIdx ?? 0) > 0) {
+              actor.seekingRoad = false;
             }
 
             let cornerScale = 1;
             const activeWp =
-              actor.subPath && actor.graphNodeId !== undefined
+              actor.subPath &&
+              (actor.graphNodeId !== undefined ||
+                actor.parkingPhase === 'entering-lot' ||
+                actor.parkingPhase === 'exiting-lot')
                 ? actor.subPath[actor.subPathIdx ?? 0]
                 : undefined;
+            const seekSteer =
+              actor.seekingRoad && !onRoadNow && activeWp
+                ? this.getOffRoadSteerDirection(actor, activeWp.x, activeWp.z)
+                : null;
             if (activeWp) {
-              const adx = activeWp.x - actor.x;
-              const adz = activeWp.z - actor.z;
+              const adx = seekSteer ? seekSteer.dirX : activeWp.x - actor.x;
+              const adz = seekSteer ? seekSteer.dirZ : activeWp.z - actor.z;
               if (Math.hypot(adx, adz) > 1e-4) {
                 const tRot = Math.atan2(-adz, adx);
                 let diff = tRot - actor.rotationY;
                 while (diff > Math.PI) diff -= Math.PI * 2;
                 while (diff < -Math.PI) diff += Math.PI * 2;
-                if (Math.abs(diff) > 0.25) {
+                if (actor.seekingRoad && !onRoadNow) {
+                  if (Math.abs(diff) > 0.75) {
+                    cornerScale = 0.14;
+                  } else if (Math.abs(diff) > 0.25) {
+                    cornerScale = clamp(1 - Math.abs(diff) * 0.65, 0.28, 1);
+                  }
+                } else if (Math.abs(diff) > 0.25) {
                   cornerScale = clamp(1 - Math.abs(diff) * 0.42, 0.48, 1);
                 }
               }
@@ -5298,8 +7030,17 @@ export class StreetSimulatorScene {
             if (traffic.hardStop) {
               actor.currentSpeed = 0;
             } else {
-              const targetSpeed = actor.speed * traffic.scale * cornerScale;
-              const dampRate = targetSpeed < actor.currentSpeed ? 12.0 : 4.2;
+              let effectiveBaseSpeed =
+                actor.seekingRoad && !onRoadNow ? Math.min(actor.speed, 6.8) : actor.speed;
+              if (actor.parkingPhase === 'entering-lot') {
+                effectiveBaseSpeed = Math.min(effectiveBaseSpeed, 3.3);
+              } else if (actor.parkingPhase === 'exiting-lot' && (actor.subPathIdx ?? 0) <= 1) {
+                effectiveBaseSpeed = Math.min(effectiveBaseSpeed, 3.6);
+              } else if (actor.parkingOnFinalEdge) {
+                effectiveBaseSpeed = Math.min(effectiveBaseSpeed, 6.2);
+              }
+              const targetSpeed = effectiveBaseSpeed * traffic.scale * cornerScale;
+              const dampRate = targetSpeed < actor.currentSpeed ? 14.5 : 5.2;
               actor.currentSpeed = THREE.MathUtils.damp(
                 actor.currentSpeed,
                 targetSpeed,
@@ -5309,73 +7050,217 @@ export class StreetSimulatorScene {
               if (targetSpeed === 0 && actor.currentSpeed < 0.08) {
                 actor.currentSpeed = 0;
               }
+              if (
+                traffic.maxAdvanceDist < Infinity &&
+                actor.currentSpeed * stepDelta > traffic.maxAdvanceDist
+              ) {
+                actor.currentSpeed =
+                  traffic.maxAdvanceDist <= 0.015
+                    ? 0
+                    : traffic.maxAdvanceDist / Math.max(stepDelta, 1e-4);
+              }
             }
 
             if (
               actor.subPath &&
-              actor.graphNodeId !== undefined &&
-              actor.graphNodeId < this.roadGraph.nodes.length
+              ((actor.graphNodeId !== undefined &&
+                actor.graphNodeId < this.roadGraph.nodes.length) ||
+                actor.parkingPhase === 'entering-lot' ||
+                actor.parkingPhase === 'exiting-lot')
             ) {
               const wp = actor.subPath[actor.subPathIdx ?? 0];
               if (wp) {
                 const dx = wp.x - actor.x;
                 const dz = wp.z - actor.z;
                 const dist = Math.hypot(dx, dz);
-                const step = actor.currentSpeed * stepDelta;
+                const step = Math.min(
+                  actor.currentSpeed * stepDelta,
+                  traffic.maxAdvanceDist,
+                );
+
+                const steerDirX = seekSteer ? seekSteer.dirX : dist > 1e-4 ? dx / dist : 0;
+                const steerDirZ = seekSteer ? seekSteer.dirZ : dist > 1e-4 ? dz / dist : 0;
 
                 if (dist > 1e-4) {
-                  const targetRotY = Math.atan2(-dz, dx);
+                  const targetRotY = Math.atan2(-steerDirZ, steerDirX);
                   let angleDiff = targetRotY - actor.rotationY;
                   while (angleDiff > Math.PI) angleDiff -= Math.PI * 2;
                   while (angleDiff < -Math.PI) angleDiff += Math.PI * 2;
-                  const turnGain = actor.subPath.length >= 3 ? 12.5 : 10.0;
+                  const turnGain =
+                    actor.parkingPhase === 'entering-lot' || actor.parkingPhase === 'exiting-lot'
+                      ? 14.5
+                      : actor.seekingRoad && !onRoadNow
+                        ? 14.0
+                        : actor.subPath.length >= 3
+                          ? 12.5
+                          : 10.0;
                   actor.rotationY += angleDiff * Math.min(1, turnGain * stepDelta);
                 }
 
-                if (dist <= step + 0.35) {
-                  actor.x = wp.x;
-                  actor.z = wp.z;
-                  actor.subPathIdx = (actor.subPathIdx ?? 0) + 1;
+                const baseSnapTolerance =
+                  actor.parkingPhase === 'entering-lot' || actor.parkingPhase === 'exiting-lot'
+                    ? 0.2
+                    : 0.35;
+                const snapTolerance =
+                  traffic.maxAdvanceDist < Infinity
+                    ? Math.min(baseSnapTolerance, Math.max(0, traffic.maxAdvanceDist - step))
+                    : baseSnapTolerance;
 
-                  let hops = 0;
-                  while (
-                    actor.subPath &&
-                    (actor.subPathIdx ?? 0) >= actor.subPath.length &&
-                    actor.graphNodeId !== undefined &&
-                    hops < 8
+                const isOnFinalWrapSeg =
+                  !actor.seekingRoad &&
+                  actor.parkingPhase !== 'entering-lot' &&
+                  actor.parkingPhase !== 'exiting-lot' &&
+                  actor.graphNodeId !== undefined &&
+                  (actor.subPathIdx ?? 0) === actor.subPath.length - 1 &&
+                  this.getWrapEdgeForNode(actor.graphNodeId) !== null;
+                const wrapOutNode = isOnFinalWrapSeg
+                  ? this.roadGraph.nodes[actor.graphNodeId!]
+                  : undefined;
+                const wrapAligned = wrapOutNode
+                  ? Math.cos(actor.rotationY) * wrapOutNode.dirX +
+                      -Math.sin(actor.rotationY) * wrapOutNode.dirZ >=
+                    0.85
+                  : false;
+                const wrapTriggerDist =
+                  isOnFinalWrapSeg && wrapAligned ? Math.min(actor.halfLen, 4.65) : 0;
+                const reachedWrapTrigger =
+                  isOnFinalWrapSeg &&
+                  wrapAligned &&
+                  dist <= wrapTriggerDist + Math.max(step, 0) + baseSnapTolerance;
+
+                if (
+                  reachedWrapTrigger ||
+                  ((step > 1e-5 || dist < 0.02) && dist <= step + snapTolerance)
+                ) {
+                  if (
+                    !reachedWrapTrigger &&
+                    actor.currentSpeed > 0 &&
+                    this.wouldCollideWithVehicleAhead(id, actor, wp.x, wp.z, actor.rotationY)
                   ) {
-                    hops++;
-                    const nextEdge = this.pickNextGraphEdge(id, actor, actor.graphNodeId);
-                    if (!nextEdge) {
-                      actor.subPath = undefined;
-                      actor.graphNodeId = undefined;
-                      break;
+                    actor.currentSpeed = 0;
+                    actor.isYielding = true;
+                  } else {
+                    if (reachedWrapTrigger) {
+                      actor.subPathIdx = actor.subPath.length;
+                    } else {
+                      actor.x = wp.x;
+                      actor.z = wp.z;
+                      actor.subPathIdx = (actor.subPathIdx ?? 0) + 1;
                     }
-                    if (nextEdge.isRoundaboutStay) {
-                      actor.roundaboutSteps = (actor.roundaboutSteps ?? 0) + 1;
-                    } else if (nextEdge.isRoundaboutExit) {
-                      actor.roundaboutSteps = 0;
-                      actor.roundaboutTargetSteps = 1 + Math.floor(Math.random() * 8);
+                    if (actor.seekingRoad && isPointInsideAnyRoadway(actor.x, actor.z, this.modularRoadEntries)) {
+                      actor.seekingRoad = false;
                     }
-                    if (nextEdge.isWrap) {
-                      const destNode = this.roadGraph.nodes[nextEdge.toNodeId];
-                      if (destNode) {
-                        actor.x = destNode.x;
-                        actor.z = destNode.z;
-                        actor.rotationY = Math.atan2(-destNode.dirZ, destNode.dirX);
+
+                    if (
+                      actor.parkingPhase === 'exiting-lot' &&
+                      (actor.subPathIdx ?? 0) >= (actor.parkingExitRejoinSubIdx ?? 3)
+                    ) {
+                      const needSeek = actor.graphNodeId === undefined;
+                      this.clearActorParkingState(actor);
+                      actor.lastParkedAt = this.simElapsedSeconds;
+                      if (needSeek) {
+                        this.assignInitialGraphRoute(actor);
                       }
-                      actor.graphNodeId = nextEdge.toNodeId;
-                      actor.subPath = [];
-                      actor.subPathIdx = 0;
-                      continue;
                     }
-                    actor.graphNodeId = nextEdge.toNodeId;
-                    actor.subPath = nextEdge.points;
-                    actor.subPathIdx = 0;
+
+                    if (
+                      actor.parkingPhase === 'entering-lot' &&
+                      actor.subPath &&
+                      (actor.subPathIdx ?? 0) >= actor.subPath.length
+                    ) {
+                      actor.parkingPhase = 'parked';
+                      actor.parkingDwellTimer = 600 + Math.random() * 300;
+                      actor.currentSpeed = 0;
+                      actor.isYielding = false;
+                      actor.subPath = undefined;
+                      actor.subPathIdx = 0;
+                      actor.graphNodeId = undefined;
+                    } else if (
+                      actor.parkingPhase === 'approaching-lot' &&
+                      actor.parkingOnFinalEdge &&
+                      actor.subPath &&
+                      (actor.subPathIdx ?? 0) >= actor.subPath.length
+                    ) {
+                      if (actor.parkingEntryWaypoints && actor.parkingEntryWaypoints.length > 0) {
+                        actor.parkingPhase = 'entering-lot';
+                        actor.parkingOnFinalEdge = false;
+                        actor.subPath = actor.parkingEntryWaypoints;
+                        actor.subPathIdx = 0;
+                        actor.graphNodeId = undefined;
+                      } else {
+                        this.clearActorParkingState(actor);
+                        this.assignInitialGraphRoute(actor);
+                      }
+                    } else {
+                      let hops = 0;
+                      while (
+                        actor.subPath &&
+                        (actor.subPathIdx ?? 0) >= actor.subPath.length &&
+                        actor.graphNodeId !== undefined &&
+                        hops < 8
+                      ) {
+                        hops++;
+                        const pick = this.pickNextGraphEdge(id, actor, actor.graphNodeId);
+                        if (pick.waitForWrap) {
+                          const holdNode = this.roadGraph.nodes[actor.graphNodeId];
+                          if (holdNode && reachedWrapTrigger) {
+                            // Keep holding inside the road right at wrapTriggerDist until destination clears
+                            actor.subPath = [{ x: holdNode.x, z: holdNode.z }];
+                            actor.subPathIdx = 0;
+                          } else if (holdNode) {
+                            actor.x = holdNode.x;
+                            actor.z = holdNode.z;
+                            actor.subPath = [{ x: holdNode.x, z: holdNode.z }];
+                            actor.subPathIdx = 0;
+                          }
+                          actor.currentSpeed = 0;
+                          actor.isYielding = true;
+                          break;
+                        }
+                        const nextEdge = pick.edge;
+                        if (!nextEdge) {
+                          actor.subPath = undefined;
+                          actor.graphNodeId = undefined;
+                          break;
+                        }
+                        if (nextEdge.isRoundaboutStay) {
+                          actor.roundaboutSteps = (actor.roundaboutSteps ?? 0) + 1;
+                        } else if (nextEdge.isRoundaboutExit) {
+                          actor.roundaboutSteps = 0;
+                          actor.roundaboutTargetSteps = 1 + Math.floor(Math.random() * 8);
+                        }
+                        if (nextEdge.isWrap) {
+                          const destNode = this.roadGraph.nodes[nextEdge.toNodeId];
+                          if (destNode) {
+                            const wrapPos = pick.wrapPos ?? { x: destNode.x, z: destNode.z };
+                            actor.x = wrapPos.x;
+                            actor.z = wrapPos.z;
+                            actor.rotationY = Math.atan2(-destNode.dirZ, destNode.dirX);
+                          }
+                          actor.graphNodeId = nextEdge.toNodeId;
+                          actor.subPath = [];
+                          actor.subPathIdx = 0;
+                          continue;
+                        }
+                        actor.graphNodeId = nextEdge.toNodeId;
+                        actor.subPath = nextEdge.points;
+                        actor.subPathIdx = 0;
+                      }
+                    }
                   }
                 } else if (dist > 1e-4) {
-                  actor.x += (dx / dist) * step;
-                  actor.z += (dz / dist) * step;
+                  const nx = actor.x + steerDirX * step;
+                  const nz = actor.z + steerDirZ * step;
+                  if (
+                    step > 1e-4 &&
+                    this.wouldCollideWithVehicleAhead(id, actor, nx, nz, actor.rotationY)
+                  ) {
+                    actor.currentSpeed = 0;
+                    actor.isYielding = true;
+                  } else {
+                    actor.x = nx;
+                    actor.z = nz;
+                  }
                 }
               }
             } else {
@@ -5392,8 +7277,18 @@ export class StreetSimulatorScene {
               const fx = Math.cos(actor.rotationY);
               const fz = -Math.sin(actor.rotationY);
 
-              actor.x += fx * actor.currentSpeed * stepDelta;
-              actor.z += fz * actor.currentSpeed * stepDelta;
+              const nx = actor.x + fx * actor.currentSpeed * stepDelta;
+              const nz = actor.z + fz * actor.currentSpeed * stepDelta;
+              if (
+                actor.currentSpeed > 0 &&
+                this.wouldCollideWithVehicleAhead(id, actor, nx, nz, actor.rotationY)
+              ) {
+                actor.currentSpeed = 0;
+                actor.isYielding = true;
+              } else {
+                actor.x = nx;
+                actor.z = nz;
+              }
 
               if (
                 Math.abs(actor.x) > FIXTURE_MAX_X - 3.0 ||
@@ -5406,9 +7301,16 @@ export class StreetSimulatorScene {
               }
             }
 
+            const baseGroundY = this.getGroundPlacementHeight(actor.x, actor.z, actor.kind);
+            const targetY =
+              actor.parkingPhase === 'entering-lot' ||
+              actor.parkingPhase === 'reversing-out' ||
+              actor.parkingPhase === 'exiting-lot'
+                ? Math.max(0.015, baseGroundY)
+                : baseGroundY;
             group.position.x = actor.x;
             group.position.z = actor.z;
-            group.position.y = this.getGroundPlacementHeight(actor.x, actor.z, actor.kind);
+            group.position.y = THREE.MathUtils.damp(group.position.y, targetY, 14, stepDelta);
             group.rotation.y = actor.rotationY;
 
             const wheelPivots = group.userData.wheelPivots as THREE.Group[] | undefined;

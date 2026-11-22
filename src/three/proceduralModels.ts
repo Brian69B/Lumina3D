@@ -1111,6 +1111,34 @@ export interface PedestrianRigRefs {
   heightScale: number;
 }
 
+export interface ParkingStallSpec {
+  idx: number;
+  x: number;
+  z: number;
+  inwardYaw: number;
+}
+
+export const PARKING_STALL_SPECS: readonly ParkingStallSpec[] = [
+  { idx: 0, x: -4.15, z: -2.85, inwardYaw: Math.PI },
+  { idx: 1, x: -4.15, z: 0.0, inwardYaw: Math.PI },
+  { idx: 2, x: -4.15, z: 2.85, inwardYaw: Math.PI },
+  { idx: 3, x: 4.15, z: -2.85, inwardYaw: 0 },
+  { idx: 4, x: 4.15, z: 0.0, inwardYaw: 0 },
+  { idx: 5, x: 4.15, z: 2.85, inwardYaw: 0 },
+];
+
+export function getParkingLotSeed(lotId: string): number {
+  let lotHash = 0;
+  for (let i = 0; i < lotId.length; i++) {
+    lotHash = (lotHash * 31 + lotId.charCodeAt(i)) | 0;
+  }
+  return Math.abs(lotHash);
+}
+
+export function getParkingLotOpenStalls(_lotId?: string): ParkingStallSpec[] {
+  return [...PARKING_STALL_SPECS];
+}
+
 export function createStreetTargetGroup(
   id: string,
   kind: TargetKind,
@@ -1160,6 +1188,7 @@ export function createStreetTargetGroup(
     'path-bike': { sx: 8.0, sz: 2.4, ringR: 3.0 },
     'path-cobble': { sx: 6.0, sz: 6.0, ringR: 3.6 },
     'path-gravel': { sx: 8.0, sz: 2.2, ringR: 2.9 },
+    'parking-lot': { sx: 13.0, sz: 9.6, ringR: 7.1 },
   };
   const fp = footprintMap[kind];
   const segLen2Lane = kind === 'road-2lane' && length && length > 0 ? length : 8.0;
@@ -3020,6 +3049,8 @@ export function createStreetTargetGroup(
       const curb = new THREE.Mesh(curbGeo, curbMat);
       curb.position.set(0, 0.0675, side * 4.62);
       curb.receiveShadow = true;
+      curb.userData.roadCurbSide = side;
+      curb.userData.roadSegLen = segLen2Lane;
       group.add(curb);
     }
   } else if (kind === 'road-intersection') {
@@ -3459,6 +3490,155 @@ export function createStreetTargetGroup(
       trimX.receiveShadow = true;
       group.add(trimX);
     }
+  } else if (kind === 'parking-lot') {
+    const asphaltMat = getSharedStdMat('parking:asphalt', {
+      color: 0x1e242d,
+      roughness: 0.9,
+      metalness: 0.05,
+      polygonOffset: true,
+      polygonOffsetFactor: -1,
+      polygonOffsetUnits: -1,
+    });
+    const curbMat = getSharedStdMat('parking:curb', {
+      color: 0x64748b,
+      roughness: 0.78,
+      metalness: 0.08,
+    });
+    const wheelStopMat = getSharedStdMat('parking:wheelStop', {
+      color: 0x94a3b8,
+      roughness: 0.8,
+      metalness: 0.06,
+    });
+    const stripeMat = getSharedStdMat('parking:stripe', {
+      color: 0xe2e8f0,
+      roughness: 0.7,
+      metalness: 0.04,
+    });
+    const adaBlueMat = getSharedStdMat('parking:adaBlue', {
+      color: 0x2563eb,
+      roughness: 0.68,
+      metalness: 0.06,
+    });
+    const safetyYellowMat = getSharedStdMat('parking:safetyYellow', {
+      color: 0xeab308,
+      roughness: 0.55,
+      metalness: 0.12,
+    });
+
+    // Main lot asphalt deck (12.6m x 9.2m) + flush road-connecting entrance apron (4.08m x 2.96m)
+    const lotPad = new THREE.Mesh(getSharedPlaneGeo(12.6, 9.2), asphaltMat);
+    lotPad.rotation.x = -Math.PI / 2;
+    lotPad.position.y = 0.015;
+    lotPad.receiveShadow = true;
+    group.add(lotPad);
+
+    const apron = new THREE.Mesh(getSharedPlaneGeo(4.08, 2.96), asphaltMat);
+    apron.rotation.x = -Math.PI / 2;
+    apron.position.set(0, 0.0135, 6.04);
+    apron.receiveShadow = true;
+    group.add(apron);
+
+    // Concrete perimeter curbs with open entrance mouth on +Z
+    const backCurb = new THREE.Mesh(getSharedBoxGeo(12.84, 0.12, 0.24), curbMat);
+    backCurb.position.set(0, 0.06, -4.6);
+    backCurb.castShadow = true;
+    backCurb.receiveShadow = true;
+    group.add(backCurb);
+
+    const sideCurbGeo = getSharedBoxGeo(0.24, 0.12, 9.32);
+    for (const sx of [-6.3, 6.3]) {
+      const sCurb = new THREE.Mesh(sideCurbGeo, curbMat);
+      sCurb.position.set(sx, 0.06, 0);
+      sCurb.castShadow = true;
+      sCurb.receiveShadow = true;
+      group.add(sCurb);
+    }
+
+    const frontWingGeo = getSharedBoxGeo(4.36, 0.12, 0.24);
+    for (const sx of [-4.22, 4.22]) {
+      const fCurb = new THREE.Mesh(frontWingGeo, curbMat);
+      fCurb.position.set(sx, 0.06, 4.6);
+      fCurb.castShadow = true;
+      fCurb.receiveShadow = true;
+      group.add(fCurb);
+    }
+
+    // Yellow curb tips + entrance safety bollards flanking the driveway apron
+    const tipGeo = getSharedBoxGeo(0.42, 0.124, 0.25);
+    const bollardPostGeo = getSharedCylinderGeo(0.09, 0.1, 0.72, 10);
+    const bollardBandGeo = getSharedCylinderGeo(0.094, 0.094, 0.14, 10);
+    for (const sx of [-2.18, 2.18]) {
+      const tip = new THREE.Mesh(tipGeo, safetyYellowMat);
+      tip.position.set(sx, 0.062, 4.6);
+      tip.receiveShadow = true;
+      group.add(tip);
+
+      const post = new THREE.Mesh(bollardPostGeo, curbMat);
+      post.position.set(sx, 0.36, 4.6);
+      post.castShadow = true;
+      post.receiveShadow = true;
+      group.add(post);
+
+      const band = new THREE.Mesh(bollardBandGeo, safetyYellowMat);
+      band.position.set(sx, 0.56, 4.6);
+      group.add(band);
+    }
+
+    // Painted stall stripes (6 perpendicular bays: 3 west, 3 east, 4.0m deep x 2.85m wide)
+    const stallLineGeo = getSharedPlaneGeo(4.0, 0.11);
+    const endRailGeo = getSharedPlaneGeo(0.11, 8.66);
+    const stallZBounds = [-4.275, -1.425, 1.425, 4.275];
+    for (const colX of [-4.15, 4.15]) {
+      const rail = new THREE.Mesh(endRailGeo, stripeMat);
+      rail.rotation.x = -Math.PI / 2;
+      rail.position.set(colX < 0 ? -6.12 : 6.12, 0.021, 0);
+      rail.receiveShadow = true;
+      group.add(rail);
+
+      for (const lz of stallZBounds) {
+        const isAdaEdge = colX > 0 && lz >= 1.4;
+        const stripe = new THREE.Mesh(stallLineGeo, isAdaEdge ? adaBlueMat : stripeMat);
+        stripe.rotation.x = -Math.PI / 2;
+        stripe.position.set(colX, 0.021, lz);
+        stripe.receiveShadow = true;
+        group.add(stripe);
+      }
+    }
+
+    // Accessible parking emblem in front-right stall (+4.15, +2.85)
+    const adaBadge = new THREE.Mesh(getSharedPlaneGeo(0.92, 0.92), adaBlueMat);
+    adaBadge.rotation.x = -Math.PI / 2;
+    adaBadge.position.set(3.2, 0.021, 2.85);
+    adaBadge.receiveShadow = true;
+    group.add(adaBadge);
+
+    const adaGlyph = new THREE.Mesh(getSharedPlaneGeo(0.46, 0.46), stripeMat);
+    adaGlyph.rotation.x = -Math.PI / 2;
+    adaGlyph.position.set(3.2, 0.022, 2.85);
+    group.add(adaGlyph);
+
+    // Center aisle entrance guide dashes
+    const aisleDashGeo = getSharedPlaneGeo(0.11, 0.85);
+    for (const dz of [2.1, 3.8]) {
+      const dash = new THREE.Mesh(aisleDashGeo, stripeMat);
+      dash.rotation.x = -Math.PI / 2;
+      dash.position.set(0, 0.021, dz);
+      dash.receiveShadow = true;
+      group.add(dash);
+    }
+
+    // Concrete wheel-stop bumpers at back of all 6 stalls
+    const wheelStopGeo = getSharedBoxGeo(0.18, 0.13, 1.55);
+    const stallZs = [-2.85, 0.0, 2.85];
+    for (const sz of stallZs) {
+      for (const wx of [-5.65, 5.65]) {
+        const stop = new THREE.Mesh(wheelStopGeo, wheelStopMat);
+        stop.position.set(wx, 0.065, sz);
+        stop.castShadow = true;
+        stop.receiveShadow = true;
+        group.add(stop);
+      }
+    }
   } else {
     // path-gravel
     const gravelMat = getSharedRoadSurfaceMat('path-gravel', maxAnisotropy, 0.94, 0.0);
@@ -3706,6 +3886,9 @@ export function createBuilderGhostGroup(tool: Exclude<BuilderTool, null>): THREE
     addBox(6.0, 0.06, 6.0, 0, 0.03, 0);
   } else if (tool === 'path-gravel') {
     addBox(8.0, 0.06, 2.2, 0, 0.03, 0);
+  } else if (tool === 'parking-lot') {
+    addBox(12.8, 0.08, 9.4, 0, 0.04, 0);
+    addBox(4.08, 0.08, 2.96, 0, 0.04, 6.04);
   } else {
     addBox(1.2, 1.12, 1.2);
   }
@@ -3714,65 +3897,67 @@ export function createBuilderGhostGroup(tool: Exclude<BuilderTool, null>): THREE
   const ringR =
     tool === 'road-roundabout'
       ? 10.4
-      : tool === 'road-curve-45'
-        ? 6.6
-        : tool === 'road-turn-90'
-          ? 6.4
-          : tool === 'road-culdesac' || tool === 'road-deadend'
-            ? 6.2
-            : tool === 'road-intersection' || tool === 'road-t-junction'
-              ? 5.2
-              : tool === 'road-2lane'
-                ? 4.85
-                : tool === 'bus'
-                  ? 4.8
-                  : tool === 'road-crosswalk'
-                    ? 4.6
-                    : tool === 'building-civic'
-                      ? 6.4
-                      : tool === 'building-warehouse'
-                        ? 6.2
-                        : tool === 'building-apartments'
-                          ? 6.0
-                          : tool === 'building-commercial'
-                            ? 5.8
-                            : tool === 'building-rowhouse'
-                              ? 5.4
-                              : tool === 'building-skyscraper'
-                                ? 5.2
-                                : tool === 'building-highrise'
-                                  ? 4.05
-                                  : tool === 'truck'
-                                    ? 3.7
-                                    : tool === 'building-tall'
-                                      ? 3.65
-                                      : tool === 'path-cobble'
-                                        ? 3.6
-                                        : tool === 'path-sidewalk'
-                                          ? 3.2
-                                          : tool === 'building-small'
-                                            ? 3.15
-                                            : tool === 'path-bike'
-                                              ? 3.0
-                                              : tool === 'path-gravel'
-                                                ? 2.9
-                                                : tool === 'van'
-                                                  ? 2.85
-                                                  : tool === 'building-kiosk'
-                                                    ? 2.65
-                                                    : tool === 'sedan'
-                                                      ? 2.35
-                                          : tool === 'hedge'
-                                            ? 1.45
-                                            : tool === 'tree'
-                                              ? 1.35
-                                              : tool === 'motorcycle'
-                                                ? 1.25
-                                                : tool === 'bench'
-                                                  ? 1.1
-                                                  : tool === 'bike'
-                                                    ? 1.05
-                                                    : 0.72;
+      : tool === 'parking-lot'
+        ? 7.1
+        : tool === 'road-curve-45'
+          ? 6.6
+          : tool === 'road-turn-90'
+            ? 6.4
+            : tool === 'road-culdesac' || tool === 'road-deadend'
+              ? 6.2
+              : tool === 'road-intersection' || tool === 'road-t-junction'
+                ? 5.2
+                : tool === 'road-2lane'
+                  ? 4.85
+                  : tool === 'bus'
+                    ? 4.8
+                    : tool === 'road-crosswalk'
+                      ? 4.6
+                      : tool === 'building-civic'
+                        ? 6.4
+                        : tool === 'building-warehouse'
+                          ? 6.2
+                          : tool === 'building-apartments'
+                            ? 6.0
+                            : tool === 'building-commercial'
+                              ? 5.8
+                              : tool === 'building-rowhouse'
+                                ? 5.4
+                                : tool === 'building-skyscraper'
+                                  ? 5.2
+                                  : tool === 'building-highrise'
+                                    ? 4.05
+                                    : tool === 'truck'
+                                      ? 3.7
+                                      : tool === 'building-tall'
+                                        ? 3.65
+                                        : tool === 'path-cobble'
+                                          ? 3.6
+                                          : tool === 'path-sidewalk'
+                                            ? 3.2
+                                            : tool === 'building-small'
+                                              ? 3.15
+                                              : tool === 'path-bike'
+                                                ? 3.0
+                                                : tool === 'path-gravel'
+                                                  ? 2.9
+                                                  : tool === 'van'
+                                                    ? 2.85
+                                                    : tool === 'building-kiosk'
+                                                      ? 2.65
+                                                      : tool === 'sedan'
+                                                        ? 2.35
+                                            : tool === 'hedge'
+                                              ? 1.45
+                                              : tool === 'tree'
+                                                ? 1.35
+                                                : tool === 'motorcycle'
+                                                  ? 1.25
+                                                  : tool === 'bench'
+                                                    ? 1.1
+                                                    : tool === 'bike'
+                                                      ? 1.05
+                                                      : 0.72;
   const baseRing = new THREE.Mesh(new THREE.RingGeometry(ringR, ringR + 0.14, 36), edgeMat);
   baseRing.rotation.x = -Math.PI / 2;
   baseRing.position.y = 0.04;

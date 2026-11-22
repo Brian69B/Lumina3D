@@ -224,6 +224,13 @@ const BUILDER_CATALOG: Array<{
     icon: Footprints,
   },
   {
+    id: 'parking-lot',
+    label: 'Parking Lot',
+    detail: '12.8×9.4m · 6 stalls · Road link',
+    category: 'Roads & Paths',
+    icon: Car,
+  },
+  {
     id: 'building-kiosk',
     label: '1-Story',
     detail: 'Pavilion · 3.8×3.8×3.8m',
@@ -1429,6 +1436,11 @@ export const ControlDock = memo(function ControlDock({
                             <span className="text-xs font-medium text-slate-100 truncate">
                               {t.label}
                             </span>
+                            {t.routeId === 'Crossing' && (
+                              <span className="rounded border border-emerald-500/40 bg-emerald-500/10 px-1.5 py-0.5 text-[10px] font-medium text-emerald-300 shrink-0">
+                                Crossing
+                              </span>
+                            )}
                             <span className="font-mono-tabular text-[11px] text-slate-400 whitespace-nowrap">
                               {bldgH ? `${bldgH.toFixed(1)}m · ` : ''}({t.position.x.toFixed(1)}, {t.position.z.toFixed(1)}) · {deg}°
                             </span>

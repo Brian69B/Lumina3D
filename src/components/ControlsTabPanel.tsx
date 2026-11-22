@@ -192,7 +192,7 @@ export function ControlsTabPanel({
                 htmlFor="ctrl-rotate-sens"
                 className="text-[11px] font-medium text-slate-300"
               >
-                Orbit Rotate Sensitivity
+                Look Rotate Sensitivity
               </label>
               <span className="font-mono-tabular text-xs font-semibold text-cyan-400">
                 {controlsConfig.rotateSensitivity.toFixed(1)}×
